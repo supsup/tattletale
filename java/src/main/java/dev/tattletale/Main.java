@@ -516,6 +516,9 @@ public final class Main {
         } catch (Exit e) {
             if (e.getMessage() != null) Watch.ERR.println(e.getMessage());
             code = e.code;
+        } catch (Db.Fatal e) {
+            Watch.ERR.println("tattletale: database connection unusable; watcher stopped");
+            code = 1;
         }
         Watch.OUT.flush();
         Watch.ERR.flush();

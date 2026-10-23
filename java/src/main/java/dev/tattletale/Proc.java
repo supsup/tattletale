@@ -24,8 +24,24 @@ final class Proc {
 
     /** Run and wait; timeoutSeconds <= 0 waits forever. stdin is not inherited. */
     static Result run(List<String> cmd, long timeoutSeconds) throws IOException, Timeout {
+        return run(cmd, timeoutSeconds, false);
+    }
+
+    static Result collector(List<String> cmd, long timeoutSeconds) throws IOException, Timeout {
+        return run(cmd, timeoutSeconds, true);
+    }
+
+    static ProcessBuilder builder(List<String> cmd, boolean collector) {
         ProcessBuilder pb = new ProcessBuilder(cmd);
+        if (collector) collectorEnvironment(pb);
         pb.redirectInput(ProcessBuilder.Redirect.from(new java.io.File("/dev/null")));
+        return pb;
+    }
+
+    static void collectorEnvironment(ProcessBuilder pb) { pb.environment().put("LC_ALL", "C"); }
+
+    private static Result run(List<String> cmd, long timeoutSeconds, boolean collector) throws IOException, Timeout {
+        ProcessBuilder pb = builder(cmd, collector);
         Process p;
         try {
             p = pb.start();
@@ -54,7 +70,8 @@ final class Proc {
         }
         if (out.failure != null || err.failure != null) throw new IOException("collector-stream");
         try {
-            return new Result(p.exitValue(), text(out.bytes()), text(err.bytes()));
+            return new Result(p.exitValue(), collector ? strictText(out.bytes()) : text(out.bytes()),
+                    collector ? strictText(err.bytes()) : text(err.bytes()));
         } catch (java.nio.charset.CharacterCodingException e) { throw new IOException("collector-decode", e); }
     }
 
@@ -63,8 +80,15 @@ final class Proc {
     }
 
     /** Text mode decoding with universal newlines, as subprocess(text=True) gives. */
-    static String text(byte[] b) throws java.nio.charset.CharacterCodingException {
-        String s = StandardCharsets.UTF_8.newDecoder().decode(java.nio.ByteBuffer.wrap(b)).toString();
+    static String text(byte[] b) {
+        return newlines(new String(b, StandardCharsets.UTF_8));
+    }
+
+    static String strictText(byte[] b) throws java.nio.charset.CharacterCodingException {
+        return newlines(StandardCharsets.UTF_8.newDecoder().decode(java.nio.ByteBuffer.wrap(b)).toString());
+    }
+
+    private static String newlines(String s) {
         if (s.indexOf('\r') < 0) return s;
         return s.replace("\r\n", "\n").replace('\r', '\n');
     }

@@ -17,8 +17,8 @@ already have:
 | **Python** (`python/`) | `python3 python/tattletale.py` | Python 3.9 or newer; nothing to install |
 | **Java** (`java/`) | `java -jar java/build/tattletale.jar`, or the native binary `java/build/tattletale` | JDK 25 to build; GraalVM to build the native binary, which then needs nothing |
 
-Both write the same database, the same log and the same dashboard data into `data/`, so you
-can switch between them and keep your history. Only one may run at a time: each refuses to
+Both use the same database schema, ordered event contract and compatible dashboard data in
+`data/`, so you can switch between them and keep your history. Only one may run at a time: each refuses to
 start while the other holds `data/tattletale.pid`. The format both follow is written down in
 [docs/DATA_FORMAT.md](docs/DATA_FORMAT.md).
 
@@ -95,12 +95,19 @@ crontab. A Live page can still have degraded observations. A restart begins with
 health even when retained inventory is shown; missing or unsupported health is also unknown,
 never an all-clear. Values retained after a failed check are labelled last-known.
 
-Startup files and crontab form one accepted sample: files are staged first, crontab last.
-Both success timestamps advance only when that sample is accepted. A failure before the
-crontab attempt leaves its prior health untouched; a later rejection degrades both checks
-without discarding their last-good data. The existing polling schedule is unchanged, with
-no added automatic retries. These four checks do not represent universal watcher, identity
-or log-stream health.
+Startup files and crontab are independent partitions, each with its own health and
+baseline. Both are attempted every scheduled cycle, files first and crontab last. Good
+peer changes may commit while a failed partition retains its last-known data. A fully
+enumerated persistent unreadable file is kept as a marker: readable peers remain visible,
+but startup health stays degraded and its success time does not advance. Eligible changes
+share a transaction; mirrors and baselines advance only after commit. This replaces the
+earlier combined-sample rule. The polling schedule is unchanged, with no added automatic
+retries. These four checks do not represent universal watcher, identity or log-stream health.
+
+The page names degraded/unknown checks alongside either Live or Stale. A failed page
+refresh retains the last fully accepted inventory, health and update time under an explicit
+last-known/load-error warning. A first attempt in flight may be unknown with an attempt
+time; unknown does not mean that no attempt has started.
 
 The generated data is now `formatVersion: 2`; SQLite remains schema 1 and the producer's
 version string is independent. Listener `bindScope` comes from the recorded address without
@@ -162,6 +169,14 @@ notifications. Turn them off with `--no-notify` or `TATTLETALE_NOTIFY=false`.
 The existing `LISTEN!` notification and `EXPOSED on all interfaces` log wording refer to
 wildcard binding; they are not remote-reachability measurements.
 
+Listener collection deliberately rejects lsof diagnostic output. Exit-0 diagnostics report
+`lsof-warning` and retain last-known listeners. A host that always warns, such as one with
+an unreachable mount, stays degraded by design, even on a Live page. Accepting warnings
+would not establish complete socket coverage; no warning allowlist is used.
+The page names the warning, and transition into it records the fixed existing-kind `NOTE`
+`listeners collection degraded: lsof-warning`. Repeated identical warnings are deduplicated;
+the note contains no raw stderr.
+
 ## Run at login (optional)
 
 ```sh
@@ -192,6 +207,10 @@ The collection-health checks use the standard libraries and built-in test runner
 python3 tests/run_python_health_tests.py --xml /tmp/tattletale-python-health.xml
 sh tests/run_java_health_tests.sh --xml /tmp/tattletale-java-health.xml --scratch "$(mktemp -d)/fixtures"
 node --test tests/test_dashboard_health.js
+python3 -B tests/test_health_parity_gate.py
+# Full two-producer fixture gate; JAVA_HOME must point to JDK 25.
+# The output leaf must not exist, even after an earlier failed run.
+python3 -B tests/run_health_gate.py --output-dir "$(cd "$(mktemp -d)" && pwd -P)/health-gate"
 ```
 
 They use synthetic command results, files and clocks, without running a live collector or
@@ -199,6 +218,20 @@ reading host inventory. Set JAVA_HOME to JDK 25 for the Java checks, which also 
 sqlite3 command and build only the jar. No native-image build is needed. The dashboard check
 uses Node's built-in test runner. These checks cover collection health and bind scope, not
 unrelated privacy, locking, platform or identity-refresh changes.
+
+The gate runs both fixture producers into fresh files, requires their successful exits
+and fresh timestamped per-case JUnit (with skips counted), then compares the complete
+23 scope cases, 13 command cases, ten original snapshots and eight startup transitions.
+It retains failed outputs and refuses missing, stale, malformed or incomplete evidence.
+`tests/test_health_parity_gate.py` uses explicitly synthetic validation data and mocked
+producers; it is not a substitute for this actual two-producer gate.
+
+For data inspection alone, `python3 tests/compare_health_parity.py PYTHON.json JAVA.json`
+checks strict shape, scalar types and ordered arrays, without sorting away event drift.
+Its success means equal fixture data, **not** proof that either producer ran or passed.
+Standalone fixture XML is not a Gradle `TEST-*.xml` task report; an outer native execution
+receipt supplies command/custody provenance. The gate is not a process supervisor or a
+live-watcher/release certification.
 
 ## Upgrading from 0.0.1
 

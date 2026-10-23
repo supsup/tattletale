@@ -61,12 +61,17 @@ crontab as `unknown`, `ok` or `degraded`, with their attempt and accepted-succes
 Failed checks keep last-known values rather than reporting stopped listeners or removed
 startup items. A new watcher starts with unknown health even when it loads old inventory;
 legacy or unsupported health is unknown too. Live does not mean every check succeeded.
+Degraded/unknown check names remain visible when the file becomes Stale. A failed refresh
+keeps the last fully accepted values and update time under a last-known/load-error warning.
 
 Listener labels describe **bind scope**: loopback, wildcard, non-loopback or unknown.
 For example, `127.0.0.1` is loopback and `192.0.2.10` is a non-loopback literal. These labels
 do not test firewall rules or access from another machine. The older `EXPOSED` log label
 means wildcard binding, not demonstrated reachability.
 
+Startup files and crontab are attempted independently on each startup cycle. A failure in
+one retains its prior values while good peer changes can commit. Persistent unreadable
+entry markers allow readable peers to be observed, but keep startup health degraded.
 The four health checks follow the existing polling schedule; no automatic retry is added.
 They do not cover every watcher component. More detail, including startup/crontab rejection
 and accepted-empty results, is in [the data contract](docs/DATA_FORMAT.md#collection-health).

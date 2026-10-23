@@ -51,11 +51,29 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--xml', required=True)
     ap.add_argument('--parity-output')
+    ap.add_argument('--case', action='append', help='Exact case name for focused fixture checks; default is the full suite')
+    ap.add_argument('--fatal-control', action='store_true', help='Expected nonzero fully fake fatal-lifecycle discriminator')
     args = ap.parse_args()
+    for output in [args.xml, args.parity_output]:
+        if output and pathlib.Path(output).exists():
+            ap.error('refusing an existing output')
     spec = importlib.util.spec_from_file_location('test_collection_health', pathlib.Path(__file__).with_name('test_collection_health.py'))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    suite = unittest.defaultTestLoader.loadTestsFromModule(module)
+    if args.fatal_control:
+        trace = []
+        try:
+            module.fatal_lifecycle_fixture(trace)
+        finally:
+            print(json.dumps({'fakeFatalLifecycleTrace': trace}), flush=True)
+        raise AssertionError('fatal lifecycle unexpectedly returned')
+    if args.case:
+        names = set(unittest.defaultTestLoader.getTestCaseNames(module.CollectionHealthTests))
+        if len(set(args.case)) != len(args.case) or any(name not in names for name in args.case):
+            ap.error('invalid or repeated focused case')
+        suite = unittest.TestSuite(module.CollectionHealthTests(name) for name in args.case)
+    else:
+        suite = unittest.defaultTestLoader.loadTestsFromModule(module)
     started = datetime.datetime.now(datetime.timezone.utc).isoformat()
     result = unittest.TextTestRunner(verbosity=2, resultclass=Result).run(suite)
     root = ET.Element('testsuite', name='python.collection-health', tests=str(result.testsRun),

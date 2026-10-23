@@ -1,8 +1,8 @@
 # Tattletale data format
 
 This is the contract every Tattletale version writes and the dashboard reads. The Python and
-Java versions must produce the same database schema, the same data file and the same log
-lines, so either one can run against the same `data/` folder (one at a time; see
+Java versions use the same database schema, compatible data objects and the same ordered
+event contract, so either one can run against the same `data/` folder (one at a time; see
 [The pid file](#the-pid-file)) and the one dashboard serves both.
 
 The generated dashboard data uses **formatVersion 2**. The SQLite database remains
@@ -18,10 +18,11 @@ Both versions default to `<repo>/data/`. Everything in it is machine data and is
 |---|---|
 | `tattletale.db` | the SQLite database (WAL mode, so also `-wal` and `-shm` while running), mode 0600 |
 | `tattletale.log` | the human-readable log, one line per event; rotated to `tattletale.log.1`, `.2`, ... |
+| `tattletale.stdout` | optional login-agent capture of stdout and stderr; a separate diagnostic channel, not the dashboard's log source |
 | `tattletale-data.js` | the dashboard's data, rewritten about once a minute, atomically (temp file and rename) |
 | `tattletale.html` | a copy of `dashboard/tattletale.html`, refreshed on start whenever its bytes differ |
 | `tattletale.pid` | the running watcher's pid |
-| `startup-snapshots/` | a copy of every version of every startup item seen |
+| `startup-snapshots/` | saved readable versions: the first 4 MiB of each file, full crontab text; hashing covers full content |
 | `tattletale-map.json` | optional; an old mac-watch JSON map, imported once into an empty database, never written |
 
 Settings live in `<repo>/tattletale.env`, shared by both versions.
@@ -61,7 +62,9 @@ CREATE INDEX IF NOT EXISTS events_time ON events(time);
 Rules:
 
 - `schema_version` holds one row. A database whose version is higher than the watcher knows
-  is refused at start, never written.
+  is refused at start. This check follows read-write initialization: WAL setup and
+  `CREATE ... IF NOT EXISTS` have already run. Refusal does not guarantee an untouched
+  database, journal or schema; it is not a read-only compatibility preflight.
 - Every time is UTC ISO-8601 to the second with a `Z` (`2026-10-23T15:02:28Z`).
 - `programs.exe` is the full executable path (spaces kept). Identity columns (`sha256`, `size`,
   `signer`, `team`, `signing_id`) are NULL until the identity worker has read the file.
@@ -69,7 +72,8 @@ Rules:
   `Developer ID Application: Example Inc (ABCDE12345)`); `adhoc` for an ad-hoc signature;
   `signed, no authority` when codesign reports a signature with no authority and no ad-hoc
   marker; and text starting `unsigned or unreadable: ` when codesign fails. `sha256` holds
-  `unreadable: <reason>` when the file could not be read.
+  `unreadable: <reason>` when the file could not be read, or the exact sentinel
+  `not hashed: larger than 512 MB` when size exceeds 512 * 1024 * 1024 bytes.
 - `listeners.key` is `<exe> <address>` with address `host:port` as lsof prints it (`*:8000`,
   `127.0.0.1:5173`, `[::1]:631`). `exposed` is 1 when the host is `*`, `0.0.0.0`, `[::]` or
   `::`: this is a legacy wildcard-binding flag, not a reachability result. `present` is 1
@@ -80,7 +84,11 @@ Rules:
 - `startup_items.path` is a file path, or the literal `crontab -l` for the user's crontab.
   `hash` is the SHA-256 of the content, except that an accepted absent crontab uses the
   existing `none` sentinel. An accepted empty crontab hashes the empty bytes instead.
-  `startup_versions.copy_path` is the saved copy.
+  Fully enumerated persistent unreadability uses exactly `unreadable: permission-denied`,
+  `unreadable: directory` or `unreadable: dangling-link` for that filesystem entry.
+  `startup_versions.copy_path` is the saved copy, or null for an unreadable-entry marker.
+  File hashes cover the full content even when the saved copy is capped at 4 MiB;
+  crontab copies are saved in full. A marker never stands for invented copy bytes.
 - Retention: rows of `sightings` older than `sightings_retention_days`, and of `events` and
   `credential_events` older than `retention_days`, are deleted hourly (0 keeps them forever).
   `programs`, `listeners` and `startup_*` are never trimmed.
@@ -108,7 +116,11 @@ window.TATTLETALE = {
 };
 ```
 
-JSON is written compactly (no spaces after `,` and `:`).
+JSON is written compactly (no spaces after `,` and `:`). Object-member order, including
+top-level order, is not a byte-identity contract; this example is illustrative. Producers
+also have their own generation time and pid. Consumers compare named fields and scalar
+types, preserving array order. Startup keys are exported in codepoint-sorted path order;
+historical database rowids are not rewritten or promised equal.
 
 | Key | Shape |
 |---|---|
@@ -120,8 +132,8 @@ JSON is written compactly (no spaces after `,` and `:`).
 | `map.programs` | object keyed by exe: `firstSeen`, `lastSeen`, `user`, `firstPid`, `firstArgs`, `parent`, and, only once known, `sha256`, `size`, `signer`, `team`, `signingId` |
 | `map.listeners` | object keyed by listener key: `firstSeen`, `lastSeen`, `pid`, `command`, `bindScope`, `exposed` (legacy boolean), `user`, `args`, `chain`, `present` (boolean) |
 | `map.credentials` | array, oldest first, the last 500: `time`, `pid`, `user`, `exe`, `args`, `chain`, `source` |
-| `map.startup` | object: path to content hash |
-| `log` | the last 500 lines of `tattletale.log`, as strings |
+| `map.startup` | object: path to content hash, absent-crontab sentinel or supported unreadable-entry marker |
+| `log` | up to the last 500 lines from the last 400,000 bytes of the configured event log, as strings; not `tattletale.stdout` |
 
 An absent identity key means "not checked yet" (the page tests `"signer" in v`), which is
 different from a present key with an empty value.
@@ -133,8 +145,8 @@ Every `collectionHealth` entry has exactly these fields:
 | Field | Meaning |
 |---|---|
 | `lastAttempt` | UTC ISO-8601 second with `Z`, or null before this watcher has attempted the check |
-| `lastSuccess` | UTC ISO-8601 second with `Z` for the last accepted sample in this watcher epoch, or null before one succeeds |
-| `status` | `unknown` before an attempt, `ok` after an accepted sample, or `degraded` after a failed or rejected sample |
+| `lastSuccess` | UTC ISO-8601 second with `Z` for the last wholly successful accepted sample in this watcher epoch, or null before one succeeds |
+| `status` | `unknown` before a completed result (including a first attempt in flight), `ok` after a wholly successful accepted sample, or `degraded` after failure/rejection or a committed unreadable startup marker |
 | `error` | null or a bounded generic stage/reason/exit diagnostic; never raw stderr, an exception message, observed command arguments or a path |
 
 The four entries cover the named polling checks only. They do not certify code-signing
@@ -144,9 +156,17 @@ resets all four entries to `unknown` with null timestamps and errors, even if th
 already contains inventory. Missing or unsupported health data is also shown as unknown,
 never all-clear.
 
-An accepted sample, including legitimate empty output, advances its success timestamp.
+Starting an attempt updates `lastAttempt` without inventing a result: a first in-flight
+attempt can have `status: "unknown"` and a non-null attempt time, with null success/error.
+Later in-flight attempts retain the previous completed result until a new outcome exists.
+If the page cannot load or render a refresh, it retains the last fully accepted file's
+inventory, health and generation time, labels them last-known and shows a persistent load
+error. That error is separate from both the retained collector result and file freshness;
+it does not rewrite a past attempt as "not yet" or certify current observation.
+
+A wholly successful accepted sample, including legitimate empty output, advances its success timestamp.
 Failed commands, decoding errors and structurally partial samples degrade the affected
-check and retain its entire last-good inventory, baseline, in-memory mirrors and events.
+check and retain its last-good observation partition, baseline, mirrors and events.
 They do not invent `UNLISTEN` or startup-removal events or consume the first successful
 baseline. Retained values are **last-known**, not proof of a current observation. File
 freshness is separate: a newly generated Live page can still report degraded or unknown
@@ -156,20 +176,35 @@ Process collection requires both `ps` commands to succeed and their output to de
 parse. An empty all-system process sample is degraded. Normal PID churn between the two
 commands is allowed; their PID sets need not be identical.
 
-Startup collection stages and validates the filesystem first, then attempts crontab last.
-Only an accepted combined sample advances **both** startup and crontab successes. Failure
-before a crontab attempt leaves the previous crontab health untouched. Rejection after a
-crontab attempt degrades both entries without advancing either success, and preserves the
-prior startup/crontab inventory, text, baseline and events. A successful command exit alone
-is not an accepted aggregate. Inventory/event changes are staged before the database
-transaction; mirrors are adopted only after commit.
+Startup filesystem entries and the literal `crontab -l` row are **independent observation
+partitions**, each with its own health and first committed baseline. Both are attempted
+on every scheduled startup cycle, filesystem first and crontab last, even if either fails.
+A failed crontab retains its row/text while good file changes may commit; a failed directory
+enumeration or transient file read retains the entire filesystem partition while good
+crontab changes may commit. This replaces the earlier combined-sample rule.
+
+A completely enumerated filesystem observation can commit a persistent unreadable-entry
+marker while continuing to observe readable peers. Such a commit consumes its filesystem
+baseline, but health is `degraded` with `startup-unreadable` and does not advance
+`lastSuccess`. Recovery to a wholly readable observation advances success and records the
+change once. A vanished listed file, broken source ancestor, I/O error or unknown/transient
+read failure rejects that partition; it is not converted to a persistent marker. No
+recursive directory scan is introduced, and an unreadable marker is never an all-clear.
+
+All eligible row/version/event changes share one database transaction. Mirrors and
+baselines are adopted only after COMMIT. A database failure adopts neither eligible
+partition and degrades affected eligible checks, preserving an independent collection
+error on a partition that already failed. Changes use the codepoint-sorted union of old
+and proposed paths, including removals; event arrays retain that order.
 
 New saved copies are published only after their bytes are written. An existing copy must
 match the expected saved bytes; a mismatched or symbolic-link copy rejects the sample and
 is left untouched for operator review. A prepared copy may remain unreferenced after a
-later database rejection. No copy cleanup or automatic repair is added. If rollback itself
-fails, the database connection is closed rather than reused with unknown pending state;
-restarting the watcher is then necessary.
+later database rejection. No copy cleanup or automatic repair is added. A sound connection
+can recover on a later cycle after SQLite has already rolled back a failed transaction.
+An uncertain or unusable connection is closed and treated as fatal: the watcher exits
+nonzero with the original failure retained, rather than silently continuing with a closed
+database. A restart is then required; this adds no automatic retry schedule.
 
 ### Accepted empty command results
 
@@ -180,6 +215,13 @@ These are explicit source-based policies, not observations from a live host coll
   statuses, nonempty output with exit 1, and structurally partial output degrade the check.
   The installed `lsof(8)` DIAGNOSTICS section says exit 1 covers errors as well as failed
   searches and describes diagnostics on stderr; exit 1 by itself is not absence proof.
+  Exit-0 diagnostic output is rejected with `lsof-warning`, retaining last-known listeners.
+  A host where lsof always warns, for example about an unreachable mount, therefore stays
+  degraded by design; neither a warning allowlist nor an empty view certifies complete
+  socket coverage. The page names the warning alongside either Live or Stale.
+  On transition into that state, the existing `NOTE` kind records exactly
+  `listeners collection degraded: lsof-warning`. Repeated identical warnings are deduplicated;
+  raw stderr is not copied into this bounded note. No new event kind is introduced.
 - **crontab:** a clean exit 0 with empty stdout is an existing empty crontab and uses
   SHA-256 of the empty bytes. Absence is accepted only with exit 1, empty stdout, and one
   anchored diagnostic line `no crontab for <username>`, optionally prefixed by `crontab: `,
@@ -212,6 +254,10 @@ to mean wildcard binding only; false does not mean loopback. Neither bind scope 
 boolean proves remote reachability, firewall behavior or network access. No network probe
 is performed.
 
+For legacy listener data, only an **absent** `bindScope` with boolean `exposed: true`
+falls back to wildcard in the page. Explicit unknown or invalid scope stays unknown;
+false does not imply loopback. This fallback does not make legacy collection health known.
+
 ## Log lines
 
 ```
@@ -243,7 +289,8 @@ is also stored in `events(time, kind, message)`.
 Notifications are rate-limited to one per kind per minute. The page also understands
 `CRED-LOG`, a kind older mac-watch logs used; current versions do not write it.
 The existing log kinds are retained; collection health does not introduce a new event-kind
-vocabulary. Startup additions, changes and removals require an accepted aggregate sample.
+vocabulary. Startup additions, changes and removals require a committed observation of
+their filesystem or crontab partition; a failed peer partition cannot invent removals.
 
 ## Settings
 

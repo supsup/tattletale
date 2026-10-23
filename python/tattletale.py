@@ -94,6 +94,8 @@ except OSError:
 def pid_path(pid):
     """The kernel's executable path for a pid (what ps shows as a bare name, e.g. "perl",
     resolved to /usr/bin/perl), or None if it cannot be read."""
+    if type(pid) is not int or not 0 < pid <= 2147483647:
+        raise CollectionError("ps-parse")
     if _libproc is None:
         return None
     buf = ctypes.create_string_buffer(4096)
@@ -121,10 +123,32 @@ __version__ = "0.0.2"
 SCHEMA_VERSION = 1
 FORMAT_VERSION = 2
 CHECKS = ("processes", "listeners", "startup", "crontab")
+ASCII_WS = " \t\r\n\v\f"
 
 
 class CollectionError(ValueError):
     """A fixed, non-observed diagnostic; never put command output in health."""
+
+
+class FatalDatabaseError(RuntimeError):
+    """The connection is unusable; propagate past recoverable polling errors."""
+
+
+def bounded_ascii_number(value, minimum, maximum, reason):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]+", value):
+        raise CollectionError(reason)
+    canonical = value.lstrip("0") or "0"
+    if len(canonical) > len(str(maximum)) or not minimum <= int(canonical) <= maximum:
+        raise CollectionError(reason)
+    return int(canonical)
+
+
+def checked_pid(value, reason, zero=False):
+    return bounded_ascii_number(value, 0 if zero else 1, 2147483647, reason)
+
+
+def ascii_split(value, maxsplit=0):
+    return re.split(r"[ \t\r\n\v\f]+", value.strip(ASCII_WS), maxsplit=maxsplit)
 
 
 def bind_scope(host):
@@ -168,7 +192,8 @@ def command_result(argv, timeout):
         raise CollectionError("collection-parse") from None
     if not isinstance(out, str) or not isinstance(err, str):
         raise CollectionError("collection-parse")
-    return result.returncode, out, err
+    return (result.returncode, out.replace("\r\n", "\n").replace("\r", "\n"),
+            err.replace("\r\n", "\n").replace("\r", "\n"))
 
 
 def command_policy(tool, code, out, err):
@@ -176,8 +201,10 @@ def command_policy(tool, code, out, err):
     if tool == "lsof" and code == 1 and out == "" and err == "":
         return "ok-empty"
     if tool == "crontab" and code == 1 and out == "" and re.fullmatch(
-            r"(?:crontab: )?no crontab for [^\s]+\n?", err):
+            r"(?:crontab: )?no crontab for [^ \t\r\n\v\f]+\n?", err):
         return "ok-absent"
+    if tool == "lsof" and code == 0 and err:
+        raise CollectionError("lsof-warning")
     if code != 0:
         raise CollectionError(tool + "-command")
     if err:
@@ -245,18 +272,20 @@ def open_db_readonly(path):
 
 @contextlib.contextmanager
 def transaction(conn):
-    conn.execute("BEGIN")
     try:
+        conn.execute("BEGIN")
         yield conn
         conn.execute("COMMIT")
-    except BaseException:
+    except BaseException as original:
         try:
-            conn.execute("ROLLBACK")
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
         except sqlite3.Error:
             try:
                 conn.close()  # Unknown transaction state must never be reused.
             except sqlite3.Error:
                 pass
+            raise FatalDatabaseError("collection-db-fatal") from original
         raise
 
 
@@ -304,7 +333,7 @@ class Watch:
     def _rejected(self, name, error):
         if isinstance(error, CollectionError):
             reason = str(error) if str(error) in {"ps-command", "ps-parse", "lsof-command",
-                "lsof-parse", "crontab-command", "startup-read", "collection-io",
+                "lsof-parse", "lsof-warning", "crontab-command", "startup-read", "startup-unreadable", "collection-io",
                 "collection-timeout", "collection-db", "collection-parse"} else "collection-parse"
         elif isinstance(error, sqlite3.Error):
             reason = "collection-db"
@@ -315,7 +344,13 @@ class Watch:
         else:
             reason = "collection-parse"
         with lock:
+            previous = self.collection_health[name]
+            warning_transition = (name == "listeners" and reason == "lsof-warning"
+                                  and not (previous["status"] == "degraded"
+                                           and previous["error"] == "lsof-warning"))
             self.collection_health[name].update(status="degraded", error=reason[:64])
+        if warning_transition:
+            self.log("NOTE", "listeners collection degraded: lsof-warning")
 
     # ---- persistence ----
     def load_state(self):
@@ -327,11 +362,12 @@ class Watch:
             self.known_progs = {r[0] for r in c.execute("SELECT exe FROM programs")}
             self.listeners = {k: {"present": bool(p), "exposed": bool(e)}
                               for k, p, e in c.execute("SELECT key, present, exposed FROM listeners")}
-            self.startup = dict(c.execute("SELECT path, hash FROM startup_items"))
+            self.startup = dict(c.execute("SELECT path, hash FROM startup_items ORDER BY path"))
             for (exe,) in c.execute("SELECT exe FROM programs WHERE sha256 IS NULL AND exe LIKE '/%'"):
                 self.ident_q.put(exe)
         self.baseline = {"programs": not self.known_progs, "listeners": not self.listeners,
-                         "startup": not self.startup}
+                         "startup": not any(p != "crontab -l" for p in self.startup),
+                         "crontab": "crontab -l" not in self.startup}
 
     def import_map(self):
         """One-time import of the old JSON map, only into a database with no programs."""
@@ -442,7 +478,7 @@ class Watch:
                  for r in c.execute("SELECT time, pid, user, exe, args, chain, source FROM"
                                     " (SELECT * FROM credential_events ORDER BY id DESC LIMIT 500)"
                                     " ORDER BY id")]
-        startup = dict(c.execute("SELECT path, hash FROM startup_items"))
+        startup = dict(c.execute("SELECT path, hash FROM startup_items ORDER BY path"))
         return {"programs": programs, "listeners": listeners, "credentials": creds,
                 "startup": startup}
 
@@ -524,31 +560,37 @@ class Watch:
         """A complete, validated pair of ps samples; PID churn between them is normal."""
         code, out, err = command_result(["ps", "-axo", "pid=,ppid=,user=,comm="], 20)
         command_policy("ps", code, out, err)
+        procs = {}
+        for line in out.split("\n"):
+            if not line.strip(ASCII_WS):
+                continue
+            parts = ascii_split(line, 3)
+            if len(parts) != 4 or not parts[3].strip(ASCII_WS):
+                raise CollectionError("ps-parse")
+            pid = checked_pid(parts[0], "ps-parse")
+            ppid = checked_pid(parts[1], "ps-parse", zero=True)
+            if pid in procs:
+                raise CollectionError("ps-parse")
+            exe = parts[3].strip(ASCII_WS)
+            if not exe.startswith("/") and not exe.startswith("("):
+                exe = pid_path(pid) or exe
+            procs[pid] = (ppid, parts[2], exe)
+        if not procs:
+            raise CollectionError("ps-parse")
         code, argv, err = command_result(["ps", "-axo", "pid=,args="], 20)
         command_policy("ps", code, argv, err)
         args = {}
-        for line in argv.splitlines():
-            if not line.strip():
+        for line in argv.split("\n"):
+            if not line.strip(ASCII_WS):
                 continue
-            parts = line.split(None, 1)
-            if not parts or not parts[0].isdigit() or int(parts[0]) <= 0 or int(parts[0]) in args:
+            parts = ascii_split(line, 1)
+            pid = checked_pid(parts[0], "ps-parse")
+            if pid in args:
                 raise CollectionError("ps-parse")
-            args[int(parts[0])] = parts[1].strip() if len(parts) == 2 else ""
-        procs = {}
-        for line in out.splitlines():
-            if not line.strip():
-                continue
-            parts = line.split(None, 3)
-            if (len(parts) != 4 or not parts[0].isdigit() or not parts[1].isdigit()
-                    or int(parts[0]) <= 0 or int(parts[0]) in procs or not parts[3].strip()):
-                raise CollectionError("ps-parse")
-            pid, exe = int(parts[0]), parts[3].strip()
-            if not exe.startswith("/") and not exe.startswith("("):
-                exe = pid_path(pid) or exe
-            procs[pid] = (int(parts[1]), parts[2], exe, args.get(pid, ""))
-        if not procs or not args:
+            args[pid] = parts[1].strip(ASCII_WS) if len(parts) == 2 else ""
+        if not args:
             raise CollectionError("ps-parse")
-        return procs
+        return {pid: row + (args.get(pid, ""),) for pid, row in procs.items()}
 
     @staticmethod
     def chain(procs, pid, depth=6):
@@ -685,7 +727,8 @@ class Watch:
                 self.announce.update(announce)
                 self.dirty_progs, self.prev_pids = dirty, cur
                 self.baseline["programs"] = False
-        except (OSError, subprocess.SubprocessError, sqlite3.Error, ValueError) as e:
+        except (OSError, subprocess.SubprocessError, sqlite3.Error, ValueError,
+                TypeError, KeyError, OverflowError, ctypes.ArgumentError) as e:
             self._rejected("processes", e)
             return False
         for row in new_progs:
@@ -703,16 +746,17 @@ class Watch:
             code, out, err = command_result(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"], 60)
             command_policy("lsof", code, out, err)
             records, pid, cmd, named, pending_fd = [], None, None, False, False
-            for line in out.splitlines():
+            lines = out.split("\n") if out else []
+            if lines and lines[-1] == "":
+                lines.pop()
+            for line in lines:
                 if not line:
-                    continue
+                    raise CollectionError("lsof-parse")
                 tag, value = line[0], line[1:]
                 if tag == "p":
                     if pending_fd or (pid is not None and not named):
                         raise CollectionError("lsof-parse")
-                    if not value.isdigit() or int(value) <= 0:
-                        raise CollectionError("lsof-parse")
-                    pid, cmd, named = int(value), None, False
+                    pid, cmd, named = checked_pid(value, "lsof-parse"), None, False
                 elif tag == "c" and pid is not None and cmd is None and value:
                     cmd = value
                 elif tag == "f" and pid is not None and cmd:
@@ -721,9 +765,10 @@ class Watch:
                     pending_fd = True
                 elif tag == "n" and pid is not None and cmd:
                     host, sep, port = value.rpartition(":")
-                    if not sep or not host or any(x.isspace() for x in host) or not port.isdigit() or not 0 < int(port) <= 65535:
+                    if not sep or not host or any(x in ASCII_WS for x in host):
                         raise CollectionError("lsof-parse")
-                    records.append((pid, cmd, value, host, int(port)))
+                    port_number = bounded_ascii_number(port, 1, 65535, "lsof-parse")
+                    records.append((pid, cmd, value, host, port_number))
                     named = True
                     pending_fd = False
                 else:
@@ -740,10 +785,12 @@ class Watch:
                 exe = p[2] if p else pid_path(pid)
                 if not exe or not exe.startswith("/"):
                     code, comm, err = command_result(["ps", "-o", "comm=", "-p", str(pid)], 20)
-                    rows = comm.splitlines()
-                    if code != 0 or err or len(rows) != 1 or not rows[0].strip():
+                    rows = comm.split("\n")
+                    if rows and rows[-1] == "":
+                        rows.pop()
+                    if code != 0 or err or len(rows) != 1 or not rows[0].strip(ASCII_WS):
                         raise CollectionError("lsof-parse")
-                    exe = rows[0].strip()
+                    exe = rows[0].strip(ASCII_WS)
                 if (not exe.startswith("/") or exe == "<defunct>"
                         or (exe.startswith("(") and exe.endswith(")"))):
                     raise CollectionError("lsof-parse")
@@ -786,7 +833,8 @@ class Watch:
                                   [(t, kind, message) for kind, message in events])
                 self.listeners, self.dirty_listeners = seen, dirty
                 self.baseline["listeners"] = False
-        except (OSError, subprocess.SubprocessError, sqlite3.Error, ValueError) as e:
+        except (OSError, subprocess.SubprocessError, sqlite3.Error, ValueError,
+                TypeError, KeyError, OverflowError, ctypes.ArgumentError) as e:
             self._rejected("listeners", e)
             return False
         self._accepted("listeners")
@@ -808,7 +856,24 @@ class Watch:
                 if parent == ancestor:
                     break
                 ancestor = parent
-        contents = {}
+        contents, markers = {}, {}
+        def read_entry(path, listed=False):
+            try:
+                with open(path, "rb") as f:
+                    contents[path] = f.read()
+            except PermissionError:
+                os.lstat(path)  # A source ancestor failure must not masquerade as a known entry.
+                markers[path] = "unreadable: permission-denied"
+            except IsADirectoryError:
+                os.lstat(path)
+                markers[path] = "unreadable: directory"
+            except FileNotFoundError:
+                if os.path.islink(path) and not os.path.exists(path):
+                    markers[path] = "unreadable: dangling-link"
+                elif listed:
+                    raise CollectionError("startup-read") from None
+                else:
+                    optional_absent(path)
         for directory in STARTUP_DIRS:
             try:
                 names = sorted(os.listdir(directory))
@@ -817,15 +882,12 @@ class Watch:
                 continue
             for name in names:
                 path = os.path.join(directory, name)
-                with open(path, "rb") as f:
-                    contents[path] = f.read()
+                read_entry(path, listed=True)
         for path in STARTUP_FILES + self.extra_startup:
-            try:
-                with open(path, "rb") as f:
-                    contents[path] = f.read()
-            except FileNotFoundError:
-                optional_absent(path)
-        return {p: hashlib.sha256(data).hexdigest() for p, data in contents.items()}, contents
+            read_entry(path)
+        snap = {p: hashlib.sha256(data).hexdigest() for p, data in contents.items()}
+        snap.update(markers)
+        return snap, contents
 
     @staticmethod
     def _crontab_sample():
@@ -912,56 +974,115 @@ class Watch:
 
     def check_startup(self):
         self._attempt("startup")
-        crontab_attempted = False
+        errors, eligible = {}, set()
+        snap, contents = {}, {}
         try:
-            try:
-                snap, contents = self._startup_files()
-            except OSError:
-                raise CollectionError("startup-read") from None
-            self._attempt("crontab")
-            crontab_attempted = True
+            snap, contents = self._startup_files()
+            snap = {p: h for p, h in snap.items() if p != "crontab -l"}
+            eligible.add("startup")
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError,
+                KeyError, OverflowError) as e:
+            errors["startup"] = (CollectionError("startup-read") if isinstance(e, OSError) else e)
+        self._attempt("crontab")
+        crontab_text = self.crontab_text
+        try:
             digest, crontab_text = self._crontab_sample()
-            snap["crontab -l"], contents["crontab -l"] = digest, crontab_text.encode()
-            old, t = self.startup, now()
-            versions, events = [], []
-            for path in sorted(snap):
-                if self.baseline["startup"] or path not in old or old[path] != snap[path]:
-                    copy = self.keep_copy(path, snap[path], contents[path])
-                    versions.append((path, snap[path], copy, t))
-                    if not self.baseline["startup"]:
+            eligible.add("crontab")
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError,
+                KeyError, OverflowError) as e:
+            errors["crontab"] = e
+        old, t = dict(self.startup), now()
+        baselines = {"startup": self.baseline["startup"],
+                     "crontab": self.baseline.get("crontab", "crontab -l" not in old)}
+        candidates = {"startup": snap, "crontab": {}}
+        if "crontab" in eligible:
+            candidates["crontab"] = {"crontab -l": digest}
+            contents["crontab -l"] = crontab_text.encode()
+        copies, partition_versions = {}, {"startup": [], "crontab": []}
+        for partition in ("startup", "crontab"):
+            if partition not in eligible:
+                continue
+            try:
+                staged_copies, staged_versions = {}, []
+                for path, value in sorted(candidates[partition].items()):
+                    if baselines[partition] or path not in old or old[path] != value:
+                        copy = self.keep_copy(path, value, contents[path]) if path in contents else None
+                        staged_copies[path] = copy
+                        staged_versions.append((path, value, copy, t))
+                copies.update(staged_copies)
+                partition_versions[partition] = staged_versions
+            except (OSError, subprocess.SubprocessError, sqlite3.Error, ValueError,
+                    TypeError, KeyError, OverflowError) as e:
+                errors[partition] = e
+                eligible.remove(partition)
+        proposed = dict(old)
+        if "startup" in eligible:
+            proposed = {p: h for p, h in old.items() if p == "crontab -l"}
+            proposed.update(snap)
+        if "crontab" in eligible:
+            proposed["crontab -l"] = digest
+        try:
+            versions = sorted((row for partition in ("startup", "crontab")
+                               for row in partition_versions[partition]), key=lambda row: row[0])
+            events = []
+            upserts, removals = [], []
+            for path in sorted(set(old) | set(proposed)):
+                partition = "crontab" if path == "crontab -l" else "startup"
+                if partition not in eligible:
+                    continue
+                if path not in proposed:
+                    removals.append((path,))
+                    if not baselines[partition]:
+                        before = (None if old[path].startswith("unreadable: ") else
+                                  os.path.join(self.snap_dir, self.safe_name(path), old[path][:16]))
+                        events.append(("STARTUP-", f"removed: {path} | last copy: {before}"))
+                    continue
+                upserts.append((path, proposed[path], t))
+                if baselines[partition] or path not in old or old[path] != proposed[path]:
+                    copy = copies[path]
+                    if not baselines[partition]:
                         if path not in old:
                             events.append(("STARTUP+", f"added: {path} | copy: {copy}"))
                         else:
-                            before = os.path.join(self.snap_dir, self.safe_name(path), old[path][:16])
+                            before = (None if old[path].startswith("unreadable: ") else
+                                      os.path.join(self.snap_dir, self.safe_name(path), old[path][:16]))
                             events.append(("STARTUP~", f"changed: {path} | before: {before} | after: {copy}\n"
                                            + self.diff(before, copy)))
-            if not self.baseline["startup"]:
-                for path in sorted(set(old) - set(snap)):
-                    before = os.path.join(self.snap_dir, self.safe_name(path), old[path][:16])
-                    events.append(("STARTUP-", f"removed: {path} | last copy: {before}"))
-            if self.baseline["startup"]:
+            if "startup" in eligible and baselines["startup"]:
                 events.append(("BASELINE", f"startup items: {len(snap)} recorded, copies in {self.snap_dir}"))
-            with lock:
-                with transaction(self.db) as c:
-                    c.executemany("DELETE FROM startup_items WHERE path=?", [(p,) for p in old if p not in snap])
-                    c.executemany("INSERT OR REPLACE INTO startup_items(path, hash, last_checked) VALUES (?,?,?)",
-                                  [(p, h, t) for p, h in snap.items()])
-                    c.executemany("INSERT INTO startup_versions(path, hash, copy_path, seen_at) VALUES (?,?,?,?)",
-                                  versions)
-                    c.executemany("INSERT INTO events(time, kind, message) VALUES (?,?,?)",
-                                  [(t, kind, message) for kind, message in events])
-                self.startup, self.crontab_text = snap, crontab_text
-                self.baseline["startup"] = False
-        except (OSError, subprocess.SubprocessError, sqlite3.Error, ValueError) as e:
-            self._rejected("startup", e)
-            if crontab_attempted:
-                self._rejected("crontab", e)
-            return False
-        self._accepted("startup")
-        self._accepted("crontab")
+            if "crontab" in eligible and baselines["crontab"]:
+                events.append(("BASELINE", f"crontab: 1 recorded, copies in {self.snap_dir}"))
+            if eligible:
+                with lock:
+                    with transaction(self.db) as c:
+                        c.executemany("DELETE FROM startup_items WHERE path=?", removals)
+                        c.executemany("INSERT OR REPLACE INTO startup_items(path, hash, last_checked) VALUES (?,?,?)",
+                                      upserts)
+                        c.executemany("INSERT INTO startup_versions(path, hash, copy_path, seen_at) VALUES (?,?,?,?)",
+                                      versions)
+                        c.executemany("INSERT INTO events(time, kind, message) VALUES (?,?,?)",
+                                      [(t, kind, message) for kind, message in events])
+                    self.startup = proposed
+                    if "crontab" in eligible:
+                        self.crontab_text = crontab_text
+                    for partition in eligible:
+                        self.baseline[partition] = False
+        except (OSError, subprocess.SubprocessError, sqlite3.Error, ValueError,
+                TypeError, KeyError, OverflowError) as e:
+            for partition in eligible:
+                errors[partition] = e
+            events = []
+        if "startup" in eligible and "startup" not in errors and any(
+                h.startswith("unreadable: ") for h in snap.values()):
+            errors["startup"] = CollectionError("startup-unreadable")
+        for partition in ("startup", "crontab"):
+            if partition in errors:
+                self._rejected(partition, errors[partition])
+            elif partition in eligible:
+                self._accepted(partition)
         for kind, message in events:
             self.log(kind, message, stored=True, event_time=t)
-        return True
+        return not errors
 
     # ---- 1b: short-lived credential and git network helpers from the unified log ----
     STREAM_PROCS = ("git-credential-osxkeychain", "git-remote-https", "git-remote-http",
@@ -1043,13 +1164,32 @@ class Watch:
         path = os.path.join(os.path.dirname(os.path.abspath(self.db_path)), "tattletale.pid")
         try:
             with open(path) as f:
-                other = int(f.read().strip() or 0)
-        except (OSError, ValueError):
+                other = checked_pid(f.read().strip(ASCII_WS), "ps-parse")
+        except FileNotFoundError:
+            if os.path.lexists(path):
+                raise SystemExit("tattletale: pid identity unavailable") from None
             other = 0
+        except (OSError, ValueError):
+            raise SystemExit("tattletale: pid identity unavailable") from None
         if other and other != os.getpid():
-            r = subprocess.run(["ps", "-p", str(other), "-o", "command="],
-                               capture_output=True, text=True)
-            if r.returncode == 0 and is_tattletale(r.stdout):
+            try:
+                r = subprocess.run(["ps", "-p", str(other), "-o", "command="],
+                                   capture_output=True, timeout=20)
+                out = r.stdout.decode("utf-8", "replace") if isinstance(r.stdout, bytes) else r.stdout
+                err = r.stderr.decode("utf-8", "replace") if isinstance(r.stderr, bytes) else r.stderr
+                if not isinstance(out, str) or not isinstance(err, str):
+                    raise ValueError("pid-observation")
+                out, err = (s.replace("\r\n", "\n").replace("\r", "\n") for s in (out, err))
+            except (OSError, subprocess.SubprocessError, ValueError):
+                raise SystemExit("tattletale: pid identity unavailable") from None
+            rows = out.split("\n")
+            if rows and rows[-1] == "":
+                rows.pop()
+            absent = r.returncode == 1 and out == "" and err == ""
+            observed = r.returncode == 0 and err == "" and len(rows) == 1 and rows[0].strip(ASCII_WS)
+            if not absent and not observed:
+                raise SystemExit("tattletale: pid identity unavailable")
+            if observed and is_tattletale(rows[0]):
                 raise SystemExit(f"tattletale: already running as pid {other} for this database "
                                  f"({path}); stop it first: kill {other}")
         with open(path, "w") as f:
@@ -1088,17 +1228,19 @@ class Watch:
 
     def run(self):
         self.claim_pid_file()
-        self.install_dashboard()
-        self.log("START", f"tattletale {__version__} pid {os.getpid()} db {self.db_path}")
-        self.load_state()
-        self._safe("retention", self.retain)
-        threading.Thread(target=self.log_stream, daemon=True).start()
-        threading.Thread(target=self.identity_worker, daemon=True).start()
-        # -inf, not 0.0: time.monotonic() can be small, so "0 seconds ago" would delay the
-        # first startup scan by up to its interval instead of running it on the first pass.
-        last = {"listeners": float("-inf"), "startup": float("-inf")}
-        last_retention = time.monotonic()
+        workers = []
         try:
+            self.install_dashboard()
+            self.log("START", f"tattletale {__version__} pid {os.getpid()} db {self.db_path}")
+            self.load_state()
+            self._safe("retention", self.retain)
+            for target in (self.log_stream, self.identity_worker):
+                worker = threading.Thread(target=target, daemon=True)
+                worker.start()
+                workers.append(worker)
+            # Start every scheduled check on the first pass.
+            last = {"listeners": float("-inf"), "startup": float("-inf")}
+            last_retention = time.monotonic()
             while not self.stop.is_set():
                 t0 = time.monotonic()
                 for name, fn in (("processes", self.check_processes),):
@@ -1117,20 +1259,40 @@ class Watch:
                     self._safe("save", self.save)
                 self.stop.wait(self.process_every)
         finally:
-            # Runs even when the loop raises, so the log stream child is stopped and the
-            # pid file released instead of being left behind by a crash.
-            self._safe("save", self.save)
-            p = getattr(self, "stream_proc", None)
-            if p is not None and p.poll() is None:
-                p.terminate()
+            # A fatal DB error must exit, not turn into a silent live no-op. Cleanup may
+            # fail too, but must neither mask the primary failure nor skip PID release.
+            original = sys.exc_info()[1]
+            cleanup_error = None
+            self.stop.set()
+            def cleanup(fn):
+                nonlocal cleanup_error
                 try:
-                    p.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    p.kill()
-            self.log("STOP", "tattletale stopped")
-            with lock:
-                self.db.close()
-            self.release_pid_file()
+                    fn()
+                except Exception as e:
+                    cleanup_error = cleanup_error or e
+            cleanup(lambda: self._safe("save", self.save))
+            def stop_stream():
+                p = getattr(self, "stream_proc", None)
+                if p is not None and p.poll() is None:
+                    p.terminate()
+                    try:
+                        p.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+                        p.wait(timeout=5)
+            cleanup(stop_stream)
+            for worker in workers:
+                cleanup(lambda worker=worker: worker.join(timeout=2))
+            cleanup(lambda: self.log("STOP", "tattletale stopped"))
+            def close_db():
+                with lock:
+                    self.db.close()
+            cleanup(close_db)
+            cleanup(self.release_pid_file)
+            if cleanup_error is not None:
+                print("tattletale: cleanup incomplete", file=sys.stderr, flush=True)
+                if original is None:
+                    raise FatalDatabaseError("collection-db-fatal") from cleanup_error
 
     def _safe(self, name, fn):
         try:

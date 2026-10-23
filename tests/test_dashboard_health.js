@@ -80,6 +80,14 @@ function page() {
       document.currentScript = script; context.TATTLETALE = d; document.currentScript = null;
     },
     text: (id) => ids.get(id).textContent,
+    programText: () => body.textContent,
+    failNextProgramRender: () => {
+      const replace = body.replaceChildren.bind(body);
+      body.replaceChildren = (...kids) => {
+        body.replaceChildren = replace;
+        throw Error("synthetic one-shot final program-panel DOM failure");
+      };
+    },
     shown: () => ids.get("banner").classList.contains("show"),
     advance: (seconds) => { now += seconds * 1000; },
     tickInterval: () => intervals.find((x) => x.ms === 15000).fn()
@@ -125,7 +133,7 @@ test("stale file remains independent of successful health", () => {
 });
 test("load error survives timer and a successful render recovers", () => {
   const p = page(); p.render(data()); p.load(); p.head.children.at(-1).onerror();
-  p.tickInterval(); assert.match(p.text("live"), /No data/); assert.equal(p.shown(), true);
+  p.tickInterval(); assert.match(p.text("live"), /Refresh failed/); assert.equal(p.shown(), true);
   p.render(data()); assert.match(p.text("live"), /Live/); assert.equal(p.shown(), false);
 });
 for (const [name, mutate] of [
@@ -181,10 +189,11 @@ test("a loaded script without a fresh assignment cannot reuse the last payload",
   const p = page(); p.setPayload(data()); p.load(); p.head.children.at(-1).onload();
   p.tick(); assert.match(p.text("live"), /No data/); assert.equal(p.shown(), true);
 });
-test("malformed map after a good sample leaves a persistent error, not green health", () => {
+test("malformed map retains last accepted health under a persistent refresh error", () => {
   const p = page(), d = data(); p.render(d); d.map.programs["/fixture/service"] = null; p.render(d);
-  p.tick(); assert.match(p.text("live"), /No data/);
-  assert.match(p.text("collection-health"), /Process list: unknown/);
+  p.tick(); assert.match(p.text("live"), /Refresh failed/);
+  assert.match(p.text("collection-health"), /Process list: ok/);
+  assert.match(p.text("collection-health"), /Last-known health/);
   assert.match(p.text("att-list"), /no accepted refresh/);
   assert.equal(p.shown(), true);
 });
@@ -201,4 +210,140 @@ test("older overlapping assignment cannot supply an empty current script", () =>
   const p = page(), old = p.head.children.at(-1); p.load(); const current = p.head.children.at(-1);
   p.setPayload(data(), old); old.onload(); current.onload(); p.tick();
   assert.match(p.text("live"), /No data/); assert.match(p.text("collection-health"), /Listening sockets: unknown/);
+});
+
+for (const [name, fields, expected] of [
+  ["legacy true", { exposed: true }, "All interfaces bind"],
+  ["legacy false", { exposed: false }, "Unknown bind scope"],
+  ["legacy missing", {}, "Unknown bind scope"],
+  ["legacy number", { exposed: 1 }, "Unknown bind scope"],
+  ["legacy string", { exposed: "true" }, "Unknown bind scope"],
+  ["explicit unknown", { exposed: true, bindScope: "unknown" }, "Unknown bind scope"],
+  ["explicit null", { exposed: true, bindScope: null }, "Unknown bind scope"],
+  ["explicit undefined", { exposed: true, bindScope: undefined }, "Unknown bind scope"],
+  ["explicit invalid", { exposed: true, bindScope: "invalid" }, "Unknown bind scope"],
+  ["explicit loopback", { exposed: true, bindScope: "loopback" }, "Loopback bind"]
+]) test(name + " scope uses only the precise legacy fallback", () => {
+  const p = page(), d = data(); delete d.formatVersion; delete d.collectionHealth;
+  d.map.listeners["/fixture/legacy *:12345"] = { present: true, ...fields };
+  p.render(d);
+  assert.match(p.text("listeners"), new RegExp(expected));
+  assert.match(p.text("collection-health"), /Listening sockets: unknown/);
+  assert.match(p.text("tiles"), new RegExp("Non-loopback binds" + (expected === "All interfaces bind" ? "1" : "0")));
+  if (expected === "All interfaces bind") assert.match(p.text("att-list"), /Non-loopback listener binds/);
+});
+test("legacy wildcard inference cannot resurrect an absent listener", () => {
+  const p = page(), d = data(); d.map.listeners["/fixture/legacy *:12345"] = { present: false, exposed: true, lastSeen: clock };
+  p.render(d); assert.match(p.text("tiles"), /Non-loopback binds0/);
+  assert.doesNotMatch(p.text("att-list"), /Non-loopback listener binds/);
+});
+test("fixed incomplete check names coexist with both fresh and stale file status", () => {
+  const p = page(), d = data();
+  d.collectionHealth.listeners = { status: "degraded", lastAttempt: clock, lastSuccess: clock, error: "lsof-command" };
+  d.collectionHealth.startup = { status: "unknown", lastAttempt: null, lastSuccess: null, error: null };
+  p.render(d);
+  for (const age of [0, 180, 181]) {
+    if (age === 180) p.advance(180);
+    if (age === 181) p.advance(1);
+    p.tickInterval();
+    assert.match(p.text("live"), age > 180 ? /Stale/ : /Live/);
+    assert.match(p.text("banner"), /Listening sockets: degraded/);
+    assert.match(p.text("banner"), /Startup items: unknown/);
+    assert.doesNotMatch(p.text("banner"), /Process list: degraded|Crontab: degraded/);
+  }
+});
+test("first in-flight attempt is truthful unknown health without discarding other checks", () => {
+  const p = page(), d = data();
+  d.collectionHealth.startup = { status: "unknown", lastAttempt: clock, lastSuccess: null, error: null };
+  p.render(d);
+  assert.match(p.text("collection-health"), /Process list: ok/);
+  assert.match(p.text("collection-health"), /Startup items: unknown \| attempted: 2000-01-01T00:00:00Z/);
+  assert.match(p.text("banner"), /Startup items: unknown/);
+});
+test("refresh failure retains actual last accepted metadata and inventory", () => {
+  const p = page(), d = data();
+  d.collectionHealth.listeners = { status: "degraded", lastAttempt: clock, lastSuccess: clock, error: "lsof-command" };
+  d.map.listeners["/fixture/accepted 127.0.0.1:12345"] = { present: true, bindScope: "loopback", command: "accepted" };
+  p.render(d);
+  const health = p.text("collection-health"), updated = p.text("updated"), inventory = p.text("listeners");
+  p.load(); p.head.children.at(-1).onerror(); p.advance(181); p.tickInterval();
+  assert.match(p.text("live"), /Refresh failed/);
+  assert.match(p.text("collection-health"), /Last-known health/);
+  assert.ok(p.text("collection-health").includes(health));
+  assert.ok(p.text("updated").includes(updated));
+  assert.equal(p.text("listeners"), inventory);
+  assert.match(p.text("banner"), /last-known/);
+  assert.match(p.text("banner"), /Listening sockets: degraded/);
+  assert.doesNotMatch(p.text("collection-health"), /Listening sockets: unknown/);
+});
+test("late rejected render restores the complete accepted view and detached payload", () => {
+  const p = page(), accepted = data();
+  accepted.map.listeners["/fixture/accepted 127.0.0.1:12345"] = { present: true, bindScope: "loopback", command: "accepted" };
+  p.render(accepted);
+  const inventory = p.text("listeners"), tiles = p.text("tiles"), updated = p.text("updated");
+  // The caller must not be able to mutate the retained snapshot after acceptance.
+  accepted.collectionHealth.listeners.status = "degraded";
+  accepted.collectionHealth.listeners.error = "lsof-command";
+  const rejected = data("degraded"); rejected.generatedAt = "2000-01-01T00:01:00Z"; rejected.version = "rejected";
+  rejected.map.programs["/fixture/rejected"] = { firstSeen: "invalid-date" };
+  p.render(rejected); p.tickInterval();
+  assert.match(p.text("live"), /Refresh failed/);
+  assert.match(p.text("collection-health"), /Listening sockets: ok/);
+  assert.ok(p.text("updated").includes(updated));
+  assert.equal(p.text("listeners"), inventory);
+  assert.equal(p.text("tiles"), tiles);
+  assert.doesNotMatch(p.text("ver"), /rejected/);
+  p.render(data()); assert.match(p.text("live"), /Live/); assert.equal(p.shown(), false);
+});
+test("initial late render failure leaves no mixed inventory or false accepted metadata", () => {
+  const p = page(), d = data(); d.map.programs["/fixture/rejected"] = { firstSeen: "invalid-date" };
+  p.render(d); p.tickInterval();
+  assert.match(p.text("live"), /No data/);
+  assert.match(p.text("collection-health"), /Process list: unknown/);
+  assert.equal(p.text("updated"), ""); assert.equal(p.text("tiles"), "");
+  assert.equal(p.text("listeners"), ""); assert.equal(p.shown(), true);
+});
+test("final panel failure restores every earlier inventory panel from the fully accepted payload", () => {
+  const p = page(), accepted = data(); accepted.version = "accepted";
+  const program = (name) => ({ firstSeen: clock, lastSeen: clock, user: "fixture", signer: "adhoc", firstArgs: name });
+  accepted.map.programs["/fixture/old"] = program("old");
+  accepted.map.listeners["/fixture/old 127.0.0.1:12345"] = { present: true, bindScope: "loopback", command: "old" };
+  accepted.map.startup["/fixture/old"] = "old-hash";
+  accepted.map.credentials.push({ time: clock, exe: "/fixture/old", args: "old", chain: "old", source: "ps" });
+  accepted.log = [clock + "  STARTUP+  added: /fixture/old | copy: /fixture/copies/old"];
+  p.render(accepted);
+  const panels = ["tiles", "listeners", "creds", "timeline", "signers", "startup", "feed", "chips", "progCount", "ver"];
+  const old = Object.fromEntries(panels.map((id) => [id, p.text(id)]));
+  const oldPrograms = p.programText(), oldUpdated = p.text("updated"), oldHealth = p.text("collection-health");
+  accepted.map.listeners["/fixture/old 127.0.0.1:12345"].command = "caller-mutated";
+  accepted.map.programs["/fixture/old"].signer = "caller-mutated";
+  const rejected = data("degraded"); rejected.version = "rejected"; rejected.generatedAt = "2000-01-01T00:01:00Z";
+  rejected.map.programs["/fixture/new"] = program("new");
+  rejected.map.listeners["/fixture/new *:23456"] = { present: true, bindScope: "wildcard", command: "new" };
+  rejected.map.startup["/fixture/new"] = "new-hash";
+  rejected.map.credentials.push({ time: clock, exe: "/fixture/new", args: "new", chain: "new", source: "ps" });
+  rejected.log = [clock + "  STARTUP+  added: /fixture/new | copy: /fixture/copies/new"];
+  p.failNextProgramRender(); p.render(rejected); p.tickInterval();
+  for (const id of panels) assert.equal(p.text(id), old[id], id + " retained rejected data");
+  assert.equal(p.programText(), oldPrograms);
+  assert.ok(p.text("collection-health").includes(oldHealth));
+  assert.ok(p.text("updated").includes(oldUpdated));
+  assert.match(p.text("live"), /Refresh failed/);
+  assert.doesNotMatch(p.text("listeners") + p.programText(), /caller-mutated|\/fixture\/new/);
+});
+test("strict lsof warning is named with retained listeners in both Live and Stale views", () => {
+  const p = page(), d = data();
+  d.collectionHealth.listeners = { status: "degraded", lastAttempt: clock, lastSuccess: clock, error: "lsof-warning" };
+  d.map.listeners["/fixture/retained 127.0.0.1:12345"] = { present: true, bindScope: "loopback", command: "retained" };
+  p.render(d);
+  for (const stale of [false, true]) {
+    if (stale) p.advance(181);
+    p.tickInterval();
+    assert.match(p.text("live"), stale ? /Stale/ : /Live/);
+    assert.match(p.text("banner"), /Listening sockets: degraded \(lsof-warning\)/);
+    assert.match(p.text("collection-health"), /Listening sockets: degraded.*lsof-warning/);
+    assert.match(p.text("listeners"), /retained/);
+    assert.match(p.text("listeners"), /Last-known values; collection degraded/);
+    assert.doesNotMatch(p.text("att-list"), /No new observations to review/);
+  }
 });

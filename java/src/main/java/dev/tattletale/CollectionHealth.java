@@ -22,6 +22,9 @@ final class CollectionHealth {
     synchronized void fail(String key, String code) {
         Map<String,Object> e=entries.get(key); e.put("status","degraded"); e.put("error",code);
     }
+    synchronized boolean degradedWith(String key,String code) {
+        Map<String,Object> e=entries.get(key);return e.get("status").equals("degraded") && code.equals(e.get("error"));
+    }
     synchronized Map<String,Object> snapshot() {
         Map<String,Object> out=new LinkedHashMap<>();
         entries.forEach((k,v)->out.put(k,new LinkedHashMap<>(v))); return out;
@@ -32,13 +35,14 @@ final class CollectionHealth {
         Rejected(String code) { super(code); this.code=code; }
     }
     static String command(String tool, Proc.Result r) throws Rejected {
+        if (tool.equals("lsof") && r.code()==0 && !r.err().isEmpty()) throw new Rejected("lsof-warning");
         if (tool.equals("lsof") && ((r.code()==0 && r.err().isEmpty()) ||
                 (r.code()==1 && r.out().isEmpty() && r.err().isEmpty()))) return r.out().isEmpty()?"ok-empty":"ok";
         if (tool.equals("crontab")) {
             if (r.code()==0 && r.err().isEmpty()) return r.out().isEmpty()?"ok-empty":"ok";
             if (r.code()==1 && r.out().isEmpty() && r.err().matches("(?:crontab: )?no crontab for [^\\s\\r\\n]+\\n?")) return "ok-absent";
         }
-        if (tool.equals("ps") && r.code()==0 && r.err().isEmpty()) return r.out().isBlank()?"ok-empty":"ok";
+        if (tool.equals("ps") && r.code()==0 && r.err().isEmpty()) return Watch.asciiStrip(r.out()).isEmpty()?"ok-empty":"ok";
         throw new Rejected(tool+"-command");
     }
     static String ioError(IOException e) {

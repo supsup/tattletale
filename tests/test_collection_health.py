@@ -20,6 +20,7 @@ with mock.patch.object(ctypes, 'CDLL', side_effect=OSError('fixture native loade
     SPEC.loader.exec_module(TT)
 T0 = FIXTURE['clock']
 T1 = '2000-01-01T00:01:00Z'
+REAL_PID_PATH = TT.pid_path
 PS_COMM = ('ps', '-axo', 'pid=,ppid=,user=,comm=')
 PS_ARGS = ('ps', '-axo', 'pid=,args=')
 LSOF = ('lsof', '-nP', '-iTCP', '-sTCP:LISTEN', '-F', 'pcn')
@@ -125,6 +126,28 @@ class CollectionHealthTests(unittest.TestCase):
             self.assertFalse(self.w.check_listeners())
         self.assertEqual(before, self.inventory())
 
+    def test_lsof_exit0_warning_preserves_every_listener_and_reports_distinct_code(self):
+        self.seed_listener(); before = self.inventory()
+        self.w.collection_health['listeners']['lastSuccess'] = T1
+        for diagnostic in ['WARNING: cannot stat synthetic storage\n', 'unrecognized diagnostic', '\n']:
+            with self.commands({LSOF: (0, LISTENER, diagnostic)}) as calls:
+                self.assertFalse(self.w.check_listeners())
+            expected = copy.deepcopy(before)
+            expected['db']['events'] = [(1, T0, 'NOTE', 'listeners collection degraded: lsof-warning')]
+            self.assertEqual(expected, self.inventory())
+            self.assertEqual(self.w.collection_health['listeners']['status'], 'degraded')
+            self.assertEqual(self.w.collection_health['listeners']['error'], 'lsof-warning')
+            self.assertEqual(self.w.collection_health['listeners']['lastSuccess'], T1)
+            self.assertEqual([tuple(c.args[0]) for c in calls.call_args_list], [LSOF])
+        responses = self.ps_responses(); responses[LSOF] = (0, LISTENER, '')
+        with self.commands(responses): self.assertTrue(self.w.check_listeners())
+        after_recovery = self.inventory()
+        with self.commands({LSOF: (0, LISTENER, 'WARNING: public fixture\n')}): self.assertFalse(self.w.check_listeners())
+        expected = copy.deepcopy(after_recovery)
+        expected['db']['events'] = [(1, T0, 'NOTE', 'listeners collection degraded: lsof-warning'),
+                                    (2, T0, 'NOTE', 'listeners collection degraded: lsof-warning')]
+        self.assertEqual(expected, self.inventory())
+
     def test_listener_missing_identity_rejects_sample(self):
         self.seed_listener()
         before = self.inventory()
@@ -208,28 +231,34 @@ class CollectionHealthTests(unittest.TestCase):
         self.assertEqual(self.w.db.execute('SELECT count(*) FROM sightings').fetchone()[0], 1)
         self.assertEqual(list(self.w.ident_q.queue), ['/fixture/service'])
 
-    def test_startup_directory_failure_does_not_attempt_crontab(self):
-        self.seed_startup(); before = self.inventory()
+    def test_startup_directory_failure_keeps_files_but_attempts_crontab(self):
+        self.seed_startup(); before = dict(self.w.startup)
         with mock.patch.object(TT, 'STARTUP_DIRS', ['/fixture/unreadable']), mock.patch.object(
-                TT.os, 'listdir', side_effect=PermissionError('fake private filename')):
+                TT.os, 'listdir', side_effect=PermissionError('fake private filename')), self.commands(
+                {CRON: (0, '* * * * * fixture\n', '')}) as calls:
             self.assertFalse(self.w.check_startup())
-        self.assertEqual(before, self.inventory())
+        self.assertEqual(self.w.startup['/fixture/old.rc'], before['/fixture/old.rc'])
         self.assert_degraded('startup')
-        self.assertEqual(self.w.collection_health['crontab']['status'], 'unknown')
-        self.run_mock.assert_not_called()
+        self.assertEqual(self.w.collection_health['crontab']['status'], 'ok')
+        self.assertEqual(self.w.collection_health['crontab']['lastAttempt'], T0)
+        self.assertEqual(self.w.crontab_text, '* * * * * fixture\n')
+        self.assertEqual([tuple(c.args[0]) for c in calls.call_args_list], [CRON])
 
-    def test_startup_late_file_failure_preserves_whole_sample(self):
+    def test_startup_late_permission_marker_does_not_hide_readable_peer(self):
         self.seed_startup(); first = self.root / 'first'; second = self.root / 'second'
         first.write_bytes(b'public fixture'); second.write_bytes(b'public fixture')
         original = open
         def read_file(path, *args, **kwargs):
             if str(path) == str(second): raise PermissionError('fake private path')
             return original(path, *args, **kwargs)
-        before = self.inventory()
-        with mock.patch.object(TT, 'STARTUP_FILES', [str(first), str(second)]), mock.patch('builtins.open', side_effect=read_file):
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(first), str(second)]), mock.patch('builtins.open', side_effect=read_file), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
             self.assertFalse(self.w.check_startup())
-        self.assertEqual(before, self.inventory())
-        self.run_mock.assert_not_called()
+        self.assertEqual(self.w.startup[str(first)], TT.hashlib.sha256(first.read_bytes()).hexdigest())
+        self.assertEqual(self.w.startup[str(second)], 'unreadable: permission-denied')
+        self.assertEqual(self.w.collection_health['startup']['error'], 'startup-unreadable')
+        self.assertIsNone(self.w.collection_health['startup']['lastSuccess'])
+        self.assertEqual(self.w.collection_health['crontab']['status'], 'ok')
+        self.assertIsNone(self.w.db.execute('SELECT copy_path FROM startup_versions WHERE path=?', (str(second),)).fetchone()[0])
 
     def test_startup_optional_missing_is_accepted(self):
         with mock.patch.object(TT, 'STARTUP_DIRS', [str(self.root / 'missing-dir')]), mock.patch.object(
@@ -240,26 +269,27 @@ class CollectionHealthTests(unittest.TestCase):
         self.assertEqual(self.w.collection_health['crontab']['status'], 'ok')
 
     def test_optional_broken_source_or_ancestor_is_not_absence(self):
-        self.seed_startup(); before = self.inventory()
+        self.seed_startup()
         broken = self.root / 'broken'; broken.symlink_to(self.root / 'missing-target')
         for name in ['STARTUP_DIRS', 'STARTUP_FILES']:
             for path in [broken, broken / 'child']:
-                with mock.patch.object(TT, name, [str(path)]):
+                with mock.patch.object(TT, name, [str(path)]), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
                     self.assertFalse(self.w.check_startup())
-                self.assertEqual(before, self.inventory())
-                self.assertEqual(self.w.collection_health['startup']['error'], 'startup-read')
-                self.assertEqual(self.w.collection_health['crontab']['status'], 'unknown')
-        self.run_mock.assert_not_called()
+                expected = 'startup-unreadable' if name == 'STARTUP_FILES' and path == broken else 'startup-read'
+                self.assertEqual(self.w.collection_health['startup']['error'], expected)
+                self.assertEqual(self.w.collection_health['crontab']['status'], 'ok')
 
-    def test_crontab_timeout_preserves_text_and_both_successes(self):
-        self.seed_startup(); before = self.inventory()
+    def test_crontab_timeout_preserves_only_cron_and_good_files_adopt(self):
+        self.seed_startup(); previous = self.w.crontab_text
         for key in ['startup', 'crontab']: self.w.collection_health[key]['lastSuccess'] = T1
         with self.commands({CRON: subprocess.TimeoutExpired(['crontab', '-l'], 20)}):
             self.assertFalse(self.w.check_startup())
-        self.assertEqual(before, self.inventory())
-        for key in ['startup', 'crontab']:
-            self.assertEqual(self.w.collection_health[key]['status'], 'degraded')
-            self.assertEqual(self.w.collection_health[key]['lastSuccess'], T1)
+        self.assertEqual(self.w.startup, {'crontab -l': 'none'})
+        self.assertEqual(self.w.crontab_text, previous)
+        self.assertEqual(self.w.collection_health['crontab']['status'], 'degraded')
+        self.assertEqual(self.w.collection_health['crontab']['lastSuccess'], T1)
+        self.assertEqual(self.w.collection_health['startup']['status'], 'ok')
+        self.assertEqual(self.w.collection_health['startup']['lastSuccess'], T0)
 
     def test_startup_rollback_preserves_text_versions_events_and_baseline(self):
         self.seed_startup()
@@ -348,6 +378,8 @@ class CollectionHealthTests(unittest.TestCase):
 
     def test_identity_announcement_completion_is_not_overwritten(self):
         self.w.announce['/fixture/old'] = 'public fixture'
+        self.w.announce['/fixture/pending'] = 'public pending fixture'
+        self.w.baseline['programs'] = False
         original = TT.transaction
         @contextlib.contextmanager
         def completed_identity(conn):
@@ -356,6 +388,8 @@ class CollectionHealthTests(unittest.TestCase):
         with self.commands(self.ps_responses()), mock.patch.object(TT, 'transaction', completed_identity):
             self.assertTrue(self.w.check_processes())
         self.assertNotIn('/fixture/old', self.w.announce)
+        self.assertEqual(self.w.announce['/fixture/pending'], 'public pending fixture')
+        self.assertIn('/fixture/service', self.w.announce)
 
     def test_startup_copy_failure_after_crontab_preserves_everything(self):
         self.seed_startup(); source = self.root / 'public.rc'; source.write_bytes(b'public fixture')
@@ -440,7 +474,12 @@ class CollectionHealthTests(unittest.TestCase):
         dest = directory / digest[:16]; dest.write_bytes(b'partial')
         with mock.patch.object(TT, 'STARTUP_FILES', [str(source)]), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
             self.assertFalse(self.w.check_startup())
-            self.assertEqual(before, self.inventory())
+            after = self.inventory()
+            self.assertEqual({p: h for p, h in before['startup'].items() if p != 'crontab -l'},
+                             {p: h for p, h in after['startup'].items() if p != 'crontab -l'})
+            self.assertEqual(before['db']['startup_versions'], after['db']['startup_versions'])
+            self.assertEqual(before['db']['events'], after['db']['events'])
+            self.assertEqual(self.w.collection_health['crontab']['status'], 'ok')
             self.assertEqual(dest.read_bytes(), b'partial')
             self.assertEqual(self.w.collection_health['startup']['status'], 'degraded')
             dest.write_bytes(data)  # Explicit synthetic operator repair, outside collector.
@@ -456,20 +495,23 @@ class CollectionHealthTests(unittest.TestCase):
                 if sql == 'ROLLBACK': raise sqlite3.OperationalError('injected rollback failure')
                 return self.conn.execute(sql)
             def close(self): self.closed = True; self.conn.close()
+            @property
+            def in_transaction(self): return self.conn.in_transaction
         conn = sqlite3.connect(':memory:', isolation_level=None)
         conn.execute('PRAGMA foreign_keys=ON')
         conn.execute('CREATE TABLE parent(id INTEGER PRIMARY KEY)')
         conn.execute('CREATE TABLE child(id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)')
         wrapped = FailedRollback(conn)
-        with self.assertRaises(sqlite3.IntegrityError):
+        with self.assertRaises(TT.FatalDatabaseError) as commit_failure:
             with TT.transaction(wrapped) as c: c.execute('INSERT INTO child VALUES(1)')
+        self.assertIsInstance(commit_failure.exception.__cause__, sqlite3.IntegrityError)
         self.assertTrue(wrapped.closed)
         with self.assertRaises(sqlite3.ProgrammingError): conn.execute('SELECT 1')
         wrapped = FailedRollback(sqlite3.connect(':memory:', isolation_level=None))
         original = ValueError('public synthetic body failure')
-        with self.assertRaises(ValueError) as caught:
+        with self.assertRaises(TT.FatalDatabaseError) as caught:
             with TT.transaction(wrapped): raise original
-        self.assertIs(caught.exception, original)
+        self.assertIs(caught.exception.__cause__, original)
         self.assertTrue(wrapped.closed)
 
     def test_atomic_copy_publish_failure_preserves_state_and_recovers(self):
@@ -484,7 +526,12 @@ class CollectionHealthTests(unittest.TestCase):
                 self.assertFalse(self.w.check_startup())
             self.assertFalse(dest.exists())
             self.assertEqual(list(directory.iterdir()), [])
-            self.assertEqual(before, self.inventory())
+            after = self.inventory()
+            self.assertEqual({p: h for p, h in before['startup'].items() if p != 'crontab -l'},
+                             {p: h for p, h in after['startup'].items() if p != 'crontab -l'})
+            self.assertEqual(before['db']['startup_versions'], after['db']['startup_versions'])
+            self.assertEqual(before['db']['events'], after['db']['events'])
+            self.assertEqual(self.w.collection_health['crontab']['status'], 'ok')
             self.assertTrue(self.w.check_startup())
         self.assertEqual(dest.read_bytes(), data)
         self.assertEqual(self.w.startup[str(source)], digest)
@@ -555,6 +602,295 @@ class CollectionHealthTests(unittest.TestCase):
         self.assertEqual(pathlib.Path(dest).read_bytes(), data)
 
 
+    def test_unreadable_entries_keep_peers_and_never_invent_copies(self):
+        directory = self.root / 'agents'; directory.mkdir()
+        good = directory / 'a.plist'; good.write_bytes(b'a0')
+        denied = directory / 'denied'; denied.write_bytes(b'private synthetic fixture')
+        (directory / 'sub.bundle').mkdir()
+        (directory / 'dangling').symlink_to(directory / 'missing')
+        original = open
+        def read(path, *args, **kwargs):
+            if str(path) == str(denied): raise PermissionError('not a health diagnostic')
+            return original(path, *args, **kwargs)
+        with mock.patch.object(TT, 'STARTUP_DIRS', [str(directory)]), mock.patch('builtins.open', side_effect=read), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+            self.assertFalse(self.w.check_startup())
+        expected = {str(denied): 'unreadable: permission-denied', str(directory / 'sub.bundle'): 'unreadable: directory', str(directory / 'dangling'): 'unreadable: dangling-link'}
+        for path, digest in expected.items():
+            self.assertEqual(self.w.startup[path], digest)
+            self.assertIsNone(self.w.db.execute('SELECT copy_path FROM startup_versions WHERE path=?', (path,)).fetchone()[0])
+        self.assertEqual(self.w.startup[str(good)], TT.hashlib.sha256(b'a0').hexdigest())
+        self.assertFalse(self.w.baseline['startup'])
+        self.assertEqual(self.w.collection_health['startup']['error'], 'startup-unreadable')
+        self.assertIsNone(self.w.collection_health['startup']['lastSuccess'])
+        self.assertEqual(self.w.collection_health['crontab']['status'], 'ok')
+
+    def test_transient_read_or_listed_disappearance_preserves_all_files(self):
+        self.seed_startup(); old = self.w.startup['/fixture/old.rc']
+        directory = self.root / 'agents'; directory.mkdir(); path = directory / 'a'; path.write_bytes(b'a0')
+        original = open
+        for error in [OSError(5, 'public injected EIO'), FileNotFoundError('public disappearing file')]:
+            def read(candidate, *args, **kwargs):
+                if str(candidate) == str(path): raise error
+                return original(candidate, *args, **kwargs)
+            with mock.patch.object(TT, 'STARTUP_DIRS', [str(directory)]), mock.patch('builtins.open', side_effect=read), self.commands({CRON: (0, '* * * * * fixture\n', '')}):
+                self.assertFalse(self.w.check_startup())
+            self.assertEqual(self.w.startup['/fixture/old.rc'], old)
+            self.assertNotIn(str(path), self.w.startup)
+            self.assertEqual(self.w.collection_health['startup']['error'], 'startup-read')
+            self.assertEqual(self.w.collection_health['crontab']['status'], 'ok')
+            self.assertEqual(self.w.db.execute("SELECT count(*) FROM events WHERE kind='STARTUP-'").fetchone()[0], 0)
+
+    def test_marker_recovery_retains_good_history_and_advances_success_once(self):
+        path = self.root / 'a'; path.write_bytes(b'a0')
+        original = open
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(path)]), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+            self.assertTrue(self.w.check_startup())
+            first = self.w.db.execute('SELECT copy_path FROM startup_versions WHERE path=?', (str(path),)).fetchone()[0]
+            def denied(candidate, *args, **kwargs):
+                if str(candidate) == str(path): raise PermissionError('public fixture')
+                return original(candidate, *args, **kwargs)
+            with mock.patch('builtins.open', side_effect=denied), mock.patch.object(TT, 'now', return_value=T1):
+                self.assertFalse(self.w.check_startup())
+            self.assertEqual(self.w.collection_health['startup']['lastSuccess'], T0)
+            with mock.patch.object(TT, 'now', return_value='2000-01-01T00:02:00Z'):
+                self.assertTrue(self.w.check_startup())
+                self.assertTrue(self.w.check_startup())
+        self.assertEqual(pathlib.Path(first).read_bytes(), b'a0')
+        rows = self.w.db.execute('SELECT hash,copy_path FROM startup_versions WHERE path=? ORDER BY id', (str(path),)).fetchall()
+        self.assertEqual(len(rows), 3)
+        self.assertIsNone(rows[1][1])
+        self.assertEqual(self.w.collection_health['startup']['lastSuccess'], '2000-01-01T00:02:00Z')
+        messages = [r[0] for r in self.w.db.execute("SELECT message FROM events WHERE kind='STARTUP~' ORDER BY id")]
+        self.assertEqual(len(messages), 2)
+        self.assertIn('before: None', messages[1])
+
+    def test_independent_first_baselines_and_attempt_order(self):
+        path = self.root / 'a'; path.write_bytes(b'a0'); trace = []
+        original_files = self.w._startup_files
+        def files(): trace.append('files'); return original_files()
+        def cron(): trace.append('cron'); return ('none', '')
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(path)]), mock.patch.object(self.w, '_startup_files', side_effect=files), self.commands({CRON: (7, '', '')}):
+            self.assertFalse(self.w.check_startup())
+        self.assertFalse(self.w.baseline['startup']); self.assertTrue(self.w.baseline['crontab'])
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(path)]), mock.patch.object(self.w, '_startup_files', side_effect=files), mock.patch.object(self.w, '_crontab_sample', side_effect=cron):
+            self.assertTrue(self.w.check_startup())
+        self.assertEqual(trace, ['files', 'files', 'cron'])
+        self.assertFalse(self.w.baseline['crontab'])
+        self.assertEqual([r[0].split(':', 1)[0] for r in self.w.db.execute("SELECT message FROM events WHERE kind='BASELINE' ORDER BY id")], ['startup items', 'crontab'])
+        self.assertEqual(self.w.collection_health['crontab']['lastAttempt'], T0)
+
+    def test_attempt_and_sampling_order_survives_filesystem_rejection(self):
+        trace = []; original = self.w._attempt
+        def attempted(name): trace.append('attempt-' + name); original(name)
+        def files(): trace.append('files'); raise TT.CollectionError('startup-read')
+        def cron(): trace.append('cron'); return ('none', '')
+        with mock.patch.object(self.w, '_attempt', side_effect=attempted), mock.patch.object(self.w, '_startup_files', side_effect=files), mock.patch.object(self.w, '_crontab_sample', side_effect=cron):
+            self.assertFalse(self.w.check_startup())
+        self.assertEqual(trace, ['attempt-startup', 'files', 'attempt-crontab', 'cron'])
+        self.assertEqual(self.w.collection_health['startup']['lastAttempt'], T0)
+        self.assertEqual(self.w.collection_health['crontab']['lastAttempt'], T0)
+
+    def test_failed_filesystem_baseline_does_not_consume_peer_baseline(self):
+        with mock.patch.object(self.w, '_startup_files', side_effect=TT.CollectionError('startup-read')), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+            self.assertFalse(self.w.check_startup())
+        self.assertTrue(self.w.baseline['startup']); self.assertFalse(self.w.baseline['crontab'])
+        self.assertEqual(self.w.collection_health['startup']['lastAttempt'], T0)
+        self.assertEqual(self.w.collection_health['crontab']['lastAttempt'], T0)
+        with self.commands({CRON: (1, '', 'no crontab for fixture\n')}): self.assertTrue(self.w.check_startup())
+        self.assertEqual([r[0].split(':', 1)[0] for r in self.w.db.execute("SELECT message FROM events WHERE kind='BASELINE' ORDER BY id")], ['crontab', 'startup items'])
+
+    def test_peer_db_failure_preserves_independent_collection_error(self):
+        self.seed_startup(); before = self.inventory()
+        self.w.db.execute("CREATE TRIGGER no_peer BEFORE INSERT ON startup_items BEGIN SELECT RAISE(ABORT,'public fixture'); END")
+        with mock.patch.object(self.w, '_startup_files', side_effect=TT.CollectionError('startup-read')), self.commands({CRON: (0, '* * * * * fixture\n', '')}):
+            self.assertFalse(self.w.check_startup())
+        self.assertEqual(before, self.inventory())
+        self.assertEqual(self.w.collection_health['startup']['error'], 'startup-read')
+        self.assertEqual(self.w.collection_health['crontab']['error'], 'collection-db')
+
+    def test_filesystem_copy_failure_keeps_files_and_commits_good_cron(self):
+        self.seed_startup(); old = dict(self.w.startup); original = self.w.keep_copy
+        source = self.root / 'new.rc'; source.write_bytes(b'new public file')
+        body = '* * * * * fixture\n'; later = '2000-01-01T00:02:00Z'
+        for name in ['startup', 'crontab']: self.w.collection_health[name]['lastSuccess'] = T1
+        def copy_file(path, digest, data=None):
+            if path != 'crontab -l': raise OSError('public filesystem copy failure')
+            return original(path, digest, data)
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(source)]), mock.patch.object(self.w, 'keep_copy', side_effect=copy_file), mock.patch.object(TT, 'now', return_value=later), self.commands({CRON: (0, body, '')}):
+            self.assertFalse(self.w.check_startup())
+        self.assertEqual(self.w.startup['/fixture/old.rc'], old['/fixture/old.rc'])
+        self.assertNotIn(str(source), self.w.startup)
+        self.assertEqual(self.w.crontab_text, body)
+        self.assertEqual(self.w.startup['crontab -l'], TT.hashlib.sha256(body.encode()).hexdigest())
+        self.assertEqual(self.w.collection_health['startup']['error'], 'collection-io')
+        self.assertEqual(self.w.collection_health['startup']['lastSuccess'], T1)
+        self.assertEqual(self.w.collection_health['crontab']['lastSuccess'], later)
+        self.assertEqual([r[0] for r in self.w.db.execute('SELECT path FROM startup_versions')], ['crontab -l'])
+        self.assertEqual([r[0] for r in self.w.db.execute('SELECT message FROM events')], [
+            'changed: crontab -l | before: ' + str(pathlib.Path(self.w.snap_dir) / 'crontab_-l' / 'none') + ' | after: ' + str(pathlib.Path(self.w.snap_dir) / 'crontab_-l' / TT.hashlib.sha256(body.encode()).hexdigest()[:16]) + '\n(no text diff: binary or missing copy)'])
+
+    def test_cron_copy_failure_keeps_cron_and_commits_good_files(self):
+        self.seed_startup(); old = dict(self.w.startup); old_text = self.w.crontab_text
+        original = self.w.keep_copy; source = self.root / 'new.rc'; source.write_bytes(b'new public file')
+        body = '* * * * * fixture\n'; later = '2000-01-01T00:02:00Z'
+        self.w.collection_health['crontab']['lastSuccess'] = T1
+        def copy_file(path, digest, data=None):
+            if path == 'crontab -l': raise OSError('public cron copy failure')
+            return original(path, digest, data)
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(source)]), mock.patch.object(self.w, 'keep_copy', side_effect=copy_file), mock.patch.object(TT, 'now', return_value=later), self.commands({CRON: (0, body, '')}):
+            self.assertFalse(self.w.check_startup())
+        self.assertNotIn('/fixture/old.rc', self.w.startup)
+        self.assertIn(str(source), self.w.startup)
+        self.assertEqual(self.w.startup['crontab -l'], old['crontab -l'])
+        self.assertEqual(self.w.crontab_text, old_text)
+        self.assertEqual(self.w.collection_health['crontab']['error'], 'collection-io')
+        self.assertEqual(self.w.collection_health['crontab']['lastSuccess'], T1)
+        self.assertEqual(self.w.collection_health['startup']['lastSuccess'], later)
+        self.assertEqual([r[0] for r in self.w.db.execute('SELECT path FROM startup_versions')], [str(source)])
+        self.assertTrue(all('crontab -l' not in row[0] for row in self.w.db.execute('SELECT message FROM events')))
+
+    def test_copy_failure_preserves_independent_first_baseline(self):
+        source = self.root / 'first.rc'; source.write_bytes(b'first public file'); original = self.w.keep_copy
+        def copy_file(path, digest, data=None):
+            if path != 'crontab -l': raise OSError('public first copy failure')
+            return original(path, digest, data)
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(source)]), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+            with mock.patch.object(self.w, 'keep_copy', side_effect=copy_file): self.assertFalse(self.w.check_startup())
+            self.assertTrue(self.w.baseline['startup']); self.assertFalse(self.w.baseline['crontab'])
+            self.assertTrue(self.w.check_startup())
+        self.assertFalse(self.w.baseline['startup'])
+        self.assertEqual([r[0] for r in self.w.db.execute('SELECT kind FROM events')], ['BASELINE', 'BASELINE'])
+
+    def test_removed_unreadable_marker_never_claims_a_saved_copy(self):
+        self.w.db.execute('INSERT INTO startup_items VALUES(?,?,?)', ('/fixture/unreadable', 'unreadable: directory', T0))
+        self.w.db.execute('INSERT INTO startup_items VALUES(?,?,?)', ('crontab -l', 'none', T0))
+        self.w.load_state()
+        with self.commands({CRON: (1, '', 'no crontab for fixture\n')}): self.assertTrue(self.w.check_startup())
+        self.assertEqual(self.w.db.execute("SELECT message FROM events WHERE kind='STARTUP-'").fetchone()[0], 'removed: /fixture/unreadable | last copy: None')
+
+    def test_collectors_normalize_both_streams_keep_locale_and_file_bytes(self):
+        for newline in ['\r\n', '\r', '\n']:
+            with self.commands({CRON: (1, b'', ('no crontab for fixture' + newline).encode())}) as calls:
+                self.assertTrue(self.w.check_startup())
+            self.assertEqual(self.w.startup['crontab -l'], 'none')
+            self.assertEqual(calls.call_args.kwargs['env']['LC_ALL'], 'C')
+        raw = b'public\r\nraw\rbytes'; path = self.root / 'raw'; path.write_bytes(raw)
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(path)]), self.commands({CRON: (0, b'public\r\ncron\rbytes', b'')}):
+            self.assertTrue(self.w.check_startup())
+        self.assertEqual(self.w.crontab_text, 'public\ncron\nbytes')
+        self.assertEqual(self.w.startup['crontab -l'], TT.hashlib.sha256(b'public\ncron\nbytes').hexdigest())
+        self.assertEqual(self.w.startup[str(path)], TT.hashlib.sha256(raw).hexdigest())
+
+    def test_automatic_rollback_keeps_connection_usable_and_recovers(self):
+        self.w.db.execute("CREATE TRIGGER auto_rollback BEFORE INSERT ON programs BEGIN SELECT RAISE(ROLLBACK,'original fixture'); END")
+        before = self.inventory()
+        with self.commands(self.ps_responses()): self.assertFalse(self.w.check_processes())
+        self.assertFalse(self.w.db.in_transaction); self.assertEqual(before, self.inventory())
+        self.w.db.execute('DROP TRIGGER auto_rollback')
+        with self.commands(self.ps_responses()): self.assertTrue(self.w.check_processes())
+
+    def test_fatal_lifecycle_propagates_and_releases_owned_resources_with_fakes(self):
+        trace = []
+        with self.assertRaises(TT.FatalDatabaseError) as caught: fatal_lifecycle_fixture(trace)
+        self.assertEqual(str(caught.exception), 'fixture-primary-fatal')
+        self.assertIn('stream-terminate', trace); self.assertIn('stream-wait', trace)
+        self.assertEqual(trace.count('join'), 2)
+        self.assertIn('close-db', trace); self.assertEqual(trace[-1], 'release-owned-pid')
+
+    def test_bare_listener_fallback_cannot_replace_full_key(self):
+        self.seed_listener(); before = self.inventory(); responses = self.ps_responses()
+        responses[PS_COMM] = (0, '99 1 fixture /fixture/other\n', '')
+        responses[LSOF] = (0, LISTENER, '')
+        responses[('ps', '-o', 'comm=', '-p', '42')] = (0, 'bare-command\n', '')
+        with self.commands(responses): self.assertFalse(self.w.check_listeners())
+        self.assertEqual(before, self.inventory())
+
+    def test_ps1_is_validated_before_ps2(self):
+        responses = {PS_COMM: (0, 'malformed\n', ''), PS_ARGS: subprocess.TimeoutExpired(list(PS_ARGS), 20)}
+        with self.commands(responses) as calls: self.assertFalse(self.w.check_processes())
+        self.assertEqual([tuple(c.args[0]) for c in calls.call_args_list], [PS_COMM])
+        self.assertEqual(self.w.collection_health['processes']['error'], 'ps-parse')
+
+    def test_bounded_ascii_pids_before_bridge_or_database(self):
+        for value in ['0', '-1', '2147483648', '9223372036854775808', '9' * 200, '\u0664\u0662']:
+            for exe in ['/fixture/service', 'bare']:
+                before = self.inventory(); responses = self.ps_responses()
+                responses[PS_COMM] = (0, value + ' 1 fixture ' + exe + '\n', '')
+                with self.commands(responses), mock.patch.object(TT, 'pid_path', side_effect=AssertionError('invalid PID reached bridge')):
+                    self.assertFalse(self.w.check_processes())
+                self.assertEqual(before, self.inventory())
+            self.seed_listener(); before = self.inventory()
+            with self.commands({LSOF: (0, 'p' + value + '\ncfixture\nn127.0.0.1:12345\n', '')}), mock.patch.object(TT, 'pid_path', side_effect=AssertionError('invalid lsof PID reached bridge')):
+                self.assertFalse(self.w.check_listeners())
+            self.assertEqual(before, self.inventory())
+        responses = {PS_COMM: (0, '2147483647 0 fixture /fixture/service\n', ''), PS_ARGS: (0, '2147483647\n', '')}
+        with self.commands(responses): self.assertTrue(self.w.check_processes())
+        for ppid in ['-1', '2147483648']:
+            responses[PS_COMM] = (0, '42 ' + ppid + ' fixture /fixture/service\n', '')
+            with self.commands(responses): self.assertFalse(self.w.check_processes())
+
+    def test_internal_blank_lsof_rejects_and_input_errors_degrade(self):
+        self.seed_listener(); before = self.inventory()
+        for output in ['\n' + LISTENER, LISTENER + '\n', LISTENER.replace('cfixture\n', 'cfixture\n\n')]:
+            with self.commands({LSOF: (0, output, '')}): self.assertFalse(self.w.check_listeners())
+            self.assertEqual(before, self.inventory())
+        for error in [TypeError('fixture'), KeyError('fixture'), OverflowError('fixture'), ctypes.ArgumentError('fixture')]:
+            with mock.patch.object(self.w, 'processes', side_effect=error): self.assertFalse(self.w.check_processes())
+            self.assertEqual(before, self.inventory())
+            self.assertEqual(self.w.collection_health['processes']['error'], 'collection-parse')
+
+    def test_numeric_bounds_preserve_leading_zeros_and_reject_bad_argv_pids(self):
+        responses = {PS_COMM: (0, '00000000000042 0000 fixture /fixture/service\n', ''), PS_ARGS: (0, '00000000000042\n', '')}
+        with self.commands(responses): self.assertTrue(self.w.check_processes())
+        for value in ['0', '2147483648', '9' * 200, '\u0664\u0662']:
+            before = self.inventory(); responses[PS_ARGS] = (0, value + '\n', '')
+            with self.commands(responses): self.assertFalse(self.w.check_processes())
+            self.assertEqual(before, self.inventory())
+        responses = self.ps_responses(); responses[LSOF] = (0, 'p00000000000042\ncfixture\nn127.0.0.1:0000000012345\n', '')
+        with self.commands(responses): self.assertTrue(self.w.check_listeners())
+        self.assertEqual(self.w.db.execute('SELECT port FROM listeners').fetchone()[0], 12345)
+
+    def test_pid_bridge_rejects_invalid_values_without_native_call(self):
+        lib = mock.Mock(); lib.proc_pidpath.return_value = 0
+        with mock.patch.object(TT, '_libproc', lib):
+            for value in [True, 0, -1, 2147483648, 2 ** 100, '42']:
+                with self.assertRaises(TT.CollectionError): REAL_PID_PATH(value)
+            lib.proc_pidpath.assert_not_called()
+            self.assertIsNone(REAL_PID_PATH(2147483647))
+            self.assertEqual(lib.proc_pidpath.call_count, 1)
+
+    def test_startup_transition_ledger_and_restart_order(self):
+        transitions = startup_transition_snapshots()
+        self.assertEqual(len(transitions), 8)
+        self.assertEqual(transitions[-1]['startupKeys'], ['/fixture/b', '/fixture/c', '/fixture/z', 'crontab -l'])
+
+    def test_old_database_export_order_does_not_depend_on_rowids(self):
+        for path in ['/fixture/z', '/fixture/a', '/fixture/c']:
+            self.w.db.execute('INSERT INTO startup_items VALUES(?,?,?)', (path, 'fixture', T0))
+        self.w.load_state()
+        with TT.lock: page = self.w.page_map()
+        self.assertEqual(list(page['startup']), ['/fixture/a', '/fixture/c', '/fixture/z'])
+
+    def test_pid_file_unknown_refuses_takeover_and_positive_evidence_allows(self):
+        path = self.root / 'tattletale.pid'; path.write_text('43\n')
+        argv = ('ps', '-p', '43', '-o', 'command=')
+        for response in [(7, '', ''), (0, '', ''), (0, 'other\n', 'diagnostic'), (1, '', 'diagnostic'), (0, 'one\ntwo\n', ''), subprocess.TimeoutExpired(list(argv), 20), OSError('public fixture')]:
+            with self.commands({argv: response}), mock.patch.object(TT.os, 'getpid', return_value=4242):
+                with self.assertRaises(SystemExit): self.w.claim_pid_file()
+            self.assertEqual(path.read_text(), '43\n')
+        with self.commands({argv: (0, b'/fixture/tattletale.py \xff\r\n', b'')}), mock.patch.object(TT.os, 'getpid', return_value=4242):
+            with self.assertRaises(SystemExit): self.w.claim_pid_file()
+        self.assertEqual(path.read_text(), '43\n')
+        for response in [(1, '', ''), (0, '/fixture/other\n', '')]:
+            path.write_text('43\n')
+            with self.commands({argv: response}), mock.patch.object(TT.os, 'getpid', return_value=4242): self.w.claim_pid_file()
+            self.assertEqual(path.read_text(), '4242\n')
+        for value in ['', 'bad', '2147483648', '\u0664\u0662']:
+            path.write_text(value)
+            with self.assertRaises(SystemExit): self.w.claim_pid_file()
+            self.assertEqual(path.read_text(), value)
+
+
 def scope_case(case):
     def test(self):
         key = self.seed_listener(case['host'])
@@ -572,7 +908,16 @@ def command_case(case):
         self.assertEqual(ok, case['expected'].startswith('ok'))
         key = 'listeners' if case['tool'] == 'lsof' else 'crontab'
         self.assertEqual(self.w.collection_health[key]['status'], 'ok' if ok else 'degraded')
-        if not ok: self.assertEqual(before, self.inventory())
+        if not ok:
+            if case['tool'] == 'lsof':
+                if case['code'] == 0 and case['err']:
+                    expected = copy.deepcopy(before)
+                    expected['db']['events'] = [(1, T0, 'NOTE', 'listeners collection degraded: lsof-warning')]
+                    self.assertEqual(expected, self.inventory())
+                else: self.assertEqual(before, self.inventory())
+            else:
+                self.assertEqual(self.w.crontab_text, before['crontab_text'])
+                self.assertEqual(self.w.startup.get('crontab -l'), before['startup'].get('crontab -l'))
         if case['expected'] == 'ok-absent': self.assertEqual(self.w.startup['crontab -l'], 'none')
     return test
 
@@ -581,6 +926,41 @@ for index, case in enumerate(FIXTURE['scopeCases']):
     setattr(CollectionHealthTests, 'test_scope_%02d' % index, scope_case(case))
 for index, case in enumerate(FIXTURE['commandCases']):
     setattr(CollectionHealthTests, 'test_command_%02d' % index, command_case(case))
+
+
+def fatal_lifecycle_fixture(trace):
+    """Run only lifecycle control flow on fakes: no Watch instance or real thread/process."""
+    class Stop:
+        def is_set(self): return False
+        def set(self): trace.append('stop-workers')
+        def wait(self, seconds): raise AssertionError('fatal fixture must not poll again')
+    class Worker:
+        def __init__(self, **kwargs): pass
+        def start(self): trace.append('start-fake-worker')
+        def join(self, **kwargs): trace.append('join')
+    class Stream:
+        def poll(self): return None
+        def terminate(self): trace.append('stream-terminate')
+        def wait(self, **kwargs): trace.append('stream-wait')
+    class Database:
+        def close(self): trace.append('close-db'); raise OSError('public cleanup fixture')
+    class Lifecycle:
+        stop = Stop(); stream_proc = Stream(); db = Database()
+        log_path = '/fixture/log'; db_path = '/fixture/db'
+        def claim_pid_file(self): trace.append('claim-fake-pid')
+        def install_dashboard(self): pass
+        def load_state(self): pass
+        def retain(self): pass
+        def log_stream(self): raise AssertionError('fake thread target must not run')
+        def identity_worker(self): raise AssertionError('fake thread target must not run')
+        def check_processes(self): raise TT.FatalDatabaseError('fixture-primary-fatal')
+        def save(self): raise TT.FatalDatabaseError('fixture-cleanup-fatal')
+        def log(self, kind, message):
+            trace.append('log-' + kind)
+            if kind == 'STOP': raise OSError('public cleanup fixture')
+        def release_pid_file(self): trace.append('release-owned-pid')
+        def _safe(self, name, fn): return TT.Watch._safe(self, name, fn)
+    with mock.patch.object(TT.threading, 'Thread', Worker): TT.Watch.run(Lifecycle())
 
 
 def parity_snapshots():
@@ -606,7 +986,7 @@ def parity_snapshots():
         case.seed_listener('127.0.0.1')
         w.db.execute("UPDATE listeners SET key=?,exe=?", ('/fixture/a 127.0.0.1:12345', '/fixture/a'))
         w.load_state()
-        w.baseline = {'programs': False, 'listeners': False, 'startup': False}
+        w.baseline = {'programs': False, 'listeners': False, 'startup': False, 'crontab': False}
         w.snap_dir = '/fixture/copies'
         w.keep_copy = lambda path, digest, data=None: '/fixture/copies/' + TT.Watch.safe_name(path) + '/' + digest[:16]
         w.diff = lambda *args: '(fixture diff)'
@@ -637,7 +1017,7 @@ def parity_snapshots():
         with case.commands(responses): w.check_processes()
         snap('processRecovered')
         with mock.patch.object(TT, 'STARTUP_DIRS', ['/fixture/unreadable']), mock.patch.object(
-                TT.os, 'listdir', side_effect=PermissionError('public fixture failure')):
+                TT.os, 'listdir', side_effect=PermissionError('public fixture failure')), case.commands({CRON: (0, '', '')}):
             w.check_startup()
         snap('startupBeforeCronFailure')
         w.db.execute("CREATE TRIGGER refuse_parity_startup BEFORE INSERT ON startup_items BEGIN SELECT RAISE(ABORT,'fixture rollback'); END")
@@ -645,6 +1025,75 @@ def parity_snapshots():
         snap('startupDbFailure')
         return {'fixtureVersion': FIXTURE['fixtureVersion'],
                 'scopes': [{'host': c['host'], 'actual': TT.bind_scope(c['host'])} for c in FIXTURE['scopeCases']],
-                'commands': command_results, 'snapshots': snapshots}
+                'commands': command_results, 'snapshots': snapshots,
+                'startupTransitions': startup_transition_snapshots()}
+    finally:
+        case.doCleanups()
+
+
+def startup_transition_snapshots():
+    """Eight actual adoption steps with an independently constructed event/health ledger."""
+    case = CollectionHealthTests('test_failed_empty_lsof_preserves_real_inventory'); case.setUp()
+    try:
+        w = case.w; w.snap_dir = '/fixture/copies'
+        w.keep_copy = lambda path, digest, data=None: '/fixture/copies/' + TT.Watch.safe_name(path) + '/' + digest[:16]
+        w.diff = lambda *args: '(fixture diff)'
+        snapshots, expected_events = [], []
+        clocks = ['2000-01-01T00:%02d:00Z' % i for i in range(8)]
+        body = '* * * * * fixture\n'
+        def digest(value): return TT.hashlib.sha256(value.encode()).hexdigest()
+        names = {'/fixture/a': 'fixture_a', '/fixture/b': 'fixture_b', '/fixture/c': 'fixture_c', '/fixture/z': 'fixture_z', 'crontab -l': 'crontab_-l'}
+        def cp(path, value): return '/fixture/copies/' + names[path] + '/' + ('none' if value is None else digest(value)[:16])
+        def added(path, value): return {'kind': 'STARTUP+', 'message': 'added: ' + path + ' | copy: ' + cp(path, value)}
+        def changed(path, before, after): return {'kind': 'STARTUP~', 'message': 'changed: ' + path + ' | before: ' + cp(path, before) + ' | after: ' + cp(path, after) + '\n(fixture diff)'}
+        def health(status, attempt, success, error=None): return dict(status=status, lastAttempt=attempt, lastSuccess=success, error=error)
+        expected_health = [
+            (health('ok', clocks[0], clocks[0]), health('ok', clocks[0], clocks[0])),
+            (health('ok', clocks[1], clocks[1]), health('ok', clocks[1], clocks[1])),
+            (health('ok', clocks[2], clocks[2]), health('ok', clocks[2], clocks[2])),
+            (health('ok', clocks[3], clocks[3]), health('degraded', clocks[3], clocks[2], 'crontab-command')),
+            (health('degraded', clocks[4], clocks[3], 'startup-read'), health('ok', clocks[4], clocks[4])),
+            (health('degraded', clocks[5], clocks[3], 'collection-db'), health('degraded', clocks[5], clocks[4], 'collection-db')),
+            (health('ok', clocks[6], clocks[6]), health('ok', clocks[6], clocks[6])),
+            (health('unknown', None, None), health('unknown', None, None))]
+        sequence = [
+            ('startupBaseline', {'/fixture/c': 'c0', '/fixture/a': 'a0'}, (1, '', 'no crontab for fixture\n')),
+            ('startupTransition', {'/fixture/c': 'c1', '/fixture/b': 'b0'}, (1, '', 'no crontab for fixture\n')),
+            ('startupRepeated', {'/fixture/c': 'c1', '/fixture/b': 'b0'}, (1, '', 'no crontab for fixture\n')),
+            ('startupCronFailure', {'/fixture/b': 'b1', '/fixture/c': 'c1'}, (7, '', '')),
+            ('startupFilesystemFailure', None, (0, body, '')),
+            ('startupDbFailure', {'/fixture/b': 'b1', '/fixture/c': 'c1', '/fixture/z': 'z0'}, (0, body, '')),
+            ('startupRecovered', {'/fixture/b': 'b1', '/fixture/c': 'c1', '/fixture/z': 'z0'}, (0, body, '')),
+            ('startupReloaded', None, None)]
+        for i, (name, files, cron) in enumerate(sequence):
+            if i == 5: w.db.execute("CREATE TRIGGER fixture_transition BEFORE INSERT ON startup_items BEGIN SELECT RAISE(ABORT,'fixture transition'); END")
+            if i == 6: w.db.execute('DROP TRIGGER fixture_transition')
+            with mock.patch.object(TT, 'now', return_value=clocks[i]):
+                if i == 7:
+                    w.db.close()
+                    w = TT.Watch(str(case.root / 'fixture.log'), str(case.root / 'fixture.db'), notify=False)
+                    case.addCleanup(w.db.close); w.load_state()
+                else:
+                    staged = (mock.patch.object(w, '_startup_files', side_effect=TT.CollectionError('startup-read')) if files is None else mock.patch.object(w, '_startup_files', return_value=({p: digest(v) for p, v in files.items()}, {p: v.encode() for p, v in files.items()})))
+                    with staged, case.commands({CRON: cron}):
+                        case.assertEqual(w.check_startup(), i not in (3, 4, 5))
+            if i == 0:
+                expected_events += [{'kind': 'BASELINE', 'message': 'startup items: 2 recorded, copies in /fixture/copies'}, {'kind': 'BASELINE', 'message': 'crontab: 1 recorded, copies in /fixture/copies'}]
+            elif i == 1:
+                expected_events += [{'kind': 'STARTUP-', 'message': 'removed: /fixture/a | last copy: ' + cp('/fixture/a', 'a0')}, added('/fixture/b', 'b0'), changed('/fixture/c', 'c0', 'c1')]
+            elif i == 3: expected_events += [changed('/fixture/b', 'b0', 'b1')]
+            elif i == 4: expected_events += [changed('crontab -l', None, body)]
+            elif i == 6: expected_events += [added('/fixture/z', 'z0')]
+            with TT.lock: page = w.page_map()
+            events = [{'kind': r[0], 'message': r[1]} for r in w.db.execute('SELECT kind,message FROM events ORDER BY id')]
+            case.assertEqual(events, expected_events)
+            case.assertEqual(w.collection_health['startup'], expected_health[i][0])
+            case.assertEqual(w.collection_health['crontab'], expected_health[i][1])
+            case.assertFalse(w.baseline['startup']); case.assertFalse(w.baseline['crontab'])
+            case.assertEqual(w.db.execute('SELECT count(*) FROM startup_versions').fetchone()[0], [3, 5, 5, 6, 7, 7, 8, 8][i])
+            snapshots.append(dict(name=name, collectionHealth=copy.deepcopy(w.collection_health), map=page, events=events,
+                                  schemaVersion=w.db.execute('SELECT max(version) FROM schema_version').fetchone()[0], formatVersion=TT.FORMAT_VERSION,
+                                  startupKeys=list(page['startup']), baselines={k: w.baseline[k] for k in ('startup', 'crontab')}))
+        return snapshots
     finally:
         case.doCleanups()

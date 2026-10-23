@@ -1,8 +1,8 @@
 # tattletale, the Java version
 
 A Java 25 port of `python/tattletale.py` with the same features, flags, settings, database,
-log format and page data file. It uses the JDK and nothing else (no Maven, no Gradle, no
-third-party libraries), and it builds to a GraalVM native binary.
+ordered event contract and compatible page data objects. It uses the JDK and nothing else
+(no Maven, no Gradle, no third-party libraries), and it builds to a GraalVM native binary.
 
 Both versions share one data directory, `<repo>/data/`, one database (schema v1, the same
 `CREATE` statements), one page (`dashboard/tattletale.html`, copied into `data/`) and one
@@ -14,15 +14,21 @@ Both producers write generated dashboard data with `formatVersion: 2`, while SQL
 The shared [data contract](../docs/DATA_FORMAT.md#collection-health) defines current-epoch
 `collectionHealth` for processes, listeners, startup and crontab. Restarted watchers begin
 with unknown health, including when retained inventory exists. Failed or partial samples
-keep last-known inventory and do not emit false listener or startup removals. Startup files
-are staged before crontab; both successes advance only after the combined sample is
-accepted. Rejection after a crontab attempt degrades both checks; a rejection before that
-attempt leaves crontab health untouched.
+keep the affected partition's last-known inventory and do not emit false removals. Startup
+files and crontab have independent health/baselines and are both attempted each scheduled
+cycle, files first and crontab last. Good peer changes may commit; a failed partition is
+retained. Fully enumerated persistent unreadability records stable markers while readable
+peers remain observable, but keeps startup degraded without advancing its success time.
+Eligible inventory/events share a transaction; mirrors and baselines adopt only after commit.
+This replaces the earlier combined-sample behavior.
 
 The page becomes Stale after 180 seconds; that freshness is separate from observation
 health. Listener `bindScope` classifies recorded IP literals without DNS, firewall or reachability probes;
 the legacy `exposed` flag still means wildcard binding only. This change covers the four
 polling checks, not universal watcher health or a new identity-refresh policy.
+The page preserves the last fully accepted file's inventory, health and update time under
+a persistent refresh error, and names degraded/unknown checks alongside Live or Stale.
+Unknown may include a first attempt in flight with a non-null attempt time.
 
 Run the Java fixture check from the repository root with JAVA_HOME pointing to JDK 25:
 

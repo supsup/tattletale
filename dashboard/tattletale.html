@@ -487,42 +487,68 @@
           !["unknown", "ok", "degraded"].includes(v.status) || !timestamp(v.lastAttempt) || !timestamp(v.lastSuccess) ||
           !(v.error === null || (typeof v.error === "string" && /^[a-z][a-z0-9-]{0,63}$/.test(v.error))) ||
           (v.status === "ok" && (!v.lastAttempt || !v.lastSuccess || v.error !== null)) ||
-          (v.status === "unknown" && (v.lastAttempt !== null || v.lastSuccess !== null || v.error !== null)) ||
+          (v.status === "unknown" && (v.lastSuccess !== null || v.error !== null)) ||
           (v.status === "degraded" && (!v.lastAttempt || !v.error))) return unknownHealth();
     }
     return h;
   }
-  const scopeOf = (v) => typeof v.bindScope === "string" && Object.hasOwn(SCOPE_NAMES, v.bindScope) ? v.bindScope : "unknown";
+  const scopeOf = (v) => typeof v.bindScope === "string" && Object.hasOwn(SCOPE_NAMES, v.bindScope) ? v.bindScope :
+    !Object.hasOwn(v, "bindScope") && v.exposed === true ? "wildcard" : "unknown";
   let health = unknownHealth(), loadFailed = false, hasData = false;
+  let acceptedPayload = null;
   const complete = () => Object.values(health).every((v) => v.status === "ok");
+  const incompleteChecks = () => Object.entries(HEALTH_NAMES).filter(([k]) => health[k].status !== "ok")
+    .map(([k, label]) => label + ": " + health[k].status + (health[k].error ? " (" + health[k].error + ")" : "")).join("; ");
   const sampleNote = (k) => health[k].status === "ok" ? "Last accepted sample" : "Last-known values; collection " + health[k].status;
   function renderHealth() {
     const box = $("#collection-health");
-    box.replaceChildren(...Object.entries(HEALTH_NAMES).map(([k, label]) => {
+    const rows = Object.entries(HEALTH_NAMES).map(([k, label]) => {
       const v = health[k];
       return el("div", { class: "note" }, status(v.status === "ok" ? "good" : "warning", label + ": " + v.status),
         el("span", { text: " | attempted: " + (v.lastAttempt || "not yet") + " | last accepted: " +
           (v.lastSuccess || "not yet") + (v.error ? " | " + v.error : "") }));
-    }));
+    });
+    if (loadFailed && hasData) rows.unshift(el("div", { class: "note", text: "Last-known health from the last accepted data file; refresh failed." }));
+    box.replaceChildren(...rows);
   }
 
   // ---- render ----
   let sortKey = "firstSeen", sortDir = -1, activeKinds = null, knownKinds = new Set();
   let lastGenerated = null, baseT = 0, otherSigners = new Set(), lastNewRows = [], lastEvents = [];
 
+  // Copy the data graph before rendering, including an explicitly present undefined value.
+  // A caller changing its object later must not change the accepted rollback snapshot.
+  function copyData(v) {
+    if (v === null || ["undefined", "string", "boolean"].includes(typeof v)) return v;
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (Array.isArray(v)) return v.map(copyData);
+    if (typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, value]) => [k, copyData(value)]));
+    throw Error("invalid-data");
+  }
+  function clearData() {
+    for (const id of ["tiles", "listeners", "creds", "timeline", "signers", "startup", "feed", "chips", "feedMore", "progMore", "progCount", "ver"])
+      $("#" + id).replaceChildren();
+    $("#progs tbody").replaceChildren();
+    $("#sigFilter").replaceChildren(el("option", { value: "", text: "All signers" }));
+    lastGenerated = null; hasData = false; health = unknownHealth();
+    lastRows = []; lastNewRows = []; lastEvents = []; otherSigners = new Set(); baseT = 0;
+  }
   function failLoad(message) {
     loadFailed = true;
-    health = unknownHealth();
     renderHealth();
-    $("#updated").textContent = "";
-    $("#live").replaceChildren(status("critical", "No data"));
+    $("#updated").textContent = hasData ? "last-known; updated " + local(lastGenerated) : "";
+    $("#live").replaceChildren(status("critical", hasData ? "Refresh failed; last-known data" : "No data"));
     $("#att-list").replaceChildren(status("warning", "Collection incomplete; no accepted refresh"));
     const banner = $("#banner");
-    banner.replaceChildren(status("critical", "No data"), el("span", { text: message }));
+    banner.replaceChildren(status("critical", hasData ? "Refresh failed" : "No data"), el("span", { text: message +
+      (hasData ? " Displayed inventory and health are last-known, from the last fully accepted file." : " No data file has been accepted.") +
+      (incompleteChecks() ? " " + incompleteChecks() + "." : "") }));
     banner.classList.add("show");
   }
   function render(D) {
+    const previousFilters = { activeKinds: activeKinds && new Set(activeKinds), knownKinds: new Set(knownKinds), feedLimit, progLimit };
     try {
+      D = copyData(D);
       const object = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
       if (!object(D) || !object(D.map) || !Array.isArray(D.log || []) ||
           !object(D.map.programs || {}) || !object(D.map.listeners || {}) || !object(D.map.startup || {}) ||
@@ -531,8 +557,15 @@
           Object.values(D.map.listeners || {}).some((v) => !object(v)) ||
           (D.map.credentials || []).some((v) => !object(v))) throw Error("invalid-data");
       renderData(D);
+      acceptedPayload = D; // Adopt ONLY after every panel and metadata field rendered.
     } catch (_) {
-      failLoad("The data file could not be accepted. Previously displayed inventory may be last-known; refresh after the watcher writes valid data.");
+      activeKinds = previousFilters.activeKinds; knownKinds = previousFilters.knownKinds;
+      feedLimit = previousFilters.feedLimit; progLimit = previousFilters.progLimit;
+      if (acceptedPayload) {
+        try { renderData(acceptedPayload); }
+        catch (_) { acceptedPayload = null; clearData(); }
+      } else clearData();
+      failLoad("The data file could not be accepted. Refresh after the watcher writes valid data.");
     }
   }
   function renderData(D) {
@@ -605,14 +638,17 @@
     const stale = !Number.isFinite(age) || age > 180;
     $("#live").replaceChildren(stale ? status("serious", Number.isFinite(age) ? "Stale, " + ago(lastGenerated) : "Stale, unknown timestamp") : status("good", "Live, " + ago(lastGenerated)));
     const banner = $("#banner");
+    const incomplete = incompleteChecks();
+    const healthWarning = incomplete ? " Collection incomplete: " + incomplete +
+      ". Retained values are last-known observations; an empty view is not an all-clear." : "";
     if (stale) {
       banner.replaceChildren(status("serious", "Stale"),
         el("span", { text: "The watcher has not written data for " + (Number.isFinite(age) ? ago(lastGenerated).replace(" ago", "") : "an unknown interval") +
-          ". It may be stopped: start it from the repository with python3 python/tattletale.py or java -jar java/build/tattletale.jar." }));
+          ". It may be stopped: start it from the repository with python3 python/tattletale.py or java -jar java/build/tattletale.jar." + healthWarning }));
       banner.classList.add("show");
     } else if (!complete()) {
       banner.replaceChildren(status("warning", "Collection incomplete"),
-        el("span", { text: "Some samples are degraded or unknown. Retained values are last-known observations; an empty view is not an all-clear." }));
+        el("span", { text: healthWarning.trim() }));
       banner.classList.add("show");
     } else banner.classList.remove("show");
   }

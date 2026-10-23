@@ -25,6 +25,12 @@ import java.util.regex.Pattern;
 final class Db implements AutoCloseable {
     static final String SQLITE = "/usr/bin/sqlite3";
 
+    /** Unknown connection disposition must leave the watcher, never a catch-and-loop no-op. */
+    static final class Fatal extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+        Fatal(DbException cause) { super("tattletale: database connection unusable", cause); }
+    }
+
     /** sqlite3.Error. */
     static final class DbException extends Exception {
         private static final long serialVersionUID = 1L;
@@ -66,7 +72,7 @@ final class Db implements AutoCloseable {
 
     /** Run statements (each ending in ';'); return the result lines. Errors throw. */
     synchronized List<String> exec(String sql) throws DbException {
-        if (closed) throw new DbException("Cannot operate on a closed database.");
+        if (closed) throw new Fatal(new DbException("Cannot operate on a closed database."));
         String mark = "__tattletale_" + (++seq) + "__";
         List<String> rows = new ArrayList<>();
         List<String> errs = new ArrayList<>();
@@ -81,9 +87,13 @@ final class Db implements AutoCloseable {
                 if (line.startsWith("[") || line.startsWith("{")) rows.add(line);
                 else errs.add(line);
             }
-            if (line == null) throw new DbException("sqlite3 exited" + (errs.isEmpty() ? "" : ": " + clean(errs)));
+            if (line == null) {
+                DbException failure = new DbException("sqlite3 exited" + (errs.isEmpty() ? "" : ": " + clean(errs)));
+                close(); throw new Fatal(failure);
+            }
         } catch (IOException e) {
-            throw new DbException("sqlite3 pipe failed: " + e.getMessage());
+            DbException failure = new DbException("sqlite3 pipe failed"); failure.initCause(e);
+            close(); throw new Fatal(failure);
         }
         if (!errs.isEmpty()) throw new DbException(clean(errs));
         return rows;
@@ -157,11 +167,12 @@ final class Db implements AutoCloseable {
         } catch (DbException e) {
             try {
                 exec("ROLLBACK;");
-            } catch (DbException rollbackFailure) {
+            } catch (DbException | Fatal rollbackFailure) {
                 // Transaction disposition is unknown; never reuse this connection, even if
                 // SQLite already rolled back automatically. Keep the original error primary.
                 e.addSuppressed(rollbackFailure);
                 close();
+                throw new Fatal(e);
             }
             throw e;
         }

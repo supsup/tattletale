@@ -80,8 +80,32 @@ final class Watch {
             try { return Files.readAllBytes(Path.of(file)); }
             catch (java.nio.file.NoSuchFileException e) { if (!optionalMissing(file)) throw e; return null; }
         }
+        /** Only final, positively observed persistent states become inventory markers. */
+        default byte[] entry(String file) throws IOException {
+            Path p=Path.of(file);
+            if(Files.isDirectory(p)) throw new Unreadable("directory");
+            if(Files.isSymbolicLink(p)) {
+                try {Files.readAttributes(p,java.nio.file.attribute.BasicFileAttributes.class);}
+                catch(java.nio.file.NoSuchFileException e) {
+                    // Confirm the final link itself. Permission/I/O failures are not proof
+                    // of a dangling target, and broken source ancestors cannot pass this read.
+                    if(!Files.readAttributes(p,java.nio.file.attribute.BasicFileAttributes.class,
+                            java.nio.file.LinkOption.NOFOLLOW_LINKS).isSymbolicLink()) throw e;
+                    throw new Unreadable("dangling-link");
+                }
+                catch(java.nio.file.AccessDeniedException e) {throw new Unreadable("permission-denied");}
+            }
+            try { return read(file); }
+            catch(java.nio.file.AccessDeniedException e) { throw new Unreadable("permission-denied"); }
+        }
+        default String textDiff(String before,String after,int limit) { return null; }
     }
-    Sources sources = Proc::run;
+    static final class Unreadable extends IOException {
+        private static final long serialVersionUID=1L;
+        final String marker;
+        Unreadable(String reason) { super("startup-unreadable"); marker="unreadable: "+reason; }
+    }
+    Sources sources = Proc::collector;
     record PendingEvent(String kind, String message) {}
     void commitSample(List<String> sql, List<PendingEvent> events, String time) throws DbException {
         List<String> batch = new ArrayList<>(sql);
@@ -104,10 +128,16 @@ final class Watch {
     void collect(String key, CollectionCheck check) {
         collectionHealth.attempt(key,clock.get());
         try { check.run(); collectionHealth.success(key,clock.get()); }
-        catch(CollectionHealth.Rejected e) { collectionHealth.fail(key,e.code); }
+        catch(CollectionHealth.Rejected e) {
+            boolean warning=key.equals("listeners") && e.code.equals("lsof-warning")
+                    && !collectionHealth.degradedWith(key,e.code);
+            collectionHealth.fail(key,e.code);
+            if(warning) log("NOTE","listeners collection degraded: lsof-warning");
+        }
         catch(IOException e) { collectionHealth.fail(key,CollectionHealth.ioError(e)); }
         catch(Proc.Timeout e) { collectionHealth.fail(key,"collection-timeout"); }
         catch(DbException e) { collectionHealth.fail(key,"collection-db"); }
+        catch(Db.Fatal e) { collectionHealth.fail(key,"collection-db"); throw e; }
         catch(IllegalArgumentException e) { collectionHealth.fail(key,"collection-parse"); }
     }
 
@@ -331,14 +361,15 @@ final class Watch {
             for (Map<String, Object> r : db.query("SELECT key, present, exposed FROM listeners;"))
                 listeners.put(Db.asStr(r.get("key")), new Listener(Py.truthy(r.get("present")), Py.truthy(r.get("exposed"))));
             startup = new LinkedHashMap<>();
-            for (Map<String, Object> r : db.query("SELECT path, hash FROM startup_items;"))
+            for (Map<String, Object> r : db.query("SELECT path, hash FROM startup_items ORDER BY path;"))
                 startup.put(Db.asStr(r.get("path")), Db.asStr(r.get("hash")));
             for (Map<String, Object> r : db.query("SELECT exe FROM programs WHERE sha256 IS NULL AND exe LIKE '/%';"))
                 identQ.add(Db.asStr(r.get("exe")));
         }
         baseline.put("programs", knownProgs.isEmpty());
         baseline.put("listeners", listeners.isEmpty());
-        baseline.put("startup", startup.isEmpty());
+        baseline.put("startup", startup.keySet().stream().noneMatch(p->!p.equals("crontab -l")));
+        baseline.put("crontab", !startup.containsKey("crontab -l"));
     }
 
     private static Object get(Map<?, ?> m, String k) {
@@ -518,7 +549,7 @@ final class Watch {
             creds.add(v);
         }
         Map<String, Object> st = new LinkedHashMap<>();
-        for (Map<String, Object> r : db.query("SELECT path, hash FROM startup_items;"))
+        for (Map<String, Object> r : db.query("SELECT path, hash FROM startup_items ORDER BY path;"))
             st.put(Db.asStr(r.get("path")), r.get("hash"));
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("programs", programs);
@@ -639,32 +670,56 @@ final class Watch {
      * is the command line, read separately so a helper started through a shell is still
      * recognised by name.
      */
+    static final String ASCII_WS="[ \t\n\r\f\u000B]";
+    static String asciiStrip(String s) { return s.replaceAll("^"+ASCII_WS+"+|"+ASCII_WS+"+$",""); }
+    static List<String> asciiSplit(String s,int max) {
+        s=asciiStrip(s); return s.isEmpty()?List.of():Arrays.asList(s.split(ASCII_WS+"+",max+1));
+    }
+    static long pidValue(String value,boolean parent,String error) throws CollectionHealth.Rejected {
+        if(!value.matches("[0-9]+")) throw new CollectionHealth.Rejected(error);
+        String significant=value.replaceFirst("^0+(?!$)","");
+        if(significant.length()>10) throw new CollectionHealth.Rejected(error);
+        long n=Long.parseLong(significant);
+        if(n<(parent?0:1) || n>Integer.MAX_VALUE) throw new CollectionHealth.Rejected(error);
+        return n;
+    }
+    static boolean absoluteExe(String value) { return value.startsWith("/") && value.length()>1; }
+
     Map<Long, P> processes() throws IOException, Proc.Timeout {
         Proc.Result comm = sources.run(List.of("ps","-axo","pid=,ppid=,user=,comm="),20);
-        Proc.Result argv = sources.run(List.of("ps","-axo","pid=,args="),20);
-        CollectionHealth.command("ps",comm); CollectionHealth.command("ps",argv);
-        Map<Long,String> args = new HashMap<>();
-        for(String line:Py.splitlines(argv.out())) {
-            if(line.isBlank()) continue;
-            List<String> parts=Py.split(line,1);
-            if(parts.isEmpty() || !Py.isDigits(parts.get(0))) throw new CollectionHealth.Rejected("ps-parse");
-            long pid=Long.parseLong(parts.get(0)); if(pid<=0) throw new CollectionHealth.Rejected("ps-parse");
-            if(args.put(pid,parts.size()==1?"":Py.strip(parts.get(1)))!=null) throw new CollectionHealth.Rejected("ps-parse");
-        }
-        Map<Long,P> procs=new LinkedHashMap<>();
+        CollectionHealth.command("ps",comm);
+        Map<Long,P> primary=new LinkedHashMap<>();
+        // Validate the entire first stream, including bridge bounds, before invoking ps2.
         for(String line:Py.splitlines(comm.out())) {
-            if(line.isBlank()) continue;
-            List<String> parts=Py.split(line,3);
-            if(parts.size()!=4 || !Py.isDigits(parts.get(0)) || !Py.isDigits(parts.get(1))) throw new CollectionHealth.Rejected("ps-parse");
-            long pid=Long.parseLong(parts.get(0)); if(pid<=0) throw new CollectionHealth.Rejected("ps-parse"); String exe=Py.strip(parts.get(3));
-            if(!exe.startsWith("/") && !exe.startsWith("(")) {
-                String pp=sources.pidPath(pid); if(pp!=null && !pp.isEmpty()) exe=pp;
-            }
-            // ps calls race normally: a missing argv row does not erase a primary process.
-            if(procs.put(pid,new P(Long.parseLong(parts.get(1)),parts.get(2),exe,args.getOrDefault(pid,"")))!=null)
+            if(asciiStrip(line).isEmpty()) continue;
+            List<String> parts=asciiSplit(line,3);
+            if(parts.size()!=4) throw new CollectionHealth.Rejected("ps-parse");
+            long pid=pidValue(parts.get(0),false,"ps-parse"), ppid=pidValue(parts.get(1),true,"ps-parse");
+            String exe=asciiStrip(parts.get(3));
+            if(exe.isEmpty() || primary.put(pid,new P(ppid,parts.get(2),exe,""))!=null)
                 throw new CollectionHealth.Rejected("ps-parse");
         }
-        if(procs.isEmpty() || args.isEmpty()) throw new CollectionHealth.Rejected("ps-parse");
+        if(primary.isEmpty()) throw new CollectionHealth.Rejected("ps-parse");
+        Proc.Result argv = sources.run(List.of("ps","-axo","pid=,args="),20);
+        CollectionHealth.command("ps",argv);
+        Map<Long,String> args = new HashMap<>();
+        for(String line:Py.splitlines(argv.out())) {
+            if(asciiStrip(line).isEmpty()) continue;
+            List<String> parts=asciiSplit(line,1);
+            if(parts.isEmpty()) throw new CollectionHealth.Rejected("ps-parse");
+            long pid=pidValue(parts.get(0),false,"ps-parse");
+            if(args.put(pid,parts.size()==1?"":asciiStrip(parts.get(1)))!=null) throw new CollectionHealth.Rejected("ps-parse");
+        }
+        if(args.isEmpty()) throw new CollectionHealth.Rejected("ps-parse");
+        Map<Long,P> procs=new LinkedHashMap<>();
+        for(Map.Entry<Long,P> e:primary.entrySet()) {
+            long pid=e.getKey(); P p=e.getValue(); String exe=p.exe();
+            if(!absoluteExe(exe) && !exe.startsWith("(")) {
+                String pp=sources.pidPath(pid); if(pp!=null && !pp.isEmpty()) exe=pp;
+            }
+            // The two commands race normally: a missing argv row is not a missing process.
+            procs.put(pid,new P(p.ppid(),p.user(),exe,args.getOrDefault(pid,"")));
+        }
         return procs;
     }
 
@@ -886,8 +941,7 @@ final class Watch {
             if(line.startsWith("p")) {
                 if(pid!=null && (!addressSeen || (inFile && !fileAddressSeen))) throw new CollectionHealth.Rejected("lsof-parse");
                 pid=line.substring(1); cmd=null; addressSeen=false; inFile=false; fileAddressSeen=false;
-                if(!Py.isDigits(pid)) throw new CollectionHealth.Rejected("lsof-parse");
-                if(Long.parseLong(pid)<=0) throw new CollectionHealth.Rejected("lsof-parse");
+                pidValue(pid,false,"lsof-parse");
             } else if(line.startsWith("c") && pid!=null) {
                 if(cmd!=null || addressSeen || inFile || line.length()==1) throw new CollectionHealth.Rejected("lsof-parse");
                 cmd=line.substring(1);
@@ -896,8 +950,9 @@ final class Watch {
                 inFile=true; fileAddressSeen=false;
             } else if(line.startsWith("n") && pid!=null && cmd!=null) {
                 String addr=line.substring(1); int colon=addr.lastIndexOf(':');
-                if(colon<=0 || !Py.isDigits(addr.substring(colon+1))) throw new CollectionHealth.Rejected("lsof-parse");
-                long port=Long.parseLong(addr.substring(colon+1)); if(port<1 || port>65535 || addr.substring(0,colon).chars().anyMatch(Character::isWhitespace)) throw new CollectionHealth.Rejected("lsof-parse");
+                if(colon<=0) throw new CollectionHealth.Rejected("lsof-parse");
+                long port=pidValue(addr.substring(colon+1),false,"lsof-parse");
+                if(port>65535 || Pattern.compile(ASCII_WS).matcher(addr.substring(0,colon)).find()) throw new CollectionHealth.Rejected("lsof-parse");
                 rows.add(new Row(Long.parseLong(pid),cmd,addr,addr.substring(0,colon),port)); addressSeen=true; fileAddressSeen=true;
             } else throw new CollectionHealth.Rejected("lsof-parse");
         }
@@ -910,14 +965,14 @@ final class Watch {
         List<PendingEvent> events=new ArrayList<>(); String t=clock.get();
         for(Row row:rows) {
             P p=procs.get(row.pid()); String exe=p==null?"":p.exe();
-            if(!exe.startsWith("/")) { String pp=sources.pidPath(row.pid()); exe=pp==null?"":pp; }
-            if(!exe.startsWith("/")) {
+            if(!absoluteExe(exe)) { String pp=sources.pidPath(row.pid()); exe=pp==null?"":pp; }
+            if(!absoluteExe(exe)) {
                 Proc.Result lookup=sources.run(List.of("ps","-o","comm=","-p",Long.toString(row.pid())),20);
                 List<String> lines=Py.splitlines(lookup.out());
                 if(lookup.code()!=0 || !lookup.err().isEmpty() || lines.size()!=1)
                     throw new CollectionHealth.Rejected("lsof-parse");
-                exe=Py.strip(lines.getFirst());
-                if(!exe.startsWith("/")) throw new CollectionHealth.Rejected("lsof-parse");
+                exe=asciiStrip(lines.getFirst());
+                if(!absoluteExe(exe)) throw new CollectionHealth.Rejected("lsof-parse");
                 // comm= is the full executable path on macOS, including spaces. Never split it.
 
             }
@@ -985,6 +1040,8 @@ final class Watch {
     }
 
     String diff(String oldCopy, String newCopy, int limit) {
+        String fixture=sources.textDiff(oldCopy,newCopy,limit);
+        if(fixture!=null) return fixture;
         List<String> a, b;
         try {
             if (oldCopy == null || newCopy == null) throw new IOException("missing");
@@ -1007,53 +1064,96 @@ final class Watch {
         }
     }
 
-    void checkStartup() {
-        collectionHealth.attempt("startup",clock.get()); boolean cronAttempt=false;
+    record StartupSample(Map<String,String> hashes,Map<String,byte[]> bytes,boolean unreadable,String cronText) {}
+    StartupSample filesystemStartup() throws IOException {
+        Map<String,String> hashes=new LinkedHashMap<>(); Map<String,byte[]> bytes=new LinkedHashMap<>();
+        for(String dir:sources.dirs()) for(String file:sources.list(dir)) observeStartup(file,true,hashes,bytes);
+        List<String> files=new ArrayList<>(sources.files()); files.addAll(extraStartup);
+        for(String file:files) observeStartup(file,false,hashes,bytes);
+        return new StartupSample(hashes,bytes,hashes.values().stream().anyMatch(v->v.startsWith("unreadable: ")),null);
+    }
+    void observeStartup(String file,boolean listed,Map<String,String> hashes,Map<String,byte[]> bytes) throws IOException {
+        if(file.equals("crontab -l")) return; // Reserved independent partition, never a filesystem row.
         try {
-            Map<String,byte[]> bytes=new LinkedHashMap<>();
-            for(String dir:sources.dirs()) for(String file:sources.list(dir)) {
-                byte[] value=sources.read(file); if(value==null) throw new CollectionHealth.Rejected("startup-read"); bytes.put(file,value);
+            byte[] value=sources.entry(file);
+            if(value==null) { if(listed) throw new CollectionHealth.Rejected("startup-read"); return; }
+            bytes.put(file,value); hashes.put(file,HexFormat.of().formatHex(sha256().digest(value)));
+        } catch(Unreadable e) { hashes.put(file,e.marker); bytes.remove(file); }
+    }
+    StartupSample cronStartup() throws IOException,Proc.Timeout {
+        Proc.Result cron=sources.run(List.of("crontab","-l"),20);
+        String disposition=CollectionHealth.command("crontab",cron), text=disposition.equals("ok-absent")?"":cron.out();
+        byte[] value=text.getBytes(StandardCharsets.UTF_8);
+        return new StartupSample(Map.of("crontab -l",disposition.equals("ok-absent")?"none":HexFormat.of().formatHex(sha256().digest(value))),Map.of("crontab -l",value),false,text);
+    }
+    Map<String,String> startupCopies(StartupSample sample,String partition,String copies) throws IOException {
+        Map<String,String> destinations=new HashMap<>();
+        for(Map.Entry<String,String> e:sample.hashes().entrySet()) {
+            String file=e.getKey(),digest=e.getValue(),old=startup.get(file);
+            if((old==null || !old.equals(digest) || baseline.get(partition)) && !digest.startsWith("unreadable: ")) {
+                String dest=Paths.join(copies,safeName(file),Py.cut(digest,16));byte[] value=sample.bytes().get(file);
+                // Full hash; files save first4MiB, cron has always saved its full text.
+                sources.copy(dest,partition.equals("crontab")?value:Arrays.copyOf(value,Math.min(value.length,4*1024*1024)));
+                destinations.put(file,dest);
             }
-            List<String> files=new ArrayList<>(sources.files()); files.addAll(extraStartup);
-            for(String file:files) { byte[] value=sources.read(file); if(value!=null) bytes.put(file,value); }
-            // Filesystem FIRST, crontab LAST. Neither success is adopted before the aggregate commits.
-            cronAttempt=true; collectionHealth.attempt("crontab",clock.get());
-            Proc.Result cron=sources.run(List.of("crontab","-l"),20);
-            String disposition=CollectionHealth.command("crontab",cron);
-            String proposedCron=disposition.equals("ok-absent")?"":cron.out();
-            bytes.put("crontab -l",proposedCron.getBytes(StandardCharsets.UTF_8));
-            Map<String,String> snap=new LinkedHashMap<>();
-            for(Map.Entry<String,byte[]> e:bytes.entrySet()) snap.put(e.getKey(),e.getKey().equals("crontab -l") && disposition.equals("ok-absent")?"none":HexFormat.of().formatHex(sha256().digest(e.getValue())));
-            String t=clock.get(); String copies=sources.copyRoot(snapDir); List<String> sql=new ArrayList<>(); List<PendingEvent> events=new ArrayList<>();
-            TreeSet<String> all=new TreeSet<>(Watch::codepointCompare); all.addAll(snap.keySet()); all.addAll(startup.keySet());
-            for(String file:all) {
-                String digest=snap.get(file), old=startup.get(file);
-                if(digest==null) {
-                    sql.add(Db.bind("DELETE FROM startup_items WHERE path=?",file));
-                    if(!baseline.get("startup")) events.add(new PendingEvent("STARTUP-","removed: "+file+" | last copy: "+Paths.join(copies,safeName(file),Py.cut(old,16))));
-                } else {
-                    sql.add(Db.bind("INSERT OR REPLACE INTO startup_items(path,hash,last_checked) VALUES (?,?,?)",file,digest,t));
-                    if(old==null || !old.equals(digest) || baseline.get("startup")) {
-                        String dest=Paths.join(copies,safeName(file),Py.cut(digest,16));
-                        byte[] value=bytes.get(file);
-                        // Preserve the existing saved-copy policy: full hash, first 4 MiB of files;
-                        // crontab content has always been saved in full.
-                        sources.copy(dest,file.equals("crontab -l")?value:Arrays.copyOf(value,Math.min(value.length,4*1024*1024)));
-                        sql.add(Db.bind("INSERT INTO startup_versions(path,hash,copy_path,seen_at) VALUES (?,?,?,?)",file,digest,dest,t));
-                        if(!baseline.get("startup")) {
-                            if(old==null) events.add(new PendingEvent("STARTUP+","added: "+file+" | copy: "+dest));
-                            else { String before=Paths.join(copies,safeName(file),Py.cut(old,16)); events.add(new PendingEvent("STARTUP~","changed: "+file+" | before: "+before+" | after: "+dest+"\n"+diff(before,dest,40))); }
-                        }
+        }
+        return destinations;
+    }
+    static String startupError(Exception e,boolean filesystem) {
+        if(e instanceof CollectionHealth.Rejected r) return r.code;
+        if(e instanceof Proc.Timeout) return "collection-timeout";
+        if(e instanceof IOException io && CollectionHealth.ioError(io).equals("collection-parse")) return "collection-parse";
+        return filesystem?"startup-read":"collection-io";
+    }
+    void checkStartup() {
+        StartupSample fs=null,cron=null; Map<String,String> destinations=new HashMap<>();
+        String copies=sources.copyRoot(snapDir);
+        collectionHealth.attempt("startup",clock.get());
+        try { fs=filesystemStartup(); }
+        catch(IOException e) {fs=null;collectionHealth.fail("startup",startupError(e,true));}
+        if(fs!=null) try {destinations.putAll(startupCopies(fs,"startup",copies));}
+        catch(IOException e) {fs=null;collectionHealth.fail("startup",CollectionHealth.ioError(e));}
+        // Both observations are attempted independently, in this deterministic order.
+        collectionHealth.attempt("crontab",clock.get());
+        try { cron=cronStartup();destinations.putAll(startupCopies(cron,"crontab",copies)); }
+        catch(IOException | Proc.Timeout e) {cron=null;collectionHealth.fail("crontab",startupError(e,false));}
+        if(fs==null && cron==null) return;
+        Map<String,String> proposed=new LinkedHashMap<>(startup);
+        if(fs!=null) {proposed.keySet().removeIf(k->!k.equals("crontab -l"));proposed.putAll(fs.hashes());}
+        if(cron!=null) proposed.putAll(cron.hashes());
+        TreeSet<String> all=new TreeSet<>(Watch::codepointCompare); all.addAll(startup.keySet());all.addAll(proposed.keySet());
+        List<String> sql=new ArrayList<>(); List<PendingEvent> events=new ArrayList<>(); String t=clock.get();
+        for(String file:all) {
+            String partition=file.equals("crontab -l")?"crontab":"startup";
+            if((partition.equals("startup") && fs==null) || (partition.equals("crontab") && cron==null)) continue;
+            String digest=proposed.get(file),old=startup.get(file);boolean first=baseline.get(partition);
+            if(digest==null) {
+                sql.add(Db.bind("DELETE FROM startup_items WHERE path=?",file));
+                if(!first) events.add(new PendingEvent("STARTUP-","removed: "+file+" | last copy: "+(old.startsWith("unreadable: ")?"None":Paths.join(copies,safeName(file),Py.cut(old,16)))));
+            } else {
+                sql.add(Db.bind("INSERT OR REPLACE INTO startup_items(path,hash,last_checked) VALUES (?,?,?)",file,digest,t));
+                if(old==null || !old.equals(digest) || first) {
+                    String dest=destinations.get(file);
+                    sql.add(Db.bind("INSERT INTO startup_versions(path,hash,copy_path,seen_at) VALUES (?,?,?,?)",file,digest,dest,t));
+                    if(!first) {
+                        if(old==null) events.add(new PendingEvent("STARTUP+","added: "+file+" | copy: "+(dest==null?"None":dest)));
+                        else {String before=old.startsWith("unreadable: ")?null:Paths.join(copies,safeName(file),Py.cut(old,16));
+                            events.add(new PendingEvent("STARTUP~","changed: "+file+" | before: "+(before==null?"None":before)+" | after: "+(dest==null?"None":dest)+"\n"+diff(before,dest,40)));}
                     }
                 }
             }
-            if(baseline.get("startup")) events.add(new PendingEvent("BASELINE","startup items: "+snap.size()+" recorded, copies in "+copies));
-            commitSample(sql,events,t); startup=snap; crontabText=proposedCron; baseline.put("startup",false);
-            collectionHealth.success("startup",clock.get()); collectionHealth.success("crontab",clock.get()); publishEvents(events,t);
-        } catch(Exception e) {
-            String code=e instanceof CollectionHealth.Rejected r?r.code:e instanceof Proc.Timeout?"collection-timeout":e instanceof DbException?"collection-db":e instanceof IOException io && CollectionHealth.ioError(io).equals("collection-parse")?"collection-parse":!cronAttempt?"startup-read":"collection-io";
-            collectionHealth.fail("startup",code); if(cronAttempt) collectionHealth.fail("crontab",code);
         }
+        if(fs!=null && baseline.get("startup")) events.add(new PendingEvent("BASELINE","startup items: "+fs.hashes().size()+" recorded, copies in "+copies));
+        if(cron!=null && baseline.get("crontab")) events.add(new PendingEvent("BASELINE","crontab: 1 recorded, copies in "+copies));
+        try {commitSample(sql,events,t);}
+        catch(DbException | Db.Fatal e) {
+            if(fs!=null)collectionHealth.fail("startup","collection-db");if(cron!=null)collectionHealth.fail("crontab","collection-db");
+            if(e instanceof Db.Fatal fatal)throw fatal;return;
+        }
+        Map<String,String> ordered=new LinkedHashMap<>();for(String file:all)if(proposed.containsKey(file))ordered.put(file,proposed.get(file));startup=ordered;
+        if(fs!=null) {baseline.put("startup",false);if(fs.unreadable())collectionHealth.fail("startup","startup-unreadable");else collectionHealth.success("startup",clock.get());}
+        if(cron!=null) {baseline.put("crontab",false);crontabText=cron.cronText();collectionHealth.success("crontab",clock.get());}
+        publishEvents(events,t);
     }
 
     // ---- 1b: short-lived credential and git network helpers from the unified log ----
@@ -1173,35 +1273,36 @@ final class Watch {
         return !w.isEmpty() && Py.basename(w.get(0)).equals("tattletale");
     }
 
-    static boolean liveTattletale(long pid) {
-        try {
-            Proc.Result r = Proc.run(List.of("ps", "-p", Long.toString(pid), "-o", "command="));
-            return r.code() == 0 && isTattletaleCommand(r.out());
-        } catch (IOException | Proc.Timeout e) {
-            return false;
-        }
+    interface PidProbe { Proc.Result inspect(long pid) throws IOException,Proc.Timeout; }
+    PidProbe pidProbe=pid->Proc.run(List.of("ps","-p",Long.toString(pid),"-o","command="),20);
+    enum PidIdentity { WATCHER, OTHER, ABSENT, UNKNOWN }
+    static PidIdentity pidIdentity(Proc.Result result) {
+        if(result.code()==1 && result.out().isEmpty() && result.err().isEmpty()) return PidIdentity.ABSENT;
+        List<String> lines=Py.splitlines(result.out());
+        if(result.code()!=0 || !result.err().isEmpty() || lines.size()!=1 || asciiStrip(lines.getFirst()).isEmpty()) return PidIdentity.UNKNOWN;
+        return isTattletaleCommand(lines.getFirst())?PidIdentity.WATCHER:PidIdentity.OTHER;
     }
-
-    /**
-     * One watcher per database. tattletale.pid sits next to the db; a live tattletale (Python or
-     * Java) holding it refuses this start. A stale file, or one whose pid now belongs to another
-     * program, is taken over.
-     */
+    /** A failed identity observation cannot authorize replacement of another watcher's pid. */
     void claimPidFile() throws IOException {
-        String path = Paths.join(Py.dirname(Paths.abspath(dbPath)), "tattletale.pid");
-        long other = 0, me = ProcessHandle.current().pid();
+        String path=Paths.join(Py.dirname(Paths.abspath(dbPath)),"tattletale.pid");
+        long other=0,me=ProcessHandle.current().pid();
         try {
-            String s = Py.strip(Files.readString(Path.of(path)));
-            other = s.isEmpty() ? 0 : Py.parseInt(s);
-        } catch (IOException | NumberFormatException e) {
-            other = 0;
+            String value=asciiStrip(Files.readString(Path.of(path)));
+            try {other=pidValue(value,false,"pid-identity");}
+            catch(CollectionHealth.Rejected e) {throw new Exit("tattletale: existing pid identity is unknown");}
+        } catch(java.nio.file.NoSuchFileException e) {
+            // A final dangling link is an existing unknown identity, not first-start absence.
+            if(Files.exists(Path.of(path),java.nio.file.LinkOption.NOFOLLOW_LINKS))
+                throw new Exit("tattletale: existing pid identity is unknown");
         }
-        if (other != 0 && other != me && liveTattletale(other)) {
-            throw new Exit("tattletale: already running as pid " + other + " for this database (" + path + "); stop it first: kill "
-                    + other);
+        if(other!=0 && other!=me) {
+            PidIdentity identity;
+            try {identity=pidIdentity(pidProbe.inspect(other));}
+            catch(IOException | Proc.Timeout e) {identity=PidIdentity.UNKNOWN;}
+            if(identity==PidIdentity.UNKNOWN) throw new Exit("tattletale: existing pid identity is unknown");
+            if(identity==PidIdentity.WATCHER) throw new Exit("tattletale: already running as pid "+other+" for this database ("+path+"); stop it first: kill "+other);
         }
-        Files.writeString(Path.of(path), me + "\n");
-        pidFile = path;
+        Files.writeString(Path.of(path),me+"\n");pidFile=path;
     }
 
     void releasePidFile() {
@@ -1251,18 +1352,37 @@ final class Watch {
         }
     }
 
+    volatile Db.Fatal workerDatabaseFailure;
+    void ownedWorker(Runnable body) {
+        try {body.run();}
+        catch(Db.Fatal e) {workerDatabaseFailure=e;requestStop();}
+    }
+    interface RuntimeBody {void run() throws IOException,DbException;}
+    void withOwnedCleanup(RuntimeBody body,Thread... workers) throws IOException,DbException {
+        try {body.run();}
+        finally {
+            requestStop();
+            for(Thread worker:workers) worker.interrupt();
+            boolean interrupted=false;
+            for(Thread worker:workers) try {worker.join(5000);}catch(InterruptedException e){interrupted=true;}
+            synchronized(LOCK) {db.close();}
+            releasePidFile();
+            if(interrupted) Thread.currentThread().interrupt();
+        }
+        // A worker can fail after the loop's final check. Join/cleanup first, then
+        // preserve NONZERO on an otherwise normal return; never mask a body failure.
+        if(workerDatabaseFailure!=null) throw workerDatabaseFailure;
+    }
     void run() throws IOException, DbException {
+        Thread ls=new Thread(()->ownedWorker(this::logStream),"log-stream");ls.setDaemon(true);
+        Thread iw=new Thread(()->ownedWorker(this::identityWorker),"identity");iw.setDaemon(true);
+        withOwnedCleanup(()->{
         claimPidFile();
         installDashboard();
         log("START", "tattletale " + VERSION + " pid " + ProcessHandle.current().pid() + " db " + dbPath);
         loadState();
         safe("retention", this::retain);
-        Thread ls = new Thread(this::logStream, "log-stream");
-        ls.setDaemon(true);
-        ls.start();
-        Thread iw = new Thread(this::identityWorker, "identity");
-        iw.setDaemon(true);
-        iw.start();
+        ls.start(); iw.start();
         double lastListeners = Double.NEGATIVE_INFINITY, lastStartup = Double.NEGATIVE_INFINITY;
         double lastRetention = monotonic();
         while (!stopped()) {
@@ -1288,13 +1408,9 @@ final class Watch {
                 break;
             }
         }
+        if(workerDatabaseFailure!=null) throw workerDatabaseFailure;
         safe("save", this::save);
         log("STOP", "tattletale stopped");
-        synchronized (LOCK) {
-            db.close();
-        }
-        releasePidFile();
-        Process p = streamProc;
-        if (p != null) p.destroy();
+        },ls,iw);
     }
 }
