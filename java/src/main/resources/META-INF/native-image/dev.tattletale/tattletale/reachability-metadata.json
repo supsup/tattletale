@@ -3,7 +3,44 @@
     "downcalls": [
       {
         "returnType": "jint",
-        "parameterTypes": ["jint", "void*", "jint"]
+        "parameterTypes": [
+          "jint",
+          "void*",
+          "jint"
+        ]
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": [
+          "void*",
+          "jint",
+          "jint"
+        ],
+        "options": {
+          "firstVariadicArg": 2,
+          "captureCallState": true
+        }
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": [
+          "jint",
+          "void*"
+        ]
+      },
+      {
+        "returnType": "jlong",
+        "parameterTypes": [
+          "jint",
+          "void*",
+          "jlong"
+        ]
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": [
+          "jint"
+        ]
       }
     ]
   }

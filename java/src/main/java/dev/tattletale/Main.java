@@ -121,7 +121,7 @@ public final class Main {
     static Object convert(String name, Kind kind, Object raw) {
         switch (kind) {
             case BOOL -> {
-                String v = Py.strip(Py.str(raw)).toLowerCase();
+                String v = Py.strip(Py.str(raw)).toLowerCase(java.util.Locale.ROOT);
                 if (List.of("1", "true", "yes", "on").contains(v)) return Boolean.TRUE;
                 if (List.of("0", "false", "no", "off").contains(v)) return Boolean.FALSE;
                 throw new Exit("tattletale: " + name + ": expected true or false, got " + Py.repr(raw));
@@ -177,7 +177,7 @@ public final class Main {
             List<String> unknown = new ArrayList<>();
             for (String k : fileVals.keySet()) {
                 if (k.equals("TATTLETALE_CONFIG")) continue;
-                if (!(k.startsWith("TATTLETALE_") && setting(k.substring(11).toLowerCase()) != null)) unknown.add(k);
+                if (!(k.startsWith("TATTLETALE_") && setting(k.substring(11).toLowerCase(java.util.Locale.ROOT)) != null)) unknown.add(k);
             }
             unknown.sort(Watch::codepointCompare);
             if (!unknown.isEmpty()) throw new Exit("tattletale: " + cfgPath + ": unknown setting(s): " + String.join(", ", unknown));
@@ -187,7 +187,7 @@ public final class Main {
         Map<String, Object> eff = new LinkedHashMap<>();
         Map<String, String> src = new LinkedHashMap<>();
         for (Setting s : SETTINGS) {
-            String key = "TATTLETALE_" + s.name().toUpperCase();
+            String key = "TATTLETALE_" + s.name().toUpperCase(java.util.Locale.ROOT);
             Object flag = a.values.get(s.name());
             if (flag != null && !(flag instanceof List<?> l && l.isEmpty())) {
                 eff.put(s.name(), convert(s.name(), s.kind(), flag));
@@ -222,7 +222,7 @@ public final class Main {
         for (Setting s : SETTINGS) {
             String f = "--" + s.name().replace('_', '-');
             if (s.kind() == Kind.BOOL) sb.append(" [").append(f).append("] [--no-").append(s.name().replace('_', '-')).append(']');
-            else sb.append(" [").append(f).append(' ').append(s.name().toUpperCase()).append(']');
+            else sb.append(" [").append(f).append(' ').append(s.name().toUpperCase(java.util.Locale.ROOT)).append(']');
         }
         return sb.toString();
     }
@@ -244,7 +244,7 @@ public final class Main {
                 case LIST -> s.help() + " (repeatable)";
                 default -> s.help() + " (default " + Py.str(s.dflt()) + ")";
             };
-            String left = s.kind() == Kind.BOOL ? f : f + " " + s.name().toUpperCase();
+            String left = s.kind() == Kind.BOOL ? f : f + " " + s.name().toUpperCase(java.util.Locale.ROOT);
             sb.append("  ").append(left);
             if (left.length() <= 20) sb.append(" ".repeat(22 - left.length())).append(h).append('\n');
             else sb.append("\n                        ").append(h).append('\n');

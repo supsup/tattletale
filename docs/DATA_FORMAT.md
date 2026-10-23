@@ -22,7 +22,7 @@ Both versions default to `<repo>/data/`. Everything in it is machine data and is
 | `tattletale-data.js` | the dashboard's data, rewritten about once a minute, atomically (temp file and rename) |
 | `tattletale.html` | a copy of `dashboard/tattletale.html`, refreshed on start whenever its bytes differ |
 | `tattletale.pid` | the running watcher's pid |
-| `startup-snapshots/` | saved readable versions: the first 4 MiB of each file, full crontab text; hashing covers full content |
+| `startup-snapshots/` | saved readable versions: the first 4 MiB of each accepted file, full crontab text; accepted filesystem files are limited to 16 MiB and hashed completely |
 | `tattletale-map.json` | optional; an old mac-watch JSON map, imported once into an empty database, never written |
 
 Settings live in `<repo>/tattletale.env`, shared by both versions.
@@ -85,9 +85,10 @@ Rules:
   `hash` is the SHA-256 of the content, except that an accepted absent crontab uses the
   existing `none` sentinel. An accepted empty crontab hashes the empty bytes instead.
   Fully enumerated persistent unreadability uses exactly `unreadable: permission-denied`,
-  `unreadable: directory` or `unreadable: dangling-link` for that filesystem entry.
+  `unreadable: directory`, `unreadable: dangling-link`, `unreadable: symlink-loop`,
+  `unreadable: not-a-regular-file` or `unreadable: file-too-large` for that filesystem entry.
   `startup_versions.copy_path` is the saved copy, or null for an unreadable-entry marker.
-  File hashes cover the full content even when the saved copy is capped at 4 MiB;
+  File hashes cover the full accepted content (up to 16 MiB) even when the saved copy is capped at 4 MiB;
   crontab copies are saved in full. A marker never stands for invented copy bytes.
 - Retention: rows of `sightings` older than `sightings_retention_days`, and of `events` and
   `credential_events` older than `retention_days`, are deleted hourly (0 keeps them forever).
@@ -111,6 +112,8 @@ window.TATTLETALE = {
     "startup": {"lastAttempt":null,"lastSuccess":null,"status":"unknown","error":null},
     "crontab": {"lastAttempt":null,"lastSuccess":null,"status":"unknown","error":null}
   },
+  "publicationHealth": {"lastAttempt":null,"lastSuccess":null,"status":"unknown","error":null},
+  "inventoryAsOf": "2000-01-01T00:00:00Z",
   "map": {"programs":{},"listeners":{},"credentials":[],"startup":{}},
   "log": []
 };
@@ -125,10 +128,12 @@ historical database rowids are not rewritten or promised equal.
 | Key | Shape |
 |---|---|
 | `formatVersion` | integer `2`, the generated-data contract version, independent of SQLite schema and producer version |
-| `generatedAt` | when the file was written; the page's Live/Stale state becomes Stale after 180 s, independently of collection health |
+| `generatedAt` | envelope generation time; the page's Live/Stale state becomes Stale after 180 s, independently of collection health or the age of a cached inventory projection |
 | `version` | the writer's version string, not the data format or SQLite schema version |
 | `pid` | the writer's pid |
 | `collectionHealth` | object with exactly `processes`, `listeners`, `startup`, `crontab`; each entry has the four fields below |
+| `publicationHealth` | separate database/page-publication result with the same four fields; a fifth collector is not implied |
+| `inventoryAsOf` | UTC ISO-8601 second with `Z` for the last complete successful database projection, or null before one exists |
 | `map.programs` | object keyed by exe: `firstSeen`, `lastSeen`, `user`, `firstPid`, `firstArgs`, `parent`, and, only once known, `sha256`, `size`, `signer`, `team`, `signingId` |
 | `map.listeners` | object keyed by listener key: `firstSeen`, `lastSeen`, `pid`, `command`, `bindScope`, `exposed` (legacy boolean), `user`, `args`, `chain`, `present` (boolean) |
 | `map.credentials` | array, oldest first, the last 500: `time`, `pid`, `user`, `exe`, `args`, `chain`, `source` |
@@ -164,6 +169,42 @@ inventory, health and generation time, labels them last-known and shows a persis
 error. That error is separate from both the retained collector result and file freshness;
 it does not rewrite a past attempt as "not yet" or certify current observation.
 
+### Database/page publication health
+
+`publicationHealth` describes the save path independently of the four polling checks.
+Its `lastAttempt` is the current save attempt; `lastSuccess` advances only after a complete
+database flush, projection and atomic page replacement succeed. Its bounded `error` is
+null, `collection-db` or `collection-io`. Like collector health, it starts unknown in each
+watcher epoch. A successful complete database projection during load seeds a detached
+cache and `inventoryAsOf`, without inventing a publication attempt or success. A recoverable
+failure of that extra projection leaves the cache unavailable; fatal database disposition
+still exits. No prior JavaScript file is used to recover inventory or health.
+
+If a recoverable flush or projection fails, a cache permits a new envelope containing the
+last complete inventory projection and **current** collector health, with publication
+degraded/`collection-db`. `generatedAt` is new; `inventoryAsOf` remains the cached projection's
+time. Repeated fallback writes never advance publication success. All displayed inventory
+is labelled last-known during fallback, even if the independent collector entries are ok.
+With no real cache, no empty inventory is invented and the old file remains unchanged.
+
+Dirty last-seen updates remain pending after a rolled-back flush. They clear after COMMIT;
+a later projection or page-write failure does not resurrect committed entries. A successful
+recovery publishes the fresh projection and ok/new success. Success is serialized
+tentatively and adopted in memory only after atomic replacement. A failed replacement
+preserves the prior exact file and prior success, marks in-memory publication degraded/
+`collection-io`, and reports failure; the failed write cannot publish its own diagnosis.
+Atomic replacement guarantees whole-file visibility, not a joint SQLite/filesystem commit
+or crash durability.
+
+Older format-2 payloads missing both additive fields remain compatible. If either field is
+present, both must be valid; malformed publication metadata is shown as unknown/incomplete,
+never healthy. An ok publication requires a non-null projection time. Unknown publication
+may have a real load projection time but no success. No wall-clock ordering guarantee is
+inferred. A failed refresh retains the last fully accepted publication and projection
+metadata with the same persistent load-error warning as the inventory.
+
+### Accepted observations
+
 A wholly successful accepted sample, including legitimate empty output, advances its success timestamp.
 Failed commands, decoding errors and structurally partial samples degrade the affected
 check and retain its last-good observation partition, baseline, mirrors and events.
@@ -186,10 +227,23 @@ crontab changes may commit. This replaces the earlier combined-sample rule.
 A completely enumerated filesystem observation can commit a persistent unreadable-entry
 marker while continuing to observe readable peers. Such a commit consumes its filesystem
 baseline, but health is `degraded` with `startup-unreadable` and does not advance
-`lastSuccess`. Recovery to a wholly readable observation advances success and records the
-change once. A vanished listed file, broken source ancestor, I/O error or unknown/transient
+`lastSuccess`. Crossing into or out of an unreadable marker is not itself a content-change
+event. A→unreadable→A emits no `STARTUP~`; A→unreadable→B emits one, comparing B with the
+most recent readable A copy. Recovery advances success once the whole partition is readable.
+A vanished listed file, broken or inaccessible source ancestor, I/O error or unknown/transient
 read failure rejects that partition; it is not converted to a persistent marker. No
 recursive directory scan is introduced, and an unreadable marker is never an all-clear.
+
+Final-entry metadata is established before opening. Known directories, including mode-000
+directories, use the directory marker; FIFO, socket, device and other nonregular entries
+use the nonregular marker. A final permission-denied regular file may be marked only when
+metadata proves that entry rather than an inaccessible ancestor. A nonblocking open and
+opened-handle type/identity checks reject replacement races; regular→FIFO must not block
+the collector. An exactly-16-MiB regular file is accepted and hashed fully; a known larger
+file gets `unreadable: file-too-large`, preserving readable peers. Growth or identity changes
+while reading reject the partition, never a prefix hash passed off as complete content.
+This does not bound delays from slow regular-file storage. Saved copies remain capped at
+4 MiB; the filesystem read limit does not truncate accepted crontab text.
 
 All eligible row/version/event changes share one database transaction. Mirrors and
 baselines are adopted only after COMMIT. A database failure adopts neither eligible
@@ -228,6 +282,10 @@ These are explicit source-based policies, not observations from a live host coll
   with no other diagnostics. That uses the existing `none` sentinel. An empty stderr on
   exit 1 is not accepted as absence. This narrow convention follows the ENOENT branch in
   Apple's [`list_cmd` source](https://github.com/apple-oss-distributions/cron/blob/main/crontab/crontab.c).
+  Both command streams require valid UTF-8. Undecodable crontab bytes degrade that
+  partition with `collection-parse` and retain its last-known values, even if those bytes
+  form a valid crontab in another encoding. Arbitrary encodings are not supported;
+  replacement decoding would hide a failed observation.
 
 These checks reject detected errors and structural partial results. They cannot universally
 detect a producer that silently returns well-formed but incomplete data.
@@ -310,4 +368,8 @@ Unknown names and malformed values are refused, never ignored. Names, types and 
 
 `tattletale.pid` sits next to the database and holds the watcher's pid. A start refuses while
 a live Tattletale (either version) holds it, takes over a file whose pid is gone or belongs to
-another program, and removes the file on a clean stop. One database, one watcher.
+another program, and removes its own file on a clean stop. Empty or unparseable regular
+PID-file content is stale with a fixed diagnostic. Unreadable content, dangling links and
+failed identity observations do not authorize takeover. A complete new PID file is published
+atomically, avoiding a truncate/write gap. This adds no interprocess lock protocol: run only
+one watcher per database.

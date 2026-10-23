@@ -19,6 +19,17 @@ TRANSITIONS = (
     'startupBaseline', 'startupTransition', 'startupRepeated', 'startupCronFailure',
     'startupFilesystemFailure', 'startupDbFailure', 'startupRecovered', 'startupReloaded',
 )
+REPAIRS = (
+    ('finalEntryStates', 'startup', ('regular', 'directory', 'permission-denied', 'fifo', 'socket', 'device', 'symlink-loop', 'dangling-link', 'file-too-large')),
+    ('ancestorRetention', 'startup', ('baseline', 'ancestor-permission', 'ancestor-broken-link', 'listed-disappeared', 'transient-io', 'recovered')),
+    ('readabilitySame', 'startup', ('baseline', 'unreadable', 'repeated', 'readable', 'removed')),
+    ('readabilityChanged', 'startup', ('baseline', 'unreadable', 'repeated', 'readable', 'removed')),
+    ('warningNotes', 'listeners', ('baseline', 'warning', 'repeated', 'otherFailure', 'warningAgain', 'recovered', 'afterRecoveryWarning')),
+    ('automaticRollback', 'rollback', ('baseline', 'rolledBack', 'recovered')),
+    ('publicationRecovery', 'publication', ('loaded', 'published', 'flushFailed', 'flushRepeated', 'projectionFailed', 'recovered', 'writeFailed', 'writeRecovered', 'restarted')),
+    ('publicationNoCache', 'publication-no-cache', ('failed',)),
+    ('pidFraming', 'pid', ('nel', 'lineSeparator', 'paragraphSeparator', 'verticalTab', 'formFeed', 'fileSeparator', 'groupSeparator', 'recordSeparator', 'watcher', 'absent', 'uncertain', 'twoLines', 'crlfTransport', 'crTransport')),
+)
 CHECKS = ('processes', 'listeners', 'startup', 'crontab')
 SCOPES = ('loopback', 'wildcard', 'non-loopback', 'unknown')
 LIMIT = 16 * 1024 * 1024
@@ -108,6 +119,133 @@ def health(value, where):
             require(row['lastAttempt'] is not None and error is not None, at + ': invalid degraded state')
 
 
+def publication_health(value, as_of, where):
+    # Reuse the four-field grammar without pretending publication is a collector.
+    health({key: value for key in CHECKS}, where)
+    require(value['error'] in (None, 'collection-db', 'collection-io'), where + ': unsupported publication diagnostic')
+    require(utc_second(as_of), where + ': invalid projection time')
+    require(value['status'] != 'ok' or as_of is not None, where + ': ok without a real projection')
+
+
+def string_map(value, where, times=False):
+    require(type(value) is dict, where + ': not an object')
+    require(all(type(k) is str and k and type(v) is str and v and
+                (not times or utc_second(v)) for k, v in value.items()), where + ': invalid map scalar')
+
+
+def repair_spec(cases):
+    require(type(cases) is list and len(cases) == len(REPAIRS), 'repair input census mismatch')
+    for case, (name, kind, names) in zip(cases, REPAIRS):
+        keys(case, ('name', 'kind', 'steps'), 'repair input')
+        require(case['name'] == name and case['kind'] == kind, 'repair input name/kind mismatch')
+        steps = case['steps']
+        require(type(steps) is list and len(steps) == len(names), name + ': input step census mismatch')
+        for step, expected in zip(steps, names):
+            require(type(step) is dict and step.get('name') == expected and
+                    type(step.get('at')) is str and utc_second(step['at']), name + ': invalid input step identity/clock')
+            op = step.get('op')
+            require(type(op) is str, name + ': invalid operation')
+            if kind in ('pid', 'listeners'):
+                expected_op = kind
+            elif name == 'publicationNoCache':
+                expected_op = 'save-without-load'
+            elif kind == 'publication':
+                expected_op = {'loaded': 'load', 'restarted': 'restart-load'}.get(expected, 'save')
+            elif kind == 'rollback':
+                expected_op = {'rolledBack': 'startup-rollback', 'recovered': 'startup-drop-trigger'}.get(expected, 'startup')
+            else:
+                expected_op = 'startup'
+            require(op == expected_op, name + ': operation differs from frozen case')
+            base = ('name', 'at', 'op')
+            if op in ('startup', 'startup-rollback', 'startup-drop-trigger'):
+                keys(step, base + ('entries', 'sourceFailure', 'cron') + (() if op == 'startup' else ('sql',)), name)
+                require(step['sourceFailure'] in (None, 'ancestor-permission', 'ancestor-broken-link', 'listed-disappeared', 'transient-io'), name + ': unsupported source failure')
+                require(type(step['entries']) is list, name + ': entries not an array')
+                paths = []
+                for entry in step['entries']:
+                    keys(entry, ('path', 'state', 'text'), name + '.entry')
+                    require(type(entry['path']) is str and entry['path'].startswith('/fixture/'), name + ': invalid logical path')
+                    require(entry['state'] in ('regular', 'directory', 'permission-denied', 'fifo', 'socket', 'device', 'symlink-loop', 'dangling-link', 'file-too-large'), name + ': unknown entry state')
+                    require(type(entry['text']) is str if entry['state'] == 'regular' else entry['text'] is None, name + ': invalid entry content')
+                    paths.append(entry['path'])
+                require(len(paths) == len(set(paths)), name + ': duplicate input path')
+                command = step['cron']
+                if op != 'startup':
+                    require(type(step['sql']) is str and step['sql'], name + ': missing real rollback SQL')
+            elif op in ('listeners', 'pid'):
+                keys(step, base + ('command',), name)
+                command = step['command']
+            elif op in ('save', 'save-without-load'):
+                keys(step, base + ('fault', 'dirtyTime'), name)
+                require(step['fault'] in (None, 'flush-abort', 'projection-db', 'atomic-write-io'), name + ': unsupported publication fault')
+                require(utc_second(step['dirtyTime']), name + ': invalid dirty clock')
+                continue
+            else:
+                require(op in ('load', 'restart-load'), name + ': unsupported operation')
+                keys(step, base, name)
+                continue
+            keys(command, ('code', 'out', 'err'), name + '.command')
+            require(type(command['code']) is int and type(command['out']) is str and type(command['err']) is str, name + ': invalid command scalar')
+
+
+def repair_results(rows, cases):
+    require(type(rows) is list and len(rows) == len(REPAIRS), 'repair result census mismatch')
+    for result, case in zip(rows, cases):
+        name = case['name']
+        keys(result, ('name', 'kind', 'states'), name)
+        require(result['name'] == name and result['kind'] == case['kind'], 'missing/duplicate/reordered repair result')
+        states = result['states']
+        require(type(states) is list and len(states) == len(case['steps']), name + ': missing/extra repair states')
+        for state, step in zip(states, case['steps']):
+            at = name + '.' + step['name']
+            if case['kind'] == 'pid':
+                keys(state, ('name', 'classification'), at)
+                require(type(state['classification']) is str and state['classification'] in ('watcher', 'other', 'absent', 'unknown'), at + ': invalid PID classification')
+            else:
+                keys(state, ('name', 'collectionHealth', 'publicationHealth', 'inventoryAsOf', 'map', 'events',
+                             'startupMirror', 'baselines', 'dirtyPrograms', 'dirtyListeners', 'startupVersions', 'copies', 'published'), at)
+                health(state['collectionHealth'], at)
+                publication_health(state['publicationHealth'], state['inventoryAsOf'], at)
+                inventory(state['map'], at)
+                string_map(state['startupMirror'], at + '.startupMirror')
+                equal(state['startupMirror'], state['map']['startup'], at + '.startupMirror')
+                if name == 'publicationNoCache' and step['name'] == 'failed':
+                    keys(state['baselines'], (), at + '.baselines')
+                else:
+                    keys(state['baselines'], ('programs', 'listeners', 'startup', 'crontab'), at + '.baselines')
+                    require(all(type(v) is bool for v in state['baselines'].values()), at + ': nonboolean baseline')
+                for field in ('dirtyPrograms', 'dirtyListeners'):
+                    string_map(state[field], at + '.' + field, times=True)
+                require(type(state['events']) is list, at + ': events not an array')
+                for row in state['events']:
+                    keys(row, ('time', 'kind', 'message'), at + '.event')
+                    require(all(type(v) is str and v for v in row.values()) and utc_second(row['time']), at + ': invalid event')
+                require(type(state['startupVersions']) is list, at + ': versions not an array')
+                for row in state['startupVersions']:
+                    keys(row, ('path', 'hash', 'copyPath', 'seenAt'), at + '.version')
+                    require(all(type(row[k]) is str and row[k] for k in ('path', 'hash', 'seenAt')) and
+                            utc_second(row['seenAt']) and (row['copyPath'] is None or
+                            (type(row['copyPath']) is str and row['copyPath'])), at + ': invalid version scalar')
+                require(type(state['copies']) is list, at + ': copies not an array')
+                paths = []
+                for row in state['copies']:
+                    keys(row, ('path', 'hex'), at + '.copy')
+                    require(type(row['path']) is str and row['path'] and type(row['hex']) is str and
+                            re.fullmatch(r'(?:[0-9a-f]{2})*', row['hex']) is not None, at + ': invalid copy bytes')
+                    paths.append(row['path'])
+                require(paths == sorted(set(paths)), at + ': duplicate/reordered copies')
+                payload = state['published']
+                if payload is not None:
+                    keys(payload, ('formatVersion', 'generatedAt', 'version', 'collectionHealth', 'publicationHealth', 'inventoryAsOf', 'map'), at + '.published')
+                    require(type(payload['formatVersion']) is int and payload['formatVersion'] == 2 and
+                            type(payload['version']) is str and payload['version'] == '0.0.2' and
+                            type(payload['generatedAt']) is str and utc_second(payload['generatedAt']), at + ': invalid published envelope')
+                    health(payload['collectionHealth'], at + '.published')
+                    publication_health(payload['publicationHealth'], payload['inventoryAsOf'], at + '.published')
+                    inventory(payload['map'], at + '.published')
+            require(state['name'] == step['name'], at + ': missing/duplicate/reordered state')
+
+
 def nullable(value, kind):
     return value is None or type(value) is kind
 
@@ -160,8 +298,8 @@ def snapshots(rows, names, transition=False):
 
 
 def validate(value, fixture):
-    keys(value, ('fixtureVersion', 'scopes', 'commands', 'snapshots', 'startupTransitions'), 'parity')
-    require(type(value['fixtureVersion']) is int and value['fixtureVersion'] == fixture['fixtureVersion'] == 1, 'unsupported fixture version')
+    keys(value, ('fixtureVersion', 'scopes', 'commands', 'snapshots', 'startupTransitions', 'repairResults'), 'parity')
+    require(type(value['fixtureVersion']) is int and value['fixtureVersion'] == fixture['fixtureVersion'] == 2, 'unsupported fixture version')
     require(type(value['scopes']) is list and len(value['scopes']) == len(fixture['scopeCases']) == 23, 'scope census mismatch')
     for actual, expected in zip(value['scopes'], fixture['scopeCases']):
         keys(actual, ('host', 'actual'), 'scope')
@@ -174,6 +312,7 @@ def validate(value, fixture):
         require(all(actual[k] == expected[k] for k in ('tool', 'code', 'out', 'err')) and actual['actual'] == expected['expected'], 'command fixture mismatch')
     snapshots(value['snapshots'], SNAPSHOTS)
     snapshots(value['startupTransitions'], TRANSITIONS, transition=True)
+    repair_results(value['repairResults'], fixture['repairCases'])
 
 
 def equal(left, right, where='$'):
@@ -192,8 +331,8 @@ def equal(left, right, where='$'):
 
 def compare_files(python_path, java_path, fixture_path=None):
     fixture = load(fixture_path or pathlib.Path(__file__).with_name('fixtures') / 'collection-health.json')
-    keys(fixture, ('fixtureVersion', 'clock', 'scopeCases', 'commandCases'), 'shared fixture')
-    require(type(fixture['fixtureVersion']) is int and fixture['fixtureVersion'] == 1 and
+    keys(fixture, ('fixtureVersion', 'clock', 'scopeCases', 'commandCases', 'repairCases'), 'shared fixture')
+    require(type(fixture['fixtureVersion']) is int and fixture['fixtureVersion'] == 2 and
             type(fixture['clock']) is str and utc_second(fixture['clock']), 'unsupported shared fixture version/clock')
     require(type(fixture['scopeCases']) is list and type(fixture['commandCases']) is list, 'invalid shared fixture census')
     for row in fixture['scopeCases']:
@@ -202,13 +341,15 @@ def compare_files(python_path, java_path, fixture_path=None):
     for row in fixture['commandCases']:
         keys(row, ('tool', 'code', 'out', 'err', 'expected'), 'command fixture')
         require(type(row['code']) is int and all(type(row[k]) is str for k in ('tool', 'out', 'err', 'expected')), 'invalid command fixture')
+    repair_spec(fixture['repairCases'])
     left, right = load(python_path), load(java_path)
     validate(left, fixture)
     validate(right, fixture)
     equal(left, right)
     return {'dataComparison': 'equal', 'producerExecutionCertified': False,
             'scopes': len(left['scopes']), 'commands': len(left['commands']),
-            'snapshots': len(left['snapshots']), 'startupTransitions': len(left['startupTransitions'])}
+            'snapshots': len(left['snapshots']), 'startupTransitions': len(left['startupTransitions']),
+            'repairFamilies': len(left['repairResults']), 'repairStates': sum(len(r['states']) for r in left['repairResults'])}
 
 
 def main():

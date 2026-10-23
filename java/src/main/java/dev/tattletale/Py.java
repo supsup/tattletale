@@ -166,7 +166,7 @@ final class Py {
         String s = strip(raw);
         if (!FLOAT.matcher(s).matches()) throw new NumberFormatException(raw);
         String t = s.replace("_", "");
-        String low = t.toLowerCase();
+        String low = t.toLowerCase(java.util.Locale.ROOT);
         boolean neg = low.startsWith("-");
         String body = low.replaceFirst("^[+-]", "");
         if (body.equals("inf") || body.equals("infinity")) return neg ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY;

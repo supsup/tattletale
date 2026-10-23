@@ -64,6 +64,13 @@ legacy or unsupported health is unknown too. Live does not mean every check succ
 Degraded/unknown check names remain visible when the file becomes Stale. A failed refresh
 keeps the last fully accepted values and update time under a last-known/load-error warning.
 
+Also check **Database publication**. A recoverable save failure may write current collector
+health beside older cached inventory, all labelled last-known. **Inventory as of** dates the
+last complete database projection; Live/Stale dates the envelope, not that inventory.
+Publication success advances only after a complete successful save. If replacement fails,
+the old file remains; it cannot announce its own failed update. Missing new publication
+fields in older format-2 data are supported, while malformed present fields are incomplete.
+
 Listener labels describe **bind scope**: loopback, wildcard, non-loopback or unknown.
 For example, `127.0.0.1` is loopback and `192.0.2.10` is a non-loopback literal. These labels
 do not test firewall rules or access from another machine. The older `EXPOSED` log label
@@ -72,6 +79,11 @@ means wildcard binding, not demonstrated reachability.
 Startup files and crontab are attempted independently on each startup cycle. A failure in
 one retains its prior values while good peer changes can commit. Persistent unreadable
 entry markers allow readable peers to be observed, but keep startup health degraded.
+Known nonregular entries and regular files over 16 MiB are marked rather than read as
+content; accepted files are hashed completely and saved copies keep at most 4 MiB.
+Becoming unreadable and readable again is not a content change by itself; a new readable
+version is compared with the last readable copy. Crontab must decode as UTF-8; another
+encoding degrades that partition and retains its last-known values.
 The four health checks follow the existing polling schedule; no automatic retry is added.
 They do not cover every watcher component. More detail, including startup/crontab rejection
 and accepted-empty results, is in [the data contract](docs/DATA_FORMAT.md#collection-health).

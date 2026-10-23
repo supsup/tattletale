@@ -39,6 +39,13 @@ final class Watch {
     static final String VERSION = "0.0.2";
     static final int SCHEMA_VERSION = 1;
     final CollectionHealth collectionHealth = new CollectionHealth();
+    final PublicationHealth publicationHealth=new PublicationHealth();
+    Map<String,Object> cachedInventory;
+    String inventoryAsOf;
+    interface Projection {Map<String,Object> read()throws DbException;}
+    Projection projection=this::pageMap;
+    interface PageReplace {void move(Path from,Path to)throws IOException;}
+    PageReplace pageReplace=(from,to)->Files.move(from,to,StandardCopyOption.REPLACE_EXISTING,StandardCopyOption.ATOMIC_MOVE);
     java.util.function.Supplier<String> clock = Watch::now;
     interface Sources {
         Proc.Result run(List<String> command, long timeout) throws IOException, Proc.Timeout;
@@ -80,24 +87,8 @@ final class Watch {
             try { return Files.readAllBytes(Path.of(file)); }
             catch (java.nio.file.NoSuchFileException e) { if (!optionalMissing(file)) throw e; return null; }
         }
-        /** Only final, positively observed persistent states become inventory markers. */
-        default byte[] entry(String file) throws IOException {
-            Path p=Path.of(file);
-            if(Files.isDirectory(p)) throw new Unreadable("directory");
-            if(Files.isSymbolicLink(p)) {
-                try {Files.readAttributes(p,java.nio.file.attribute.BasicFileAttributes.class);}
-                catch(java.nio.file.NoSuchFileException e) {
-                    // Confirm the final link itself. Permission/I/O failures are not proof
-                    // of a dangling target, and broken source ancestors cannot pass this read.
-                    if(!Files.readAttributes(p,java.nio.file.attribute.BasicFileAttributes.class,
-                            java.nio.file.LinkOption.NOFOLLOW_LINKS).isSymbolicLink()) throw e;
-                    throw new Unreadable("dangling-link");
-                }
-                catch(java.nio.file.AccessDeniedException e) {throw new Unreadable("permission-denied");}
-            }
-            try { return read(file); }
-            catch(java.nio.file.AccessDeniedException e) { throw new Unreadable("permission-denied"); }
-        }
+        /** Metadata/type first, then a nonblocking stable regular-handle read. */
+        default byte[] entry(String file) throws IOException {return StartupEntry.read(file);}
         default String textDiff(String before,String after,int limit) { return null; }
     }
     static final class Unreadable extends IOException {
@@ -370,6 +361,9 @@ final class Watch {
         baseline.put("listeners", listeners.isEmpty());
         baseline.put("startup", startup.keySet().stream().noneMatch(p->!p.equals("crontab -l")));
         baseline.put("crontab", !startup.containsKey("crontab -l"));
+        cachedInventory=null;inventoryAsOf=null;
+        try {synchronized(LOCK){cacheInventory(projection.read(),clock.get());}}
+        catch(DbException seedFailure) {db.proveRecoveredIdle(seedFailure); /* valid load, no partial projection */ }
     }
 
     private static Object get(Map<?, ?> m, String k) {
@@ -468,19 +462,8 @@ final class Watch {
                     sql.add("SELECT '" + tbl + "' AS t, changes() AS n;");
                 }
             }
-            db.exec("BEGIN;");
-            try {
-                for (Map<String, Object> r : db.query(String.join("\n", sql)))
-                    counts.put(Db.asStr(r.get("t")), Db.asLong(r.get("n")));
-            } catch (DbException e) {
-                try {
-                    db.exec("ROLLBACK;");
-                } catch (DbException ignored) {
-                    // nothing to roll back
-                }
-                throw e;
-            }
-            db.exec("COMMIT;");
+            for (Map<String,Object> row:db.transactionQuery(sql))
+                counts.put(Db.asStr(row.get("t")),Db.asLong(row.get("n")));
         }
         long sum = 0;
         for (long v : counts.values()) sum += v;
@@ -492,20 +475,36 @@ final class Watch {
         }
     }
 
+    @SuppressWarnings("unchecked")
+    static <T> T detached(T value) {
+        if(value instanceof Map<?,?> map) {Map<String,Object> copy=new LinkedHashMap<>();for(Map.Entry<?,?> e:map.entrySet())copy.put((String)e.getKey(),detached(e.getValue()));return (T)copy;}
+        if(value instanceof List<?> list) {List<Object> copy=new ArrayList<>();for(Object e:list)copy.add(detached(e));return (T)copy;}
+        return value; // the projection contains only immutable scalar values
+    }
+    void cacheInventory(Map<String,Object> complete,String time) {cachedInventory=detached(complete);inventoryAsOf=time;}
     void save() throws DbException, IOException {
-        Map<String, Object> m;
-        synchronized (LOCK) {
-            List<String> sql = new ArrayList<>();
-            for (Map.Entry<String, String> e : dirtyProgs.entrySet())
-                sql.add(Db.bind("UPDATE programs SET last_seen=? WHERE exe=?", e.getValue(), e.getKey()));
-            for (Map.Entry<String, String> e : dirtyListeners.entrySet())
-                sql.add(Db.bind("UPDATE listeners SET last_seen=? WHERE key=?", e.getValue(), e.getKey()));
-            db.transaction(sql);
-            dirtyProgs = new LinkedHashMap<>();
-            dirtyListeners = new LinkedHashMap<>();
-            m = pageMap();
+        publicationHealth.attempt(clock.get());
+        try {
+            synchronized(LOCK) {
+                List<String> sql=new ArrayList<>();
+                for(Map.Entry<String,String> e:dirtyProgs.entrySet())sql.add(Db.bind("UPDATE programs SET last_seen=? WHERE exe=?",e.getValue(),e.getKey()));
+                for(Map.Entry<String,String> e:dirtyListeners.entrySet())sql.add(Db.bind("UPDATE listeners SET last_seen=? WHERE key=?",e.getValue(),e.getKey()));
+                db.transaction(sql);
+                // The flush COMMIT is final even if projection/replacement subsequently fails.
+                dirtyProgs=new LinkedHashMap<>();dirtyListeners=new LinkedHashMap<>();
+                cacheInventory(projection.read(),clock.get());
+            }
+        } catch(DbException original) {
+            db.proveRecoveredIdle(original);
+            publicationHealth.fail("collection-db");
+            if(cachedInventory!=null)try {writePageData(dataDir,detached(cachedInventory),publicationHealth.snapshot(),inventoryAsOf);}
+            catch(IOException writeFailure) {publicationHealth.fail("collection-io");original.addSuppressed(writeFailure);}
+            throw original;
         }
-        writePageData(dataDir, m);
+        Map<String,Object> tentative=publicationHealth.success(clock.get());
+        try {writePageData(dataDir,detached(cachedInventory),tentative,inventoryAsOf);}
+        catch(IOException e){publicationHealth.fail("collection-io");throw e;}
+        publicationHealth.adopt(tentative);
     }
 
     /** The dashboard's "map" object; identity keys are absent until known. Caller holds the lock. */
@@ -576,10 +575,15 @@ final class Watch {
 
     /** tattletale-data.js for tattletale.html, written to a temp file and renamed into place. */
     void writePageData(String d, Map<String, Object> state) throws IOException {
+        writePageData(d,state,publicationHealth.snapshot(),inventoryAsOf);
+    }
+    void writePageData(String d,Map<String,Object> state,Map<String,Object> publication,String asOf)throws IOException {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("generatedAt", clock.get());
         payload.put("formatVersion", 2);
         payload.put("collectionHealth", collectionHealth.snapshot());
+        payload.put("publicationHealth",detached(publication));
+        payload.put("inventoryAsOf",asOf);
         payload.put("version", VERSION);
         payload.put("pid", ProcessHandle.current().pid());
         payload.put("map", state);
@@ -590,17 +594,16 @@ final class Watch {
         Path tmp = Files.createTempFile(Path.of(d), ".tattletale-data.", ".tmp");
         try {
             Files.writeString(tmp, sb, StandardCharsets.UTF_8);
-            Files.move(tmp, Path.of(d, "tattletale-data.js"), StandardCopyOption.REPLACE_EXISTING,
-                    StandardCopyOption.ATOMIC_MOVE);
+            pageReplace.move(tmp,Path.of(d,"tattletale-data.js"));
         } catch (IOException e) {
-            Files.deleteIfExists(tmp);
+            try {Files.deleteIfExists(tmp);}catch(IOException cleanup){e.addSuppressed(cleanup);}
             throw e;
         }
     }
 
     // ---- the log ----
     void log(String kind, String msg) {
-        String t = now();
+        String t = clock.get();
         String line = t + "  " + Py.ljust(kind, 9) + " " + msg;
         synchronized (LOCK) {
             rotate();
@@ -714,9 +717,9 @@ final class Watch {
         Map<Long,P> procs=new LinkedHashMap<>();
         for(Map.Entry<Long,P> e:primary.entrySet()) {
             long pid=e.getKey(); P p=e.getValue(); String exe=p.exe();
-            if(!absoluteExe(exe) && !exe.startsWith("(")) {
-                String pp=sources.pidPath(pid); if(pp!=null && !pp.isEmpty()) exe=pp;
-            }
+            String pp=sources.pidPath(pid);
+            if(pp!=null && absoluteExe(pp)) exe=pp;
+            if(exe.equals("/"))throw new CollectionHealth.Rejected("ps-parse");
             // The two commands race normally: a missing argv row is not a missing process.
             procs.put(pid,new P(p.ppid(),p.user(),exe,args.getOrDefault(pid,"")));
         }
@@ -873,14 +876,14 @@ final class Watch {
                             row));
                 }
             }
-            String base = Py.basename(exe).toLowerCase();
+            String base = Py.basename(exe).toLowerCase(java.util.Locale.ROOT);
             List<String> words = Py.split(argline);
             List<String> hw = new ArrayList<>();
             for (String w : words.subList(0, Math.min(2, words.size()))) hw.add(Py.basename(w));
-            String head = String.join(" ", hw).toLowerCase();
+            String head = String.join(" ", hw).toLowerCase(java.util.Locale.ROOT);
             boolean isCred = false;
             for (String c : CRED_NAMES) {
-                String lc = c.toLowerCase();
+                String lc = c.toLowerCase(java.util.Locale.ROOT);
                 if (base.contains(lc) || head.contains(lc)) {
                     isCred = true;
                     break;
@@ -1110,7 +1113,7 @@ final class Watch {
         String copies=sources.copyRoot(snapDir);
         collectionHealth.attempt("startup",clock.get());
         try { fs=filesystemStartup(); }
-        catch(IOException e) {fs=null;collectionHealth.fail("startup",startupError(e,true));}
+        catch(IOException | java.nio.file.InvalidPathException e) {fs=null;collectionHealth.fail("startup",startupError(e,true));}
         if(fs!=null) try {destinations.putAll(startupCopies(fs,"startup",copies));}
         catch(IOException e) {fs=null;collectionHealth.fail("startup",CollectionHealth.ioError(e));}
         // Both observations are attempted independently, in this deterministic order.
@@ -1123,6 +1126,7 @@ final class Watch {
         if(cron!=null) proposed.putAll(cron.hashes());
         TreeSet<String> all=new TreeSet<>(Watch::codepointCompare); all.addAll(startup.keySet());all.addAll(proposed.keySet());
         List<String> sql=new ArrayList<>(); List<PendingEvent> events=new ArrayList<>(); String t=clock.get();
+        try {
         for(String file:all) {
             String partition=file.equals("crontab -l")?"crontab":"startup";
             if((partition.equals("startup") && fs==null) || (partition.equals("crontab") && cron==null)) continue;
@@ -1137,16 +1141,22 @@ final class Watch {
                     sql.add(Db.bind("INSERT INTO startup_versions(path,hash,copy_path,seen_at) VALUES (?,?,?,?)",file,digest,dest,t));
                     if(!first) {
                         if(old==null) events.add(new PendingEvent("STARTUP+","added: "+file+" | copy: "+(dest==null?"None":dest)));
-                        else {String before=old.startsWith("unreadable: ")?null:Paths.join(copies,safeName(file),Py.cut(old,16));
-                            events.add(new PendingEvent("STARTUP~","changed: "+file+" | before: "+(before==null?"None":before)+" | after: "+(dest==null?"None":dest)+"\n"+diff(before,dest,40)));}
+                        else if(!digest.startsWith("unreadable: ")) {
+                            String beforeHash=old,before=Paths.join(copies,safeName(file),Py.cut(old,16));
+                            if(old.startsWith("unreadable: ")) {
+                                List<Map<String,Object>> history=db.query(Db.bind("SELECT hash,copy_path FROM startup_versions WHERE path=? AND copy_path IS NOT NULL AND hash NOT LIKE 'unreadable: %' ORDER BY id DESC LIMIT 1;",file));
+                                beforeHash=history.isEmpty()?null:Db.asStr(history.getFirst().get("hash"));before=history.isEmpty()?null:Db.asStr(history.getFirst().get("copy_path"));
+                            }
+                            if(beforeHash!=null && !beforeHash.equals(digest))events.add(new PendingEvent("STARTUP~","changed: "+file+" | before: "+before+" | after: "+dest+"\n"+diff(before,dest,40)));
+                        }
                     }
                 }
             }
         }
         if(fs!=null && baseline.get("startup")) events.add(new PendingEvent("BASELINE","startup items: "+fs.hashes().size()+" recorded, copies in "+copies));
         if(cron!=null && baseline.get("crontab")) events.add(new PendingEvent("BASELINE","crontab: 1 recorded, copies in "+copies));
-        try {commitSample(sql,events,t);}
-        catch(DbException | Db.Fatal e) {
+        commitSample(sql,events,t);
+        } catch(DbException | Db.Fatal e) {
             if(fs!=null)collectionHealth.fail("startup","collection-db");if(cron!=null)collectionHealth.fail("crontab","collection-db");
             if(e instanceof Db.Fatal fatal)throw fatal;return;
         }
@@ -1278,18 +1288,21 @@ final class Watch {
     enum PidIdentity { WATCHER, OTHER, ABSENT, UNKNOWN }
     static PidIdentity pidIdentity(Proc.Result result) {
         if(result.code()==1 && result.out().isEmpty() && result.err().isEmpty()) return PidIdentity.ABSENT;
-        List<String> lines=Py.splitlines(result.out());
+        List<String> lines=new ArrayList<>(Arrays.asList(result.out().split("\\n",-1)));
+        if(!lines.isEmpty() && lines.getLast().isEmpty()) lines.removeLast();
         if(result.code()!=0 || !result.err().isEmpty() || lines.size()!=1 || asciiStrip(lines.getFirst()).isEmpty()) return PidIdentity.UNKNOWN;
         return isTattletaleCommand(lines.getFirst())?PidIdentity.WATCHER:PidIdentity.OTHER;
     }
     /** A failed identity observation cannot authorize replacement of another watcher's pid. */
     void claimPidFile() throws IOException {
         String path=Paths.join(Py.dirname(Paths.abspath(dbPath)),"tattletale.pid");
-        long other=0,me=ProcessHandle.current().pid();
+        long other=0,me=ProcessHandle.current().pid();boolean stale=false;
         try {
+            if(!Files.readAttributes(Path.of(path),java.nio.file.attribute.BasicFileAttributes.class,java.nio.file.LinkOption.NOFOLLOW_LINKS).isRegularFile())
+                throw new Exit("tattletale: existing pid identity is unknown");
             String value=asciiStrip(Files.readString(Path.of(path)));
             try {other=pidValue(value,false,"pid-identity");}
-            catch(CollectionHealth.Rejected e) {throw new Exit("tattletale: existing pid identity is unknown");}
+            catch(CollectionHealth.Rejected e) {stale=true;}
         } catch(java.nio.file.NoSuchFileException e) {
             // A final dangling link is an existing unknown identity, not first-start absence.
             if(Files.exists(Path.of(path),java.nio.file.LinkOption.NOFOLLOW_LINKS))
@@ -1302,7 +1315,15 @@ final class Watch {
             if(identity==PidIdentity.UNKNOWN) throw new Exit("tattletale: existing pid identity is unknown");
             if(identity==PidIdentity.WATCHER) throw new Exit("tattletale: already running as pid "+other+" for this database ("+path+"); stop it first: kill "+other);
         }
-        Files.writeString(Path.of(path),me+"\n");pidFile=path;
+        Path destination=Path.of(path),tmp=Files.createTempFile(destination.getParent(),".tattletale-pid-",".tmp");
+        try {
+            try(java.nio.channels.FileChannel file=java.nio.channels.FileChannel.open(tmp,StandardOpenOption.WRITE)) {
+                java.nio.ByteBuffer data=StandardCharsets.UTF_8.encode(me+"\n");while(data.hasRemaining())file.write(data);file.force(true);
+            }
+            Files.move(tmp,destination,StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING);
+        } catch(IOException e) {try{Files.deleteIfExists(tmp);}catch(IOException cleanup){e.addSuppressed(cleanup);}throw e;}
+        pidFile=path;
+        if(stale)log("NOTE","pid file contained invalid stale content; replacing");
     }
 
     void releasePidFile() {

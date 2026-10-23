@@ -41,7 +41,9 @@ database, its page data file and its startup copies.
 """
 import argparse
 import contextlib
+import copy
 import difflib
+import errno
 import queue
 import re
 import shutil
@@ -124,6 +126,7 @@ SCHEMA_VERSION = 1
 FORMAT_VERSION = 2
 CHECKS = ("processes", "listeners", "startup", "crontab")
 ASCII_WS = " \t\r\n\v\f"
+STARTUP_MAX_BYTES = 16 * 1024 * 1024
 
 
 class CollectionError(ValueError):
@@ -272,13 +275,28 @@ def open_db_readonly(path):
 
 @contextlib.contextmanager
 def transaction(conn):
+    # Never roll back a caller-owned transaction after a rejected BEGIN.
+    try:
+        active = conn.in_transaction
+    except sqlite3.Error as original:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+        raise FatalDatabaseError("collection-db-fatal") from original
+    if active:
+        raise sqlite3.OperationalError("collection-db-active-transaction")
+    begun = False
     try:
         conn.execute("BEGIN")
+        begun = True
         yield conn
         conn.execute("COMMIT")
     except BaseException as original:
         try:
             if conn.in_transaction:
+                if not begun:
+                    raise sqlite3.OperationalError("collection-db-unknown-begin")
                 conn.execute("ROLLBACK")
         except sqlite3.Error:
             try:
@@ -287,6 +305,19 @@ def transaction(conn):
                 pass
             raise FatalDatabaseError("collection-db-fatal") from original
         raise
+
+
+def require_recovered_db(conn, original):
+    """A cached fallback is valid only after positively known DB recovery."""
+    try:
+        if conn.in_transaction:
+            raise sqlite3.OperationalError("collection-db-active-transaction")
+    except sqlite3.Error:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+        raise FatalDatabaseError("collection-db-fatal") from original
 
 
 class Watch:
@@ -321,6 +352,10 @@ class Watch:
         # Health describes this watcher epoch; persisted inventory may be older.
         self.collection_health = {k: {"lastAttempt": None, "lastSuccess": None,
                                       "status": "unknown", "error": None} for k in CHECKS}
+        self.publication_health = {"lastAttempt": None, "lastSuccess": None,
+                                   "status": "unknown", "error": None}
+        self._inventory_cache = None
+        self._inventory_as_of = None
 
     def _attempt(self, name):
         with lock:
@@ -368,6 +403,18 @@ class Watch:
         self.baseline = {"programs": not self.known_progs, "listeners": not self.listeners,
                          "startup": not any(p != "crontab -l" for p in self.startup),
                          "crontab": "crontab -l" not in self.startup}
+        # A valid load can supply fallback inventory before the first save.
+        # Only this optional complete projection is best-effort; load errors above
+        # and fatal/unknown connection state still propagate.
+        with lock:
+            try:
+                loaded = self.page_map()
+            except sqlite3.Error as error:
+                require_recovered_db(self.db, error)
+                self._inventory_cache, self._inventory_as_of = None, None
+            else:
+                self._inventory_cache = copy.deepcopy(loaded)
+                self._inventory_as_of = now()
 
     def import_map(self):
         """One-time import of the old JSON map, only into a database with no programs."""
@@ -443,15 +490,44 @@ class Watch:
 
     def save(self):
         """Flush last-seen times to the database and rewrite the page data file."""
+        failure = None
+        attempt = now()
         with lock:
-            with transaction(self.db) as c:
-                c.executemany("UPDATE programs SET last_seen=? WHERE exe=?",
-                              [(t, exe) for exe, t in self.dirty_progs.items()])
-                c.executemany("UPDATE listeners SET last_seen=? WHERE key=?",
-                              [(t, k) for k, t in self.dirty_listeners.items()])
-            self.dirty_progs, self.dirty_listeners = {}, {}
-            m = self.page_map()
-        self.write_page_data(self.data_dir, m)
+            self.publication_health["lastAttempt"] = attempt
+            try:
+                with transaction(self.db) as c:
+                    c.executemany("UPDATE programs SET last_seen=? WHERE exe=?",
+                                  [(t, exe) for exe, t in self.dirty_progs.items()])
+                    c.executemany("UPDATE listeners SET last_seen=? WHERE key=?",
+                                  [(t, k) for k, t in self.dirty_listeners.items()])
+                self.dirty_progs, self.dirty_listeners = {}, {}
+                m = self.page_map()
+                self._inventory_cache = copy.deepcopy(m)
+                self._inventory_as_of = now()
+            except sqlite3.Error as error:
+                require_recovered_db(self.db, error)
+                failure = error
+                self.publication_health.update(status="degraded", error="collection-db")
+                if self._inventory_cache is None:
+                    raise
+                m = copy.deepcopy(self._inventory_cache)
+            publication = dict(self.publication_health)
+            if failure is None:
+                publication.update(lastSuccess=now(), status="ok", error=None)
+            inventory_as_of = self._inventory_as_of
+        try:
+            self.write_page_data(self.data_dir, m, publication, inventory_as_of)
+        except OSError as write_error:
+            with lock:
+                self.publication_health.update(status="degraded", error="collection-io")
+            if failure is not None:
+                raise failure from write_error
+            raise
+        if failure is None:
+            with lock:
+                self.publication_health = publication
+        else:
+            raise failure
 
     def page_map(self):
         """The dashboard's "map" object, built from the database in the shape the old JSON
@@ -482,7 +558,7 @@ class Watch:
         return {"programs": programs, "listeners": listeners, "credentials": creds,
                 "startup": startup}
 
-    def write_page_data(self, d, state):
+    def write_page_data(self, d, state, publication=None, inventory_as_of=None):
         """tattletale-data.js for tattletale.html: the map plus the last 500 log lines, as a
         script the page can load from disk (a page opened as a file cannot fetch JSON)."""
         try:
@@ -494,14 +570,20 @@ class Watch:
             tail = []
         with lock:
             health = {k: dict(v) for k, v in self.collection_health.items()}
+            publication = dict(self.publication_health if publication is None else publication)
         payload = {"generatedAt": now(), "version": __version__, "pid": os.getpid(), "map": state,
-                   "log": tail, "formatVersion": FORMAT_VERSION, "collectionHealth": health}
+                   "log": tail, "formatVersion": FORMAT_VERSION, "collectionHealth": health,
+                   "publicationHealth": publication, "inventoryAsOf": inventory_as_of}
         fd, tmp = tempfile.mkstemp(dir=d, prefix=".tattletale-data.", suffix=".tmp")
-        with os.fdopen(fd, "w") as f:
-            f.write("window.TATTLETALE = ")
-            json.dump(payload, f, separators=(",", ":"))
-            f.write(";\n")
-        os.replace(tmp, os.path.join(d, "tattletale-data.js"))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("window.TATTLETALE = ")
+                json.dump(payload, f, separators=(",", ":"))
+                f.write(";\n")
+            os.replace(tmp, os.path.join(d, "tattletale-data.js"))
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
 
     NOTIFY_KINDS = {"CREDENTIAL": "Credential prompt", "CRED-NET": "Git network credential lookup",
                     "LISTEN!": "Listener bound to all interfaces", "STARTUP+": "Startup item added",
@@ -572,8 +654,11 @@ class Watch:
             if pid in procs:
                 raise CollectionError("ps-parse")
             exe = parts[3].strip(ASCII_WS)
-            if not exe.startswith("/") and not exe.startswith("("):
-                exe = pid_path(pid) or exe
+            kernel_exe = pid_path(pid)
+            if isinstance(kernel_exe, str) and kernel_exe.startswith("/") and kernel_exe != "/":
+                exe = kernel_exe
+            if exe == "/":
+                raise CollectionError("ps-parse")
             procs[pid] = (ppid, parts[2], exe)
         if not procs:
             raise CollectionError("ps-parse")
@@ -845,35 +930,127 @@ class Watch:
     # ---- 4: startup items ----
     def _startup_files(self):
         """Stage filesystem hashes and copy bytes without changing any accepted state."""
+        def identity(info):
+            return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                    info.st_mtime_ns, info.st_ctime_ns)
+
         def optional_absent(path):
-            if os.path.lexists(path):
+            # ENOENT for a child of a broken symlink is not optional absence.
+            try:
+                os.lstat(path)
+            except FileNotFoundError:
+                pass
+            else:
                 raise CollectionError("startup-read")
-            ancestor = os.path.dirname(os.path.abspath(path))
+            absolute = path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
+            ancestor = os.path.dirname(absolute)
             while True:
-                if os.path.islink(ancestor) and not os.path.exists(ancestor):
-                    raise CollectionError("startup-read")
+                try:
+                    info = os.lstat(ancestor)
+                except FileNotFoundError:
+                    info = None
+                if info is not None:
+                    resolved = os.stat(ancestor)
+                    if not stat.S_ISDIR(resolved.st_mode):
+                        raise CollectionError("startup-read")
+                    return
                 parent = os.path.dirname(ancestor)
                 if parent == ancestor:
-                    break
+                    raise CollectionError("startup-read")
                 ancestor = parent
+
         contents, markers = {}, {}
         def read_entry(path, listed=False):
             try:
-                with open(path, "rb") as f:
-                    contents[path] = f.read()
-            except PermissionError:
-                os.lstat(path)  # A source ancestor failure must not masquerade as a known entry.
-                markers[path] = "unreadable: permission-denied"
-            except IsADirectoryError:
-                os.lstat(path)
-                markers[path] = "unreadable: directory"
+                entry = os.lstat(path)
             except FileNotFoundError:
-                if os.path.islink(path) and not os.path.exists(path):
-                    markers[path] = "unreadable: dangling-link"
-                elif listed:
+                if listed:
                     raise CollectionError("startup-read") from None
-                else:
-                    optional_absent(path)
+                optional_absent(path)
+                return
+            target, info, links, seen = path, entry, [], set()
+            def stable_links():
+                for name, expected in links:
+                    if identity(os.lstat(name)) != expected:
+                        raise CollectionError("startup-read")
+            # Bound final-link resolution to 40 hops. Kernel ELOOP while following
+            # a known link also positively establishes exhausted/cyclic resolution.
+            for unused in range(40):
+                if not stat.S_ISLNK(info.st_mode):
+                    break
+                key = (info.st_dev, info.st_ino)
+                if key in seen:
+                    stable_links()
+                    markers[path] = "unreadable: symlink-loop"
+                    return
+                seen.add(key)
+                link = os.readlink(target)
+                if identity(os.lstat(target)) != identity(info):
+                    raise CollectionError("startup-read")
+                links.append((target, identity(info)))
+                target = link if os.path.isabs(link) else os.path.join(os.path.dirname(target), link)
+                try:
+                    info = os.lstat(target)
+                except FileNotFoundError:
+                    optional_absent(target)
+                    stable_links()
+                    markers[path] = "unreadable: dangling-link"
+                    return
+                except OSError as error:
+                    if error.errno == errno.ELOOP:
+                        stable_links()
+                        markers[path] = "unreadable: symlink-loop"
+                        return
+                    raise
+            else:
+                if stat.S_ISLNK(info.st_mode):
+                    if identity(os.lstat(target)) != identity(info):
+                        raise CollectionError("startup-read")
+                    stable_links()
+                    markers[path] = "unreadable: symlink-loop"
+                    return
+
+            before = identity(info)
+            def stable():
+                if identity(os.lstat(target)) != before:
+                    raise CollectionError("startup-read")
+                stable_links()
+
+            if not stat.S_ISREG(info.st_mode):
+                stable()
+                markers[path] = ("unreadable: directory" if stat.S_ISDIR(info.st_mode)
+                                 else "unreadable: not-a-regular-file")
+                return
+            if info.st_size > STARTUP_MAX_BYTES:
+                stable()
+                markers[path] = "unreadable: file-too-large"
+                return
+            try:
+                fd = os.open(target, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+            except PermissionError:
+                stable()  # A changed/inaccessible ancestor is not a known unreadable entry.
+                markers[path] = "unreadable: permission-denied"
+                return
+            try:
+                stream = os.fdopen(fd, "rb")
+            except BaseException:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+            with stream:
+                opened = os.fstat(stream.fileno())
+                if not stat.S_ISREG(opened.st_mode) or identity(opened) != before:
+                    raise CollectionError("startup-read")
+                stable()
+                data = stream.read(info.st_size + 1)
+                if identity(os.fstat(stream.fileno())) != before:
+                    raise CollectionError("startup-read")
+                stable()
+                if len(data) != opened.st_size:
+                    raise CollectionError("startup-read")
+            contents[path] = data
         for directory in STARTUP_DIRS:
             try:
                 names = sorted(os.listdir(directory))
@@ -982,7 +1159,8 @@ class Watch:
             eligible.add("startup")
         except (OSError, subprocess.SubprocessError, ValueError, TypeError,
                 KeyError, OverflowError) as e:
-            errors["startup"] = (CollectionError("startup-read") if isinstance(e, OSError) else e)
+            errors["startup"] = (CollectionError("startup-read") if isinstance(e, (OSError, ValueError))
+                                 and not isinstance(e, CollectionError) else e)
         self._attempt("crontab")
         crontab_text = self.crontab_text
         try:
@@ -1043,11 +1221,19 @@ class Watch:
                     if not baselines[partition]:
                         if path not in old:
                             events.append(("STARTUP+", f"added: {path} | copy: {copy}"))
-                        else:
-                            before = (None if old[path].startswith("unreadable: ") else
-                                      os.path.join(self.snap_dir, self.safe_name(path), old[path][:16]))
-                            events.append(("STARTUP~", f"changed: {path} | before: {before} | after: {copy}\n"
-                                           + self.diff(before, copy)))
+                        elif not proposed[path].startswith("unreadable: "):
+                            with lock:
+                                readable = self.db.execute(
+                                    "SELECT hash,copy_path FROM startup_versions WHERE path=? "
+                                    "AND hash NOT LIKE 'unreadable: %' ORDER BY id DESC LIMIT 1",
+                                    (path,)).fetchone()
+                            if readable is None and not old[path].startswith("unreadable: "):
+                                readable = (old[path], os.path.join(
+                                    self.snap_dir, self.safe_name(path), old[path][:16]))
+                            if readable is not None and readable[0] != proposed[path]:
+                                before = readable[1]
+                                events.append(("STARTUP~", f"changed: {path} | before: {before} | after: {copy}\n"
+                                               + self.diff(before, copy)))
             if "startup" in eligible and baselines["startup"]:
                 events.append(("BASELINE", f"startup items: {len(snap)} recorded, copies in {self.snap_dir}"))
             if "crontab" in eligible and baselines["crontab"]:
@@ -1162,15 +1348,38 @@ class Watch:
         holding it refuses this start (install-login-agent.sh reads the same file). A stale
         file, or one whose pid now belongs to another program, is taken over."""
         path = os.path.join(os.path.dirname(os.path.abspath(self.db_path)), "tattletale.pid")
+        invalid = False
         try:
-            with open(path) as f:
-                other = checked_pid(f.read().strip(ASCII_WS), "ps-parse")
+            entry = os.lstat(path)
         except FileNotFoundError:
-            if os.path.lexists(path):
-                raise SystemExit("tattletale: pid identity unavailable") from None
             other = 0
-        except (OSError, ValueError):
+        except OSError:
             raise SystemExit("tattletale: pid identity unavailable") from None
+        else:
+            if not stat.S_ISREG(entry.st_mode):
+                raise SystemExit("tattletale: pid identity unavailable")
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                try:
+                    stream = os.fdopen(fd, "rb")
+                except BaseException:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    raise
+                with stream:
+                    opened = os.fstat(stream.fileno())
+                    if (not stat.S_ISREG(opened.st_mode)
+                            or (opened.st_dev, opened.st_ino) != (entry.st_dev, entry.st_ino)):
+                        raise OSError("pid-identity")
+                    raw = stream.read()
+                try:
+                    other = checked_pid(raw.decode("utf-8").strip(ASCII_WS), "ps-parse")
+                except ValueError:
+                    invalid, other = True, 0
+            except OSError:
+                raise SystemExit("tattletale: pid identity unavailable") from None
         if other and other != os.getpid():
             try:
                 r = subprocess.run(["ps", "-p", str(other), "-o", "command="],
@@ -1192,8 +1401,18 @@ class Watch:
             if observed and is_tattletale(rows[0]):
                 raise SystemExit(f"tattletale: already running as pid {other} for this database "
                                  f"({path}); stop it first: kill {other}")
-        with open(path, "w") as f:
-            f.write(f"{os.getpid()}\n")
+        if invalid:
+            self.log("NOTE", "pid file contained invalid stale content; replacing")
+        fd, pending = tempfile.mkstemp(prefix=".tattletale-pid.", dir=self.data_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="ascii") as f:
+                f.write(f"{os.getpid()}\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(pending, path)
+        finally:
+            if os.path.exists(pending):
+                os.unlink(pending)
         self.pid_file = path
 
     def release_pid_file(self):

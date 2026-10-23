@@ -31,11 +31,21 @@ def synthetic():
             value['events'] = [{'kind': 'BASELINE', 'message': 'synthetic baseline'},
                                {'kind': 'STARTUP+', 'message': 'synthetic transition'}]
         return value
-    return {'fixtureVersion': 1,
+    def repair_state(case, step):
+        if case['kind'] == 'pid':
+            return {'name': step['name'], 'classification': 'other'}
+        return {'name': step['name'], 'collectionHealth': copy.deepcopy(health),
+                'publicationHealth': {'lastAttempt': None, 'lastSuccess': None, 'status': 'unknown', 'error': None},
+                'inventoryAsOf': None, 'map': {'programs': {}, 'listeners': {}, 'credentials': [], 'startup': {}},
+                'events': [], 'startupMirror': {},
+                'baselines': {} if case['name'] == 'publicationNoCache' else {k: True for k in ('programs', 'listeners', 'startup', 'crontab')},
+                'dirtyPrograms': {}, 'dirtyListeners': {}, 'startupVersions': [], 'copies': [], 'published': None}
+    return {'fixtureVersion': 2,
             'scopes': [{'host': r['host'], 'actual': r['expected']} for r in fixture['scopeCases']],
             'commands': [{**{k: r[k] for k in ('tool', 'code', 'out', 'err')}, 'actual': r['expected']} for r in fixture['commandCases']],
             'snapshots': [row(name) for name in parity.SNAPSHOTS],
-            'startupTransitions': [row(name, True) for name in parity.TRANSITIONS]}
+            'startupTransitions': [row(name, True) for name in parity.TRANSITIONS],
+            'repairResults': [{'name': c['name'], 'kind': c['kind'], 'states': [repair_state(c, s) for s in c['steps']]} for c in fixture['repairCases']]}
 
 
 class ParityDataTests(unittest.TestCase):
@@ -54,6 +64,7 @@ class ParityDataTests(unittest.TestCase):
     def test_equal_nonempty_data_explicitly_does_not_certify_producers(self):
         result = self.compare(self.data)
         self.assertEqual((result['scopes'], result['commands'], result['snapshots'], result['startupTransitions']), (23, 13, 10, 8))
+        self.assertEqual((result['repairFamilies'], result['repairStates']), (9, 59))
         self.assertFalse(result['producerExecutionCertified'])
 
     def test_dictionary_key_order_is_not_whole_file_byte_identity(self):
@@ -92,6 +103,65 @@ class ParityDataTests(unittest.TestCase):
         self.right.symlink_to(self.left)
         with self.assertRaises(OSError): parity.compare_files(self.left, self.right)
 
+    def test_no_cache_state_preserves_actual_empty_baseline_only_at_the_exact_exception(self):
+        self.assertEqual(self.compare(self.data)['repairStates'], 59)
+        value = copy.deepcopy(self.data)
+        value['repairResults'][7]['states'][0]['baselines'] = {k: False for k in parity.CHECKS}
+        self.left.write_text(json.dumps(value))
+        with self.assertRaises(parity.ParityError): self.compare(value)
+
+    def test_new_fixture_inputs_cannot_silently_drop_reorder_or_duplicate_cases(self):
+        fixture_path = pathlib.Path(__file__).with_name('fixtures') / 'collection-health.json'
+        fixture = parity.load(fixture_path)
+        for change in ('drop', 'reorder', 'duplicate'):
+            value = copy.deepcopy(fixture)
+            if change == 'drop': value['repairCases'].pop()
+            elif change == 'reorder': value['repairCases'].reverse()
+            else: value['repairCases'][1] = copy.deepcopy(value['repairCases'][0])
+            self.right.write_text(json.dumps(self.data))
+            custom = self.root / (change + '.json'); custom.write_text(json.dumps(value))
+            with self.assertRaises(parity.ParityError): parity.compare_files(self.left, self.right, custom)
+
+    def test_repair_history_events_versions_and_copy_bytes_remain_exact_ordered_data(self):
+        value = copy.deepcopy(self.data)
+        state = value['repairResults'][3]['states'][3]
+        state['events'] = [{'time': '2000-01-01T00:00:00Z', 'kind': 'BASELINE', 'message': 'synthetic baseline'},
+                           {'time': '2000-01-01T00:01:00Z', 'kind': 'STARTUP~', 'message': 'synthetic actual-field projection'}]
+        state['startupVersions'] = [{'path': '/fixture/a', 'hash': 'a' * 64, 'copyPath': '/fixture/copies/a', 'seenAt': '2000-01-01T00:00:00Z'},
+                                    {'path': '/fixture/b', 'hash': 'b' * 64, 'copyPath': '/fixture/copies/b', 'seenAt': '2000-01-01T00:01:00Z'}]
+        state['copies'] = [{'path': '/fixture/copies/a', 'hex': '00'}, {'path': '/fixture/copies/b', 'hex': 'ff'}]
+        self.left.write_text(json.dumps(value))
+        self.assertEqual(self.compare(value)['dataComparison'], 'equal')
+        for field in ('events', 'startupVersions', 'copies'):
+            for action in ('drop', 'reverse'):
+                changed = copy.deepcopy(value); rows = changed['repairResults'][3]['states'][3][field]
+                if action == 'drop': rows.pop()
+                else: rows.reverse()
+                with self.assertRaises(parity.ParityError): self.compare(changed)
+        changed = copy.deepcopy(value); changed['repairResults'][3]['states'][3]['copies'][0]['hex'] = '01'
+        with self.assertRaises(parity.ParityError): self.compare(changed)
+
+    def test_selected_real_payload_fields_are_strict_and_not_replaced_by_a_success_boolean(self):
+        value = copy.deepcopy(self.data); state = value['repairResults'][6]['states'][1]
+        state['published'] = {'formatVersion': 2, 'generatedAt': '2000-01-01T00:00:00Z', 'version': '0.0.2',
+                              'collectionHealth': copy.deepcopy(state['collectionHealth']),
+                              'publicationHealth': copy.deepcopy(state['publicationHealth']),
+                              'inventoryAsOf': None, 'map': copy.deepcopy(state['map'])}
+        self.left.write_text(json.dumps(value)); self.assertEqual(self.compare(value)['dataComparison'], 'equal')
+        for field in ('formatVersion', 'version', 'inventoryAsOf', 'publicationHealth', 'map'):
+            changed = copy.deepcopy(value); changed['repairResults'][6]['states'][1]['published'][field] = True
+            with self.assertRaises(parity.ParityError): self.compare(changed)
+        changed = copy.deepcopy(value); changed['repairResults'][6]['states'][1]['published'] = True
+        with self.assertRaises(parity.ParityError): self.compare(changed)
+
+    def test_illegal_projection_type_and_malformed_history_are_refused_even_in_identical_pairs(self):
+        for field, bad in [('inventoryAsOf', False), ('events', [{'time': 1, 'kind': 'NOTE', 'message': 'synthetic'}]),
+                           ('startupVersions', [{'path': '/fixture/a', 'hash': 'a', 'copyPath': '', 'seenAt': '2000-01-01T00:00:00Z'}]),
+                           ('dirtyPrograms', {'/fixture/a': True}), ('copies', [{'path': '/fixture/a', 'hex': 'Ff'}])]:
+            value = copy.deepcopy(self.data); value['repairResults'][0]['states'][0][field] = bad
+            self.left.write_text(json.dumps(value))
+            with self.assertRaises(parity.ParityError): self.compare(value)
+
 
 def mutation_test(mutate):
     def test(self):
@@ -118,6 +188,21 @@ for name, mutate in {
     'raw_health_error': lambda d: d['snapshots'][0]['collectionHealth']['listeners'].update(error='private /fixture/name'),
     'wrong_key_order': lambda d: d['startupTransitions'][0]['startupKeys'].reverse(),
     'extra_transition_field': lambda d: d['startupTransitions'][0].update(extra=True),
+    'missing_repairs': lambda d: d.pop('repairResults'),
+    'empty_repairs': lambda d: d.update(repairResults=[]),
+    'dropped_repair_family': lambda d: d['repairResults'].pop(),
+    'reordered_repair_family': lambda d: d['repairResults'].reverse(),
+    'duplicate_repair_name': lambda d: d['repairResults'][1].update(name='finalEntryStates'),
+    'dropped_repair_step': lambda d: d['repairResults'][0]['states'].pop(),
+    'reordered_repair_step': lambda d: d['repairResults'][0]['states'].reverse(),
+    'wrong_repair_kind': lambda d: d['repairResults'][0].update(kind='pid'),
+    'nonboolean_repair_baseline': lambda d: d['repairResults'][0]['states'][0]['baselines'].update(startup=0),
+    'empty_loaded_baseline': lambda d: d['repairResults'][0]['states'][0].update(baselines={}),
+    'wrong_publication_diagnostic': lambda d: d['repairResults'][0]['states'][0]['publicationHealth'].update(status='degraded', lastAttempt='2000-01-01T00:00:00Z', error='lsof-warning'),
+    'wrong_projection_type': lambda d: d['repairResults'][0]['states'][0].update(inventoryAsOf=False),
+    'missing_pending_map': lambda d: d['repairResults'][0]['states'][0].pop('dirtyPrograms'),
+    'old_fixture_version': lambda d: d.update(fixtureVersion=1),
+    'pid_classification_drift': lambda d: d['repairResults'][-1]['states'][0].update(classification='unknown'),
 }.items():
     setattr(ParityDataTests, 'test_refuses_' + name, mutation_test(mutate))
 

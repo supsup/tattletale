@@ -34,9 +34,15 @@ final class Db implements AutoCloseable {
     /** sqlite3.Error. */
     static final class DbException extends Exception {
         private static final long serialVersionUID = 1L;
+        final List<String> shellErrors;
+        final boolean protocolComplete;
 
         DbException(String msg) {
             super(msg);
+            shellErrors=List.of(); protocolComplete=false;
+        }
+        DbException(List<String> errors) {
+            super(clean(errors));shellErrors=List.copyOf(errors);protocolComplete=true;
         }
     }
 
@@ -45,6 +51,8 @@ final class Db implements AutoCloseable {
     private final BufferedReader out;
     private long seq;
     private boolean closed;
+    interface Rollback {void run()throws DbException;}
+    Rollback rollback=()->exec("ROLLBACK;");
 
     private Db(Process proc) {
         this.proc = proc;
@@ -95,7 +103,7 @@ final class Db implements AutoCloseable {
             DbException failure = new DbException("sqlite3 pipe failed"); failure.initCause(e);
             close(); throw new Fatal(failure);
         }
-        if (!errs.isEmpty()) throw new DbException(clean(errs));
+        if (!errs.isEmpty()) throw new DbException(errs);
         return rows;
     }
 
@@ -156,26 +164,57 @@ final class Db implements AutoCloseable {
      * transaction() context manager does.
      */
     synchronized void transaction(List<String> statements) throws DbException {
+        transactionQuery(statements);
+    }
+
+    /** Each statement finishes at its shell marker before the next is sent. */
+    synchronized List<Map<String,Object>> transactionQuery(List<String> statements) throws DbException {
         // One round trip per statement, so the FIRST error stops the batch. Sending the whole
         // batch at once let the shell keep executing after an error; if SQLite had rolled the
         // transaction back itself (SQLITE_FULL, IOERR, BUSY) the rest then ran in autocommit
         // and was kept. Stopping here means no later statement runs outside the transaction.
-        exec("BEGIN;");
+        try {exec("BEGIN;");}
+        catch(DbException e) {
+            if(exactShellResponse(e,"cannot start a transaction within a transaction"))throw e;
+            close();throw new Fatal(e);
+        }
         try {
-            for (String s : statements) exec(s);
+            List<Map<String,Object>> rows=new ArrayList<>();
+            for (String s : statements) rows.addAll(query(s));
             exec("COMMIT;");
+            return rows;
         } catch (DbException e) {
             try {
-                exec("ROLLBACK;");
+                rollback.run();
             } catch (DbException | Fatal rollbackFailure) {
-                // Transaction disposition is unknown; never reuse this connection, even if
-                // SQLite already rolled back automatically. Keep the original error primary.
                 e.addSuppressed(rollbackFailure);
-                close();
-                throw new Fatal(e);
+                if(rollbackFailure instanceof DbException response && noActiveTransaction(response)) {
+                    // Exact, single completed ROLLBACK response; verify a NEW owned empty
+                    // transaction on this same handle, without a fictitious SQL state API.
+                    proveRecoveredIdle(e);
+                } else {close();throw new Fatal(e);}
             }
             throw e;
         }
+    }
+
+    static boolean noActiveTransaction(DbException e) {
+        return exactShellResponse(e,"cannot rollback - no transaction is active");
+    }
+
+    /** An optional projection may fail only while this same connection is usable and idle. */
+    synchronized void proveRecoveredIdle(DbException original) {
+        try {exec("BEGIN;");exec("ROLLBACK;");}
+        catch(DbException | Fatal verificationFailure) {
+            original.addSuppressed(verificationFailure);close();throw new Fatal(original);
+        }
+    }
+    static boolean exactShellResponse(DbException e,String message) {
+        if(!e.protocolComplete || e.shellErrors.size()!=1)return false;
+        String body=PREFIX.matcher(e.shellErrors.getFirst()).replaceFirst("");
+        // Installed SQLite shells differ: some append SQLITE_ERROR (1), others do not.
+        // Match only the complete body, never a substring or an arbitrary result code.
+        return body.equals(message) || body.equals(message+" (1)");
     }
 
     @Override

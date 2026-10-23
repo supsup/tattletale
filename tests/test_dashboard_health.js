@@ -347,3 +347,79 @@ test("strict lsof warning is named with retained listeners in both Live and Stal
     assert.doesNotMatch(p.text("att-list"), /No new observations to review/);
   }
 });
+
+function publication(d, status = "ok", asOf = clock) {
+  d.publicationHealth = { lastAttempt: status === "unknown" ? null : clock,
+    lastSuccess: status === "unknown" ? null : clock, status,
+    error: status === "degraded" ? "collection-db" : null };
+  d.inventoryAsOf = asOf;
+  return d;
+}
+test("database fallback names publication and labels every inventory last-known in Live and Stale views", () => {
+  const p = page(), d = publication(data(), "degraded");
+  d.map.listeners["/fixture/retained 127.0.0.1:12345"] = { present: true, bindScope: "loopback", command: "retained" };
+  p.render(d);
+  for (const stale of [false, true]) {
+    if (stale) p.advance(181);
+    p.tickInterval();
+    assert.match(p.text("live"), stale ? /Stale/ : /Live/);
+    assert.match(p.text("banner"), /Database publication: degraded \(collection-db\)/);
+    assert.match(p.text("collection-health"), /Process list: ok/);
+    assert.match(p.text("collection-health"), /Inventory as of: 2000-01-01T00:00:00Z/);
+    for (const id of ["listeners", "creds", "startup", "tiles"]) assert.match(p.text(id), /Last-known inventory/);
+    assert.doesNotMatch(p.text("att-list"), /No new observations to review/);
+  }
+});
+test("publication recovery clears only publication warning and uses the fresh projection timestamp", () => {
+  const p = page(); p.render(publication(data(), "degraded"));
+  const d = publication(data()); d.inventoryAsOf = "2000-01-01T00:01:00Z"; d.generatedAt = "2000-01-01T00:02:00Z";
+  p.render(d);
+  assert.equal(p.shown(), false);
+  assert.match(p.text("collection-health"), /Database publication: ok/);
+  assert.match(p.text("collection-health"), /Inventory as of: 2000-01-01T00:01:00Z/);
+  assert.equal(p.text("listeners"), "No listeners in the last accepted sample.");
+  assert.doesNotMatch(p.text("listeners"), /Last-known inventory/);
+});
+test("new epoch can have a real cached projection with unknown publication and no invented success", () => {
+  const p = page(); p.render(publication(data(), "unknown"));
+  assert.match(p.text("collection-health"), /Database publication: unknown \| attempted: not yet \| last successful publication: not yet/);
+  assert.match(p.text("banner"), /Database publication: unknown/);
+  assert.match(p.text("collection-health"), /Inventory as of: 2000-01-01T00:00:00Z/);
+  assert.match(p.text("listeners"), /Last-known inventory/);
+});
+for (const [name, mutate] of [
+  ["missing projection time", (d) => { delete d.inventoryAsOf; }],
+  ["projection without publication", (d) => { delete d.publicationHealth; }],
+  ["invalid projection time", (d) => { d.inventoryAsOf = "2000-02-31T00:00:00Z"; }],
+  ["numeric projection time", (d) => { d.inventoryAsOf = 0; }],
+  ["ok without projection", (d) => { d.inventoryAsOf = null; }],
+  ["invalid publication shape", (d) => { d.publicationHealth.extra = true; }],
+  ["unknown fixed diagnostic", (d) => { d.publicationHealth = { status: "degraded", lastAttempt: clock, lastSuccess: null, error: "lsof-warning" }; }],
+  ["raw publication diagnostic", (d) => { d.publicationHealth = { status: "degraded", lastAttempt: clock, lastSuccess: null, error: "<script>private</script>" }; }],
+  ["undefined present publication", (d) => { d.publicationHealth = undefined; }]
+]) test(name + " cannot hide a malformed additive publication contract behind legacy behavior", () => {
+  const p = page(), d = publication(data()); mutate(d); p.render(d); p.tickInterval();
+  assert.match(p.text("collection-health"), /Database publication: unknown/);
+  assert.match(p.text("banner"), /Database publication: unknown/);
+  assert.doesNotMatch(p.text("att-list"), /No new observations to review/);
+  assert.doesNotMatch(p.text("collection-health"), /<script>|private/);
+  assert.equal(p.shown(), true);
+});
+test("the bounded in-memory I/O diagnostic is supported without implying that its failed write was delivered", () => {
+  const p = page(), d = publication(data(), "degraded"); d.publicationHealth.error = "collection-io"; p.render(d);
+  assert.match(p.text("banner"), /Database publication: degraded \(collection-io\)/);
+  assert.match(p.text("listeners"), /Last-known inventory/);
+});
+test("late render failure and failed refresh preserve the exact prior publication and inventory age", () => {
+  const p = page(), old = publication(data(), "degraded"); p.render(old);
+  const oldHealth = p.text("collection-health"), oldUpdated = p.text("updated");
+  old.publicationHealth.status = "ok"; old.inventoryAsOf = "2000-01-01T00:02:00Z";
+  const fresh = publication(data()); fresh.inventoryAsOf = "2000-01-01T00:03:00Z";
+  p.failNextProgramRender(); p.render(fresh); p.tickInterval();
+  assert.ok(p.text("collection-health").includes(oldHealth));
+  assert.ok(p.text("updated").includes(oldUpdated));
+  assert.match(p.text("collection-health"), /Database publication: degraded/);
+  assert.match(p.text("collection-health"), /Inventory as of: 2000-01-01T00:00:00Z/);
+  p.load(); p.head.children.at(-1).onerror(); p.tickInterval();
+  assert.match(p.text("collection-health"), /Database publication: degraded/);
+});

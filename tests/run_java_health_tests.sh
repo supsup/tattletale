@@ -6,4 +6,4 @@ cd "$here"
 sh java/build.sh --jar-only
 mkdir -p java/build/test-classes
 "$JAVA_HOME/bin/javac" --release 25 -encoding UTF-8 -Xlint:all,-options -cp java/build/tattletale.jar -d java/build/test-classes java/src/test/java/dev/tattletale/*.java
-exec "$JAVA_HOME/bin/java" -Duser.home="$HOME" -cp java/build/tattletale.jar:java/build/test-classes dev.tattletale.CollectionHealthTest --fixtures tests/fixtures/collection-health.json "$@"
+exec "$JAVA_HOME/bin/java" --enable-native-access=ALL-UNNAMED -Duser.home="$HOME" -cp java/build/tattletale.jar:java/build/test-classes dev.tattletale.CollectionHealthTest --fixtures tests/fixtures/collection-health.json "$@"

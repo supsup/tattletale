@@ -39,10 +39,10 @@ final class RepairHealthTest {
             f.w.db.exec("INSERT INTO startup_items(path,hash) VALUES('/fixture/z','z'),('/fixture/a','a');");f.w.loadState();
             check(new ArrayList<>(f.w.startup.keySet()).equals(List.of("/fixture/a","/fixture/z")),"old physical row order leaked");
         }});
-        test("repair-automatic-rollback-fatal-not-noop",()->{try(Fixture f=new Fixture()) {
+        test("repair-automatic-rollback-recovery",()->{try(Fixture f=new Fixture()) {
             f.w.db.exec("CREATE TRIGGER fatal_fixture BEFORE INSERT ON programs BEGIN SELECT RAISE(ROLLBACK,'fixture-original'); END;");
-            boolean fatal=false;try {f.w.checkProcesses();}catch(RuntimeException e){fatal=true;check(e.getCause()!=null,"original cause lost");}
-            check(fatal && f.w.knownProgs.isEmpty(),"closed DB silently continued");
+            f.w.checkProcesses();status(f.w,"processes","degraded");check(f.w.knownProgs.isEmpty(),"rolled-back sample adopted");
+            f.w.db.exec("DROP TRIGGER fatal_fixture;");f.w.checkProcesses();status(f.w,"processes","ok");check(!f.w.knownProgs.isEmpty(),"same-handle recovery failed");
         }});
         test("repair-collector-locale-streams-and-strictness",()->{
             ProcessBuilder pb=new ProcessBuilder("synthetic-unused");pb.environment().put("LC_ALL","conflicting-locale");Proc.collectorEnvironment(pb);
@@ -64,7 +64,7 @@ final class RepairHealthTest {
             for(Proc.Result result:List.of(new Proc.Result(1,"",""),new Proc.Result(0,"/other-program\n",""))) {
                 Files.writeString(pid,"42\n");f.w.pidProbe=n->result;f.w.claimPidFile();check(Files.readString(pid).equals(ProcessHandle.current().pid()+"\n"),"positive absence/other refused");f.w.releasePidFile();check(!Files.exists(pid),"owned pid not released");
             }
-            Files.writeString(pid,"2147483648\n");f.w.pidProbe=n->{throw new AssertionError("bad PID reached probe");};refused=false;try{f.w.claimPidFile();}catch(Watch.Exit e){refused=true;}check(refused,"malformed pid accepted");
+            Files.writeString(pid,"2147483648\n");f.w.pidProbe=n->{throw new AssertionError("bad PID reached probe");};f.w.claimPidFile();check(Files.readString(pid).equals(ProcessHandle.current().pid()+"\n"),"stale malformed pid not replaced");f.w.releasePidFile();
         }});
         test("repair-fatal-owned-finally-preserves-error",()->{try(Fixture f=new Fixture()) {
             Path pid=Path.of(f.w.dataDir,"tattletale.pid");Files.writeString(pid,ProcessHandle.current().pid()+"\n");f.w.pidFile=pid.toString();
@@ -81,7 +81,7 @@ final class RepairHealthTest {
             fake.files.put("/fixture/b","b".getBytes(StandardCharsets.UTF_8));f.w.checkStartup();check(f.w.startup.containsKey("/fixture/b") && count(f.w,"STARTUP+")==1,"marker concealed new peer");
             Map<String,String> before=new LinkedHashMap<>(f.w.startup);fake.failRead=true;f.w.checkStartup();check(f.w.startup.equals(before) && count(f.w,"STARTUP-")==0,"transient read removed entries");status(f.w,"crontab","ok");
             fake.failRead=false;f.w.sources=new Fake(){public List<String> files(){return new ArrayList<>(fake.files.keySet());}public byte[] read(String file){return fake.files.get(file);}public String textDiff(String a,String b,int l){return "(fixture diff)";}};
-            f.w.clock=()->"2000-01-01T00:01:00Z";f.w.checkStartup();status(f.w,"startup","ok");check(count(f.w,"STARTUP~")==1 && health(f.w,"startup").get("lastSuccess").equals("2000-01-01T00:01:00Z"),"marker recovery duplicated/missed");
+            f.w.clock=()->"2000-01-01T00:01:00Z";f.w.checkStartup();status(f.w,"startup","ok");check(count(f.w,"STARTUP~")==0 && health(f.w,"startup").get("lastSuccess").equals("2000-01-01T00:01:00Z"),"marker recovery duplicated/missed");
         }});
         test("repair-final-directory-dangling-versus-disappearance",()->{
             Path d=Files.createDirectory(root.resolve("entry-markers"));Path dir=Files.createDirectory(d.resolve("bundle"));Path link=d.resolve("dangling");Files.createSymbolicLink(link,d.resolve("absent"));Watch.Sources source=Proc::collector;
@@ -111,10 +111,10 @@ final class RepairHealthTest {
         test("repair-readable-marker-readable-retains-history",()->{try(Fixture f=new Fixture()) {
             f.fake.files.put("/fixture/a","good".getBytes(StandardCharsets.UTF_8));f.w.checkStartup();String good=f.w.startup.get("/fixture/a"),copy=copy("/fixture/a",good);byte[] retained=f.fake.copies.get(copy);
             Fake denied=new Fake(){public byte[] entry(String path)throws IOException{throw new Watch.Unreadable("permission-denied");}};denied.files.put("/fixture/a",new byte[0]);f.w.sources=denied;f.w.clock=()->"2000-01-01T00:01:00Z";f.w.checkStartup();
-            check(health(f.w,"startup").get("lastSuccess").equals(T) && count(f.w,"STARTUP~")==1 && f.fake.copies.get(copy)==retained,"marker erased success/history");
+            check(health(f.w,"startup").get("lastSuccess").equals(T) && count(f.w,"STARTUP~")==0 && f.fake.copies.get(copy)==retained,"marker erased success/history");
             check(Db.asLong(f.w.db.scalar("SELECT count(*) FROM startup_versions WHERE path='/fixture/a' AND copy_path IS NULL;"))==1,"marker saved invented copy");
-            f.w.checkStartup();check(count(f.w,"STARTUP~")==1,"persistent marker duplicate change");
-            f.w.sources=f.fake;f.w.clock=()->"2000-01-01T00:02:00Z";f.w.checkStartup();check(count(f.w,"STARTUP~")==2 && health(f.w,"startup").get("lastSuccess").equals("2000-01-01T00:02:00Z"),"readable recovery missing/duplicated");
+            f.w.checkStartup();check(count(f.w,"STARTUP~")==0,"persistent marker duplicate change");
+            f.w.sources=f.fake;f.w.clock=()->"2000-01-01T00:02:00Z";f.w.checkStartup();check(count(f.w,"STARTUP~")==0 && health(f.w,"startup").get("lastSuccess").equals("2000-01-01T00:02:00Z"),"readable recovery missing/duplicated");
         }});
         test("repair-synthetic-directory-link-do-not-hide-readable-peer",()->{try(Fixture f=new Fixture()) {
             Path dir=Files.createDirectory(root.resolve("inventory-entries")),bundle=Files.createDirectory(dir.resolve("bundle")),link=dir.resolve("dangling"),file=dir.resolve("readable");Files.createSymbolicLink(link,dir.resolve("absent"));Files.writeString(file,"readable bytes");

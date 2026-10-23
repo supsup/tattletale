@@ -95,6 +95,14 @@ crontab. A Live page can still have degraded observations. A restart begins with
 health even when retained inventory is shown; missing or unsupported health is also unknown,
 never an all-clear. Values retained after a failed check are labelled last-known.
 
+Database/page publication has its own `publicationHealth`, separate from those four checks.
+A recoverable save failure can publish current check health with the last complete cached
+database projection, marked degraded. `inventoryAsOf` dates that inventory; `generatedAt`
+dates the envelope, so a Live page can contain older last-known values. No cache means no
+invented empty page. Failed page replacement preserves the prior file and cannot publish
+its own diagnosis. Successful recovery advances publication success only after replacement.
+Both new fields may be absent in older format-2 data; a malformed present field is incomplete.
+
 Startup files and crontab are independent partitions, each with its own health and
 baseline. Both are attempted every scheduled cycle, files first and crontab last. Good
 peer changes may commit while a failed partition retains its last-known data. A fully
@@ -103,6 +111,11 @@ but startup health stays degraded and its success time does not advance. Eligibl
 share a transaction; mirrors and baselines advance only after commit. This replaces the
 earlier combined-sample rule. The polling schedule is unchanged, with no added automatic
 retries. These four checks do not represent universal watcher, identity or log-stream health.
+Final directories, nonregular entries, symlink loops and regular files larger than 16 MiB
+are explicit unreadable markers; inaccessible ancestors reject the filesystem partition.
+Accepted regular files are fully hashed up to 16 MiB, while copies retain at most 4 MiB.
+Readability flaps alone emit no content-change event: restored A is unchanged, while B is
+compared with the last readable A version.
 
 The page names degraded/unknown checks alongside either Live or Stale. A failed page
 refresh retains the last fully accepted inventory, health and update time under an explicit
@@ -176,6 +189,9 @@ would not establish complete socket coverage; no warning allowlist is used.
 The page names the warning, and transition into it records the fixed existing-kind `NOTE`
 `listeners collection degraded: lsof-warning`. Repeated identical warnings are deduplicated;
 the note contains no raw stderr.
+Crontab command output intentionally requires UTF-8. Another encoding degrades crontab
+with `collection-parse` and retains last-known values; it is not decoded with replacement
+or treated as an empty/absent crontab.
 
 ## Run at login (optional)
 
@@ -221,7 +237,13 @@ unrelated privacy, locking, platform or identity-refresh changes.
 
 The gate runs both fixture producers into fresh files, requires their successful exits
 and fresh timestamped per-case JUnit (with skips counted), then compares the complete
-23 scope cases, 13 command cases, ten original snapshots and eight startup transitions.
+23 scope cases, 13 command cases, ten original snapshots and eight startup transitions,
+plus nine ordered repair families with 59 states from shared test-fixture version 2.
+These cover special entries/ancestor failures, readability history, warning-note dedup,
+automatic rollback, publication failure/recovery and PID framing. Actual filesystem adapter
+and default-collector wiring controls remain in each language's fixture suite. The 59
+states are data observations, not a claim of 59 distinct executed tests. SQLite schema 1,
+generated-data format 2 and producer version 0.0.2 remain unchanged.
 It retains failed outputs and refuses missing, stale, malformed or incomplete evidence.
 `tests/test_health_parity_gate.py` uses explicitly synthetic validation data and mocked
 producers; it is not a substitute for this actual two-producer gate.

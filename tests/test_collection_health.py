@@ -5,10 +5,14 @@ import ctypes
 import importlib.util
 import io
 import json
+import os
 import pathlib
+import signal
+import socket
 import sqlite3
 import subprocess
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -247,11 +251,11 @@ class CollectionHealthTests(unittest.TestCase):
     def test_startup_late_permission_marker_does_not_hide_readable_peer(self):
         self.seed_startup(); first = self.root / 'first'; second = self.root / 'second'
         first.write_bytes(b'public fixture'); second.write_bytes(b'public fixture')
-        original = open
+        original = TT.os.open
         def read_file(path, *args, **kwargs):
             if str(path) == str(second): raise PermissionError('fake private path')
             return original(path, *args, **kwargs)
-        with mock.patch.object(TT, 'STARTUP_FILES', [str(first), str(second)]), mock.patch('builtins.open', side_effect=read_file), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(first), str(second)]), mock.patch.object(TT.os, 'open', side_effect=read_file), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
             self.assertFalse(self.w.check_startup())
         self.assertEqual(self.w.startup[str(first)], TT.hashlib.sha256(first.read_bytes()).hexdigest())
         self.assertEqual(self.w.startup[str(second)], 'unreadable: permission-denied')
@@ -608,11 +612,11 @@ class CollectionHealthTests(unittest.TestCase):
         denied = directory / 'denied'; denied.write_bytes(b'private synthetic fixture')
         (directory / 'sub.bundle').mkdir()
         (directory / 'dangling').symlink_to(directory / 'missing')
-        original = open
+        original = TT.os.open
         def read(path, *args, **kwargs):
             if str(path) == str(denied): raise PermissionError('not a health diagnostic')
             return original(path, *args, **kwargs)
-        with mock.patch.object(TT, 'STARTUP_DIRS', [str(directory)]), mock.patch('builtins.open', side_effect=read), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+        with mock.patch.object(TT, 'STARTUP_DIRS', [str(directory)]), mock.patch.object(TT.os, 'open', side_effect=read), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
             self.assertFalse(self.w.check_startup())
         expected = {str(denied): 'unreadable: permission-denied', str(directory / 'sub.bundle'): 'unreadable: directory', str(directory / 'dangling'): 'unreadable: dangling-link'}
         for path, digest in expected.items():
@@ -627,12 +631,12 @@ class CollectionHealthTests(unittest.TestCase):
     def test_transient_read_or_listed_disappearance_preserves_all_files(self):
         self.seed_startup(); old = self.w.startup['/fixture/old.rc']
         directory = self.root / 'agents'; directory.mkdir(); path = directory / 'a'; path.write_bytes(b'a0')
-        original = open
+        original = TT.os.open
         for error in [OSError(5, 'public injected EIO'), FileNotFoundError('public disappearing file')]:
             def read(candidate, *args, **kwargs):
                 if str(candidate) == str(path): raise error
                 return original(candidate, *args, **kwargs)
-            with mock.patch.object(TT, 'STARTUP_DIRS', [str(directory)]), mock.patch('builtins.open', side_effect=read), self.commands({CRON: (0, '* * * * * fixture\n', '')}):
+            with mock.patch.object(TT, 'STARTUP_DIRS', [str(directory)]), mock.patch.object(TT.os, 'open', side_effect=read), self.commands({CRON: (0, '* * * * * fixture\n', '')}):
                 self.assertFalse(self.w.check_startup())
             self.assertEqual(self.w.startup['/fixture/old.rc'], old)
             self.assertNotIn(str(path), self.w.startup)
@@ -642,14 +646,14 @@ class CollectionHealthTests(unittest.TestCase):
 
     def test_marker_recovery_retains_good_history_and_advances_success_once(self):
         path = self.root / 'a'; path.write_bytes(b'a0')
-        original = open
+        original = TT.os.open
         with mock.patch.object(TT, 'STARTUP_FILES', [str(path)]), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
             self.assertTrue(self.w.check_startup())
             first = self.w.db.execute('SELECT copy_path FROM startup_versions WHERE path=?', (str(path),)).fetchone()[0]
             def denied(candidate, *args, **kwargs):
                 if str(candidate) == str(path): raise PermissionError('public fixture')
                 return original(candidate, *args, **kwargs)
-            with mock.patch('builtins.open', side_effect=denied), mock.patch.object(TT, 'now', return_value=T1):
+            with mock.patch.object(TT.os, 'open', side_effect=denied), mock.patch.object(TT, 'now', return_value=T1):
                 self.assertFalse(self.w.check_startup())
             self.assertEqual(self.w.collection_health['startup']['lastSuccess'], T0)
             with mock.patch.object(TT, 'now', return_value='2000-01-01T00:02:00Z'):
@@ -661,8 +665,7 @@ class CollectionHealthTests(unittest.TestCase):
         self.assertIsNone(rows[1][1])
         self.assertEqual(self.w.collection_health['startup']['lastSuccess'], '2000-01-01T00:02:00Z')
         messages = [r[0] for r in self.w.db.execute("SELECT message FROM events WHERE kind='STARTUP~' ORDER BY id")]
-        self.assertEqual(len(messages), 2)
-        self.assertIn('before: None', messages[1])
+        self.assertEqual(messages, [], 'readability alone is not a content change')
 
     def test_independent_first_baselines_and_attempt_order(self):
         path = self.root / 'a'; path.write_bytes(b'a0'); trace = []
@@ -887,8 +890,342 @@ class CollectionHealthTests(unittest.TestCase):
             self.assertEqual(path.read_text(), '4242\n')
         for value in ['', 'bad', '2147483648', '\u0664\u0662']:
             path.write_text(value)
+            with mock.patch.object(TT.os, 'getpid', return_value=4242): self.w.claim_pid_file()
+            self.assertEqual(path.read_text(), '4242\n')
+        self.assertEqual(self.w.db.execute("SELECT count(*) FROM events WHERE kind='NOTE' AND message='pid file contained invalid stale content; replacing'").fetchone()[0], 4)
+
+    def test_real_special_startup_entries_do_not_open_or_stall(self):
+        directory = self.root / 'special'; directory.mkdir()
+        good = directory / 'good'; good.write_bytes(b'public healthy bytes')
+        os.mkfifo(str(directory / 'fifo'))
+        (directory / 'loop').symlink_to('loop')
+        (directory / 'dangling').symlink_to('missing')
+        denied_dir = directory / 'mode000'; denied_dir.mkdir(); denied_dir.chmod(0)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(str(directory)); sock.bind('socket')
+        finally: os.chdir(old_cwd)
+        self.addCleanup(sock.close)
+        self.addCleanup(denied_dir.chmod, 0o700)
+        expected = {'fifo': 'not-a-regular-file', 'socket': 'not-a-regular-file',
+                    'loop': 'symlink-loop', 'mode000': 'directory', 'dangling': 'dangling-link'}
+        original = TT.os.open
+        def checked_open(path, flags, *args, **kwargs):
+            self.assertNotIn(str(path), [str(directory / key) for key in expected])
+            return original(path, flags, *args, **kwargs)
+        with mock.patch.object(TT, 'STARTUP_DIRS', [str(directory)]), mock.patch.object(TT.os, 'open', side_effect=checked_open), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+            self.assertFalse(self.w.check_startup())
+        self.assertEqual(self.w.startup[str(good)], TT.hashlib.sha256(good.read_bytes()).hexdigest())
+        for name, marker in expected.items():
+            self.assertEqual(self.w.startup[str(directory / name)], 'unreadable: ' + marker)
+        self.assertEqual(self.w.collection_health['crontab']['status'], 'ok')
+
+    def test_regular_link_reads_target_and_link_race_rejects(self):
+        target = self.root / 'regular'; target.write_bytes(b'public regular')
+        link = self.root / 'link'; link.symlink_to(target.name)
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(link)]), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+            self.assertTrue(self.w.check_startup())
+            before = self.inventory(); original = TT.os.open
+            replacement = self.root / 'replacement'; replacement.write_bytes(b'new target')
+            def race(path, flags, *args, **kwargs):
+                if str(path) == str(target):
+                    link.unlink(); link.symlink_to(replacement.name)
+                return original(path, flags, *args, **kwargs)
+            with mock.patch.object(TT.os, 'open', side_effect=race): self.assertFalse(self.w.check_startup())
+        self.assertEqual(before, self.inventory())
+
+    def test_regular_to_fifo_race_is_nonblocking_and_preserves_fs(self):
+        source = self.root / 'regular'; source.write_bytes(b'public regular')
+        self.seed_startup(); old = dict(self.w.startup); original = TT.os.open
+        class Deadline(BaseException): pass
+        def alarm(signum, frame): raise Deadline('own FIFO race deadline')
+        previous = signal.signal(signal.SIGALRM, alarm)
+        def race(path, flags, *args, **kwargs):
+            if str(path) == str(source):
+                self.assertTrue(flags & os.O_NONBLOCK); source.unlink(); os.mkfifo(str(source))
+            return original(path, flags, *args, **kwargs)
+        try:
+            signal.alarm(1)
+            with mock.patch.object(TT, 'STARTUP_FILES', [str(source)]), mock.patch.object(TT.os, 'open', side_effect=race), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+                self.assertFalse(self.w.check_startup())
+        finally:
+            signal.alarm(0); signal.signal(signal.SIGALRM, previous)
+        self.assertEqual(old, self.w.startup)
+        self.assertEqual(self.w.collection_health['startup']['error'], 'startup-read')
+        self.assertEqual(self.w.collection_health['crontab']['status'], 'ok')
+
+    def test_inaccessible_ancestor_rejects_fs_without_hiding_cron(self):
+        parent = self.root / 'no-search'; parent.mkdir(); source = parent / 'public'; source.write_bytes(b'public')
+        parent.chmod(0); self.addCleanup(parent.chmod, 0o700)
+        self.seed_startup(); old = self.w.startup['/fixture/old.rc']
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(source)]), self.commands({CRON: (0, 'public cron', '')}):
+            self.assertFalse(self.w.check_startup())
+        self.assertEqual(self.w.startup['/fixture/old.rc'], old)
+        self.assertEqual(self.w.collection_health['startup']['error'], 'startup-read')
+        self.assertEqual(self.w.collection_health['crontab']['status'], 'ok')
+
+    def test_recovery_from_marker_diffs_last_readable_version(self):
+        source = self.root / 'public'; source.write_bytes(b'alpha\n')
+        original = TT.os.open
+        def denied(path, *args, **kwargs):
+            if str(path) == str(source): raise PermissionError('synthetic permission')
+            return original(path, *args, **kwargs)
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(source)]), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+            self.assertTrue(self.w.check_startup())
+            first = self.w.db.execute('SELECT copy_path FROM startup_versions WHERE path=?', (str(source),)).fetchone()[0]
+            with mock.patch.object(TT.os, 'open', side_effect=denied): self.assertFalse(self.w.check_startup())
+            source.write_bytes(b'beta\n'); self.assertTrue(self.w.check_startup())
+        events = self.w.db.execute("SELECT message FROM events WHERE kind='STARTUP~' ORDER BY id").fetchall()
+        self.assertEqual(len(events), 1); self.assertIn('before: ' + first, events[0][0])
+        self.assertIn('-alpha', events[0][0]); self.assertIn('+beta', events[0][0])
+
+    def test_kernel_path_wins_over_c_escaped_absolute_display_and_root_rejects(self):
+        responses = self.ps_responses(); responses[PS_COMM] = (0, '42 1 fixture /fixture/M-CM-)xecutable\n', '')
+        with self.commands(responses), mock.patch.object(TT, 'pid_path', return_value='/fixture/éxecutable') as bridge:
+            self.assertTrue(self.w.check_processes())
+        self.assertEqual(self.w.known_progs, {'/fixture/éxecutable'}); bridge.assert_called_once_with(42)
+        before = self.inventory(); responses[PS_COMM] = (0, '42 1 fixture /\n', '')
+        with self.commands(responses): self.assertFalse(self.w.check_processes())
+        self.assertEqual(before, self.inventory())
+
+    def test_failed_begin_does_not_roll_back_caller_transaction(self):
+        self.w.db.execute('BEGIN'); self.w.db.execute("INSERT INTO events(time,kind,message) VALUES('t','NOTE','caller')")
+        with self.assertRaises(sqlite3.OperationalError):
+            with TT.transaction(self.w.db): self.fail('body ran inside caller transaction')
+        self.assertTrue(self.w.db.in_transaction)
+        self.assertEqual(self.w.db.execute('SELECT count(*) FROM events').fetchone()[0], 1)
+        self.w.db.execute('ROLLBACK')
+
+    def test_pid_atomic_failure_preserves_prior_bytes_and_special_identity_refuses(self):
+        path = self.root / 'tattletale.pid'; path.write_text('invalid stale')
+        with mock.patch.object(TT.os, 'replace', side_effect=OSError('synthetic atomic publication failure')):
+            with self.assertRaises(OSError): self.w.claim_pid_file()
+        self.assertEqual(path.read_text(), 'invalid stale')
+        self.assertEqual(list(self.root.glob('.tattletale-pid.*')), [])
+        path.unlink(); path.symlink_to('missing')
+        with self.assertRaises(SystemExit): self.w.claim_pid_file()
+        self.assertTrue(path.is_symlink())
+
+    def page_payload(self):
+        text = (self.root / 'tattletale-data.js').read_text()
+        return json.loads(text[len('window.TATTLETALE = '):-2])
+
+    def test_publication_flush_failure_repeats_cached_inventory_and_recovers(self):
+        self.seed_listener(); self.w.save(); first = self.page_payload()
+        self.assertEqual(first['publicationHealth']['status'], 'ok')
+        self.w.dirty_listeners[KEY] = T1
+        self.w.db.execute("CREATE TRIGGER refuse_flush BEFORE UPDATE ON listeners BEGIN SELECT RAISE(ABORT,'public flush'); END")
+        with self.commands({LSOF: (7, '', '')}): self.assertFalse(self.w.check_listeners())
+        later = '2000-01-01T00:02:00Z'
+        for instant in [T1, later]:
+            with mock.patch.object(TT, 'now', return_value=instant):
+                with self.assertRaises(sqlite3.IntegrityError): self.w.save()
+            page = self.page_payload()
+            self.assertEqual(page['map'], first['map']); self.assertEqual(page['inventoryAsOf'], T0)
+            self.assertEqual(page['generatedAt'], instant)
+            self.assertEqual(page['collectionHealth']['listeners']['status'], 'degraded')
+            self.assertEqual(page['publicationHealth']['lastSuccess'], T0)
+            self.assertEqual(page['publicationHealth']['error'], 'collection-db')
+            self.assertEqual(self.w.dirty_listeners, {KEY: T1})
+        self.w.db.execute('DROP TRIGGER refuse_flush')
+        with mock.patch.object(TT, 'now', return_value=later): self.w.save()
+        self.assertEqual(self.w.dirty_listeners, {})
+        self.assertEqual(self.page_payload()['map']['listeners'][KEY]['lastSeen'], T1)
+        self.assertEqual(self.w.publication_health['lastSuccess'], later)
+
+    def test_publication_projection_failure_after_commit_does_not_resurrect_dirty(self):
+        self.seed_listener(); self.w.save(); first = self.page_payload()
+        self.w.dirty_listeners[KEY] = T1
+        with mock.patch.object(self.w, 'page_map', side_effect=sqlite3.OperationalError('public projection failure')):
+            with self.assertRaises(sqlite3.OperationalError): self.w.save()
+        self.assertEqual(self.w.dirty_listeners, {})
+        self.assertEqual(self.w.db.execute('SELECT last_seen FROM listeners WHERE key=?', (KEY,)).fetchone()[0], T1)
+        self.assertEqual(self.page_payload()['map'], first['map'])
+        self.w.save(); self.assertEqual(self.page_payload()['map']['listeners'][KEY]['lastSeen'], T1)
+
+    def test_publication_without_cache_and_atomic_failure_keep_old_bytes(self):
+        self.w = TT.Watch(str(self.root / 'no-load.log'), str(self.root / 'no-load.db'), notify=False)
+        self.addCleanup(self.w.db.close)
+        page = self.root / 'tattletale-data.js'; page.write_bytes(b'prior public page')
+        with mock.patch.object(self.w, 'page_map', side_effect=sqlite3.OperationalError('public projection failure')):
+            with self.assertRaises(sqlite3.OperationalError): self.w.save()
+        self.assertEqual(page.read_bytes(), b'prior public page'); self.assertIsNone(self.w._inventory_cache)
+        with mock.patch.object(TT.os, 'replace', side_effect=OSError('public atomic failure')):
+            with self.assertRaises(OSError): self.w.save()
+        self.assertEqual(page.read_bytes(), b'prior public page')
+        self.assertEqual(self.w.publication_health['error'], 'collection-io')
+        self.assertIsNone(self.w.publication_health['lastSuccess'])
+        self.assertEqual(list(self.root.glob('.tattletale-data.*')), [])
+        self.w.save(); self.assertEqual(self.page_payload()['map']['startup'], {})
+
+    def test_publication_cache_is_detached_and_fatal_db_never_falls_back(self):
+        self.w.save(); before = (self.root / 'tattletale-data.js').read_bytes()
+        original = self.w.write_page_data
+        def mutate(d, state, *args):
+            state['startup']['/fixture/mutated'] = 'not database data'
+            return original(d, state, *args)
+        with mock.patch.object(self.w, 'write_page_data', side_effect=mutate): self.w.save()
+        self.assertEqual(self.w._inventory_cache['startup'], {})
+        with mock.patch.object(TT, 'transaction', side_effect=TT.FatalDatabaseError('public fatal')):
+            prior = (self.root / 'tattletale-data.js').read_bytes()
+            with self.assertRaises(TT.FatalDatabaseError): self.w.save()
+            self.assertEqual((self.root / 'tattletale-data.js').read_bytes(), prior)
+        other = TT.Watch(str(self.root / 'other.log'), str(self.root / 'other.db'), notify=False)
+        try:
+            self.assertEqual(other.publication_health['status'], 'unknown')
+            self.assertIsNone(other.publication_health['lastSuccess']); self.assertIsNone(other._inventory_cache)
+        finally: other.db.close()
+
+    def test_load_seeds_complete_projection_without_publication_success(self):
+        self.seed_listener()
+        self.assertIn(KEY, self.w._inventory_cache['listeners'])
+        self.assertEqual(self.w._inventory_as_of, T0)
+        self.assertEqual(self.w.publication_health, dict(lastAttempt=None, lastSuccess=None, status='unknown', error=None))
+        self.w.dirty_listeners[KEY] = T1
+        self.w.db.execute("CREATE TRIGGER first_save_failure BEFORE UPDATE ON listeners BEGIN SELECT RAISE(ABORT,'public first flush'); END")
+        with self.assertRaises(sqlite3.IntegrityError): self.w.save()
+        self.assertEqual(self.page_payload()['map']['listeners'][KEY]['lastSeen'], T0)
+        self.assertEqual(self.page_payload()['publicationHealth']['status'], 'degraded')
+        self.assertIsNone(self.page_payload()['publicationHealth']['lastSuccess'])
+
+    def test_load_optional_projection_failure_is_not_partial_cache_or_fatal_waiver(self):
+        with mock.patch.object(self.w, 'page_map', side_effect=sqlite3.OperationalError('public optional projection failure')):
+            self.w.load_state()
+        self.assertIsNone(self.w._inventory_cache); self.assertIsNone(self.w._inventory_as_of)
+        with mock.patch.object(self.w, 'page_map', side_effect=TT.FatalDatabaseError('public fatal seed')):
+            with self.assertRaises(TT.FatalDatabaseError): self.w.load_state()
+
+    def test_complete_startup_file_limit_never_hashes_a_prefix(self):
+        exact = self.root / 'exact-limit'; exact.write_bytes(b'x' * TT.STARTUP_MAX_BYTES)
+        oversized = self.root / 'over-limit'; oversized.write_bytes(b'y' * (TT.STARTUP_MAX_BYTES + 1))
+        original = TT.os.open
+        def checked_open(path, *args, **kwargs):
+            self.assertNotEqual(str(path), str(oversized), 'known oversized source must not open')
+            return original(path, *args, **kwargs)
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(exact), str(oversized)]), mock.patch.object(TT.os, 'open', side_effect=checked_open), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+            self.assertFalse(self.w.check_startup())
+        self.assertEqual(self.w.startup[str(exact)], TT.hashlib.sha256(exact.read_bytes()).hexdigest())
+        self.assertEqual(self.w.startup[str(oversized)], 'unreadable: file-too-large')
+        saved = self.w.db.execute('SELECT copy_path FROM startup_versions WHERE path=?', (str(exact),)).fetchone()[0]
+        self.assertEqual(pathlib.Path(saved).stat().st_size, 4 * 1024 * 1024)
+        self.assertIsNone(self.w.db.execute('SELECT copy_path FROM startup_versions WHERE path=?', (str(oversized),)).fetchone()[0])
+        self.assertEqual(self.w.collection_health['crontab']['status'], 'ok')
+
+    def test_regular_growth_rejects_sample_and_closes_opened_descriptor(self):
+        source = self.root / 'growing'; source.write_bytes(b'public initial')
+        self.seed_startup(); old = dict(self.w.startup); original = TT.os.fdopen; owned_fds = []
+        inode = source.stat().st_ino
+        class GrowDuringRead:
+            def __init__(self, stream): self.stream = stream
+            def __enter__(self): return self
+            def __exit__(self, *args): return self.stream.__exit__(*args)
+            def fileno(self): return self.stream.fileno()
+            def read(self, size):
+                with source.open('ab') as writer: writer.write(b' growth')
+                return self.stream.read(size)
+        def wrap(fd, mode, *args, **kwargs):
+            stream = original(fd, mode, *args, **kwargs)
+            if mode == 'rb' and os.fstat(fd).st_ino == inode:
+                owned_fds.append(fd); return GrowDuringRead(stream)
+            return stream
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(source)]), mock.patch.object(TT.os, 'fdopen', side_effect=wrap), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+            self.assertFalse(self.w.check_startup())
+        self.assertEqual(self.w.startup, old); self.assertEqual(len(owned_fds), 1)
+        with self.assertRaises(OSError): os.fstat(owned_fds[0])
+        self.assertEqual(self.w.collection_health['crontab']['status'], 'ok')
+
+    def test_invalid_startup_path_rejects_partition_and_strict_cron_bytes_preserve(self):
+        self.seed_startup(); before = self.inventory()
+        with mock.patch.object(TT, 'STARTUP_FILES', ['/fixture/nul\x00path']), self.commands({CRON: (0, b'\xff', b'')}):
+            self.assertFalse(self.w.check_startup())
+        self.assertEqual(before, self.inventory())
+        self.assertEqual(self.w.collection_health['startup']['error'], 'startup-read')
+        self.assertEqual(self.w.collection_health['crontab']['error'], 'collection-parse')
+
+    def test_closed_transaction_state_is_fatal_not_recoverable(self):
+        conn = sqlite3.connect(':memory:', isolation_level=None); conn.close()
+        with self.assertRaises(TT.FatalDatabaseError) as caught:
+            with TT.transaction(conn): self.fail('closed connection entered transaction body')
+        self.assertIsInstance(caught.exception.__cause__, sqlite3.ProgrammingError)
+
+    def test_stable_metadata_short_read_rejects_instead_of_hashing_prefix(self):
+        source = self.root / 'short-read'; source.write_bytes(b'complete public bytes')
+        self.seed_startup(); old = dict(self.w.startup); original = TT.os.fdopen
+        inode = source.stat().st_ino
+        class ShortRead:
+            def __init__(self, stream): self.stream = stream
+            def __enter__(self): return self
+            def __exit__(self, *args): return self.stream.__exit__(*args)
+            def fileno(self): return self.stream.fileno()
+            def read(self, size): return self.stream.read(size)[:-1]
+        def wrap(fd, mode, *args, **kwargs):
+            stream = original(fd, mode, *args, **kwargs)
+            return ShortRead(stream) if mode == 'rb' and os.fstat(fd).st_ino == inode else stream
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(source)]), mock.patch.object(TT.os, 'fdopen', side_effect=wrap), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+            self.assertFalse(self.w.check_startup())
+        self.assertEqual(self.w.startup, old)
+        self.assertEqual(self.w.collection_health['startup']['error'], 'startup-read')
+        self.assertEqual(self.w.collection_health['crontab']['status'], 'ok')
+        source.write_bytes(b'')
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(source)]), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+            self.assertTrue(self.w.check_startup())
+        self.assertEqual(self.w.startup[str(source)], TT.hashlib.sha256(b'').hexdigest())
+
+    def test_db_fallback_write_failure_preserves_both_errors_and_old_file(self):
+        self.seed_listener(); self.w.save(); page = self.root / 'tattletale-data.js'; prior = page.read_bytes()
+        self.w.dirty_listeners[KEY] = T1
+        self.w.db.execute("CREATE TRIGGER reject_flush BEFORE UPDATE ON listeners BEGIN SELECT RAISE(ABORT,'public original db failure'); END")
+        write_error = OSError('public replacement failure')
+        with mock.patch.object(TT.os, 'replace', side_effect=write_error):
+            with self.assertRaises(sqlite3.IntegrityError) as caught: self.w.save()
+        self.assertEqual(str(caught.exception), 'public original db failure')
+        self.assertIs(caught.exception.__cause__, write_error)
+        self.assertEqual(page.read_bytes(), prior); self.assertEqual(self.w.dirty_listeners, {KEY: T1})
+        self.assertEqual(self.w.publication_health['error'], 'collection-io')
+        self.assertEqual(self.w.publication_health['lastSuccess'], T0)
+
+    def test_reader_fdopen_failure_closes_owned_descriptor_and_rejects_fs(self):
+        source = self.root / 'public'; source.write_bytes(b'public source')
+        original = TT.os.fdopen; inode = source.stat().st_ino; owned = []
+        def fail(fd, mode, *args, **kwargs):
+            if mode == 'rb' and os.fstat(fd).st_ino == inode:
+                owned.append(fd); raise OSError('synthetic fdopen construction failure')
+            return original(fd, mode, *args, **kwargs)
+        self.seed_startup(); before = dict(self.w.startup)
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(source)]), mock.patch.object(TT.os, 'fdopen', side_effect=fail), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+            self.assertFalse(self.w.check_startup())
+        self.assertEqual(self.w.startup, before); self.assertEqual(len(owned), 1)
+        with self.assertRaises(OSError): os.fstat(owned[0])
+        self.assertEqual(self.w.collection_health['crontab']['status'], 'ok')
+
+    def test_closed_or_active_projection_state_is_fatal_without_publishing_cache(self):
+        for state in ['closed', 'active']:
+            writer = TT.Watch(str(self.root / (state + '.log')), str(self.root / (state + '.db')), notify=False)
+            self.addCleanup(writer.db.close); writer.load_state(); writer.save()
+            output = self.root / 'tattletale-data.js'; before = output.read_bytes()
+            original_error = sqlite3.OperationalError('synthetic projection original')
+            def failed_projection():
+                if state == 'closed': writer.db.close()
+                else: writer.db.execute('BEGIN')
+                raise original_error
+            with mock.patch.object(writer, 'page_map', side_effect=failed_projection):
+                with self.assertRaises(TT.FatalDatabaseError) as caught: writer.save()
+            self.assertIs(caught.exception.__cause__, original_error)
+            self.assertEqual(output.read_bytes(), before)
+            with self.assertRaises(sqlite3.ProgrammingError): writer.db.execute('SELECT 1')
+
+    def test_pid_fdopen_failure_preserves_file_and_closes_owned_descriptor(self):
+        path = self.root / 'tattletale.pid'; path.write_text('43\n')
+        original = TT.os.fdopen; inode = path.stat().st_ino; owned = []
+        def fail(fd, mode, *args, **kwargs):
+            if mode == 'rb' and os.fstat(fd).st_ino == inode:
+                owned.append(fd); raise OSError('synthetic PID fdopen failure')
+            return original(fd, mode, *args, **kwargs)
+        with mock.patch.object(TT.os, 'fdopen', side_effect=fail):
             with self.assertRaises(SystemExit): self.w.claim_pid_file()
-            self.assertEqual(path.read_text(), value)
+        self.assertEqual(path.read_text(), '43\n'); self.assertEqual(len(owned), 1)
+        with self.assertRaises(OSError): os.fstat(owned[0])
 
 
 def scope_case(case):
@@ -1026,7 +1363,8 @@ def parity_snapshots():
         return {'fixtureVersion': FIXTURE['fixtureVersion'],
                 'scopes': [{'host': c['host'], 'actual': TT.bind_scope(c['host'])} for c in FIXTURE['scopeCases']],
                 'commands': command_results, 'snapshots': snapshots,
-                'startupTransitions': startup_transition_snapshots()}
+                'startupTransitions': startup_transition_snapshots(),
+                'repairResults': repair_snapshots()}
     finally:
         case.doCleanups()
 
@@ -1097,3 +1435,222 @@ def startup_transition_snapshots():
         return snapshots
     finally:
         case.doCleanups()
+
+
+@contextlib.contextmanager
+def logical_startup_source(step):
+    """Inject metadata/descriptors, not inventories, into the real checked reader."""
+    entries = {entry['path']: entry for entry in step['entries']}
+    failure = step['sourceFailure']
+    real_lstat, real_stat = TT.os.lstat, TT.os.stat
+    real_open, real_fdopen, real_fstat, real_readlink = TT.os.open, TT.os.fdopen, TT.os.fstat, TT.os.readlink
+    real_listdir = TT.os.listdir
+    handles = {}
+    def metadata(path, mode, size=0):
+        return types.SimpleNamespace(st_dev=1, st_ino=100 + sorted(entries).index(path) if path in entries else 1,
+                                     st_mode=mode, st_size=size, st_mtime_ns=0, st_ctime_ns=0)
+    def lstat(path, *args, **kwargs):
+        path = str(path)
+        if path == '/fixture':
+            return metadata(path, TT.stat.S_IFLNK if failure == 'ancestor-broken-link' else TT.stat.S_IFDIR)
+        if not path.startswith('/fixture/'): return real_lstat(path, *args, **kwargs)
+        if failure == 'ancestor-permission': raise PermissionError('synthetic source ancestor')
+        if failure == 'transient-io': raise OSError(5, 'synthetic source I/O')
+        if failure in ('ancestor-broken-link', 'listed-disappeared'): raise FileNotFoundError('synthetic missing metadata')
+        if path not in entries: raise FileNotFoundError('synthetic optional absence')
+        entry = entries[path]; state = entry['state']
+        mode = {'regular': TT.stat.S_IFREG, 'permission-denied': TT.stat.S_IFREG,
+                'directory': TT.stat.S_IFDIR, 'fifo': TT.stat.S_IFIFO,
+                'socket': TT.stat.S_IFSOCK, 'device': TT.stat.S_IFCHR,
+                'symlink-loop': TT.stat.S_IFLNK, 'dangling-link': TT.stat.S_IFLNK,
+                'file-too-large': TT.stat.S_IFREG}[state]
+        data = (entry['text'] or '').encode()
+        return metadata(path, mode | 0o600, TT.STARTUP_MAX_BYTES + 1 if state == 'file-too-large' else len(data))
+    def stat(path, *args, **kwargs):
+        if str(path) == '/fixture':
+            if failure == 'ancestor-broken-link': raise FileNotFoundError('synthetic broken ancestor')
+            return metadata('/fixture', TT.stat.S_IFDIR)
+        if str(path).startswith('/fixture/'): return lstat(path)
+        return real_stat(path, *args, **kwargs)
+    def readlink(path, *args, **kwargs):
+        if str(path) in entries:
+            return str(path) if entries[str(path)]['state'] == 'symlink-loop' else '/fixture/missing-target'
+        return real_readlink(path, *args, **kwargs)
+    def open_fd(path, flags, *args, **kwargs):
+        if str(path) not in entries: return real_open(path, flags, *args, **kwargs)
+        entry = entries[str(path)]
+        if entry['state'] == 'permission-denied': raise PermissionError('synthetic regular permission')
+        if entry['state'] != 'regular': raise AssertionError('nonregular logical entry was opened')
+        if not flags & TT.os.O_NONBLOCK or not flags & TT.os.O_NOFOLLOW:
+            raise AssertionError('checked logical reader omitted nonblocking/nofollow')
+        descriptor = -1000 - len(handles); handles[descriptor] = str(path)
+        return descriptor
+    class Stream:
+        def __init__(self, descriptor): self.descriptor = descriptor
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def fileno(self): return self.descriptor
+        def read(self, size): return entries[handles[self.descriptor]]['text'].encode()[:size]
+    def fdopen(descriptor, *args, **kwargs):
+        return Stream(descriptor) if descriptor in handles else real_fdopen(descriptor, *args, **kwargs)
+    def fstat(descriptor, *args, **kwargs):
+        return lstat(handles[descriptor]) if descriptor in handles else real_fstat(descriptor, *args, **kwargs)
+    def listdir(path):
+        return ['gone'] if str(path) == '/fixture/agents' else real_listdir(path)
+    paths = list(entries) if not failure else ['/fixture/entry']
+    with contextlib.ExitStack() as stack:
+        for name, fake in [('lstat', lstat), ('stat', stat), ('readlink', readlink), ('open', open_fd),
+                           ('fdopen', fdopen), ('fstat', fstat), ('listdir', listdir)]:
+            stack.enter_context(mock.patch.object(TT.os, name, side_effect=fake))
+        stack.enter_context(mock.patch.object(TT, 'STARTUP_DIRS', ['/fixture/agents'] if failure == 'listed-disappeared' else []))
+        stack.enter_context(mock.patch.object(TT, 'STARTUP_FILES', [] if failure == 'listed-disappeared' else paths))
+        yield
+
+
+def repair_snapshots(selected=None):
+    """Frozen inputs enter real collection/save/PID methods; capture actual state."""
+    assert FIXTURE['fixtureVersion'] == 2 and len(FIXTURE['repairCases']) == 9
+    results = []
+    specs = FIXTURE['repairCases'] if selected is None else [selected]
+    for specification in specs:
+        case = CollectionHealthTests('test_failed_empty_lsof_preserves_real_inventory'); case.setUp()
+        try:
+            w = case.w
+            if specification['kind'] == 'publication-no-cache':
+                w = TT.Watch(str(case.root / 'no-load.log'), str(case.root / 'no-load.db'), notify=False)
+                case.addCleanup(w.db.close)
+            store = {}
+            def configure(writer):
+                writer.snap_dir = '/fixture/copies'
+                def retain(path, digest, data=None):
+                    if data is None or digest.startswith('unreadable: '): return None
+                    data = data if path == 'crontab -l' else data[:4 * 1024 * 1024]
+                    dest = '/fixture/copies/' + TT.Watch.safe_name(path) + '/' + digest[:16]
+                    if dest in store and store[dest] != data: raise OSError('synthetic immutable copy collision')
+                    store[dest] = bytes(data)
+                    return dest
+                writer.keep_copy = retain
+            configure(w)
+            if specification['kind'].startswith('publication'):
+                w.db.execute('INSERT INTO programs(exe,first_seen,last_seen,user,first_pid,first_args,parent) VALUES(?,?,?,?,?,?,?)',
+                             ('/fixture/program', T0, T0, 'fixture', 42, '', '?'))
+            states = []
+            for step in specification['steps']:
+                with mock.patch.object(TT, 'now', return_value=step['at']):
+                    operation = step['op']
+                    if operation == 'pid':
+                        pidfile = case.root / 'tattletale.pid'; pidfile.write_text('43\n')
+                        command = step['command']; classification = None
+                        with case.commands({('ps', '-p', '43', '-o', 'command='): (command['code'], command['out'], command['err'])}), mock.patch.object(TT.os, 'getpid', return_value=4242):
+                            try: w.claim_pid_file()
+                            except SystemExit as error:
+                                classification = 'watcher' if 'already running as pid' in str(error) else 'unknown'
+                            else:
+                                case.assertEqual(pidfile.read_text(), '4242\n')
+                                classification = 'absent' if command['code'] == 1 else 'other'
+                        states.append(dict(name=step['name'], classification=classification))
+                        continue
+                    if operation.startswith('startup'):
+                        if 'sql' in step: w.db.execute(step['sql'])
+                        real_open = open
+                        def logical_open(path, mode='r', *args, **kwargs):
+                            if isinstance(path, str) and path in store and mode == 'rb': return io.BytesIO(store[path])
+                            return real_open(path, mode, *args, **kwargs)
+                        cron = step['cron']
+                        with logical_startup_source(step), case.commands({CRON: (cron['code'], cron['out'], cron['err'])}), mock.patch('builtins.open', side_effect=logical_open):
+                            w.check_startup()
+                    elif operation == 'listeners':
+                        command = step['command']
+                        with case.commands({LSOF: (command['code'], command['out'], command['err'])}): w.check_listeners()
+                    elif operation == 'load': w.load_state()
+                    elif operation == 'restart-load':
+                        db_path, log_path = w.db_path, w.log_path; w.db.close()
+                        w = TT.Watch(log_path, db_path, notify=False); case.addCleanup(w.db.close); configure(w); w.load_state()
+                    elif operation in ('save', 'save-without-load'):
+                        if step['dirtyTime'] is not None: w.dirty_progs['/fixture/program'] = step['dirtyTime']
+                        fault = step['fault']; patches = contextlib.ExitStack()
+                        try:
+                            if fault == 'flush-abort':
+                                w.db.execute("CREATE TRIGGER fixture_flush BEFORE UPDATE ON programs BEGIN SELECT RAISE(ABORT,'fixture-flush'); END")
+                            elif fault == 'projection-db':
+                                patches.enter_context(mock.patch.object(w, 'page_map', side_effect=sqlite3.OperationalError('fixture projection failure')))
+                            elif fault == 'atomic-write-io':
+                                patches.enter_context(mock.patch.object(TT.os, 'replace', side_effect=OSError('fixture atomic failure')))
+                            try: w.save()
+                            except (sqlite3.Error, OSError):
+                                if fault is None: raise
+                            else:
+                                if fault is not None: case.fail('injected save fault unexpectedly returned success')
+                        finally:
+                            patches.close()
+                            if fault == 'flush-abort': w.db.execute('DROP TRIGGER fixture_flush')
+                    else: raise AssertionError('unsupported frozen operation: ' + operation)
+                    with TT.lock: page = w.page_map()
+                    published = None; js = pathlib.Path(w.data_dir) / 'tattletale-data.js'
+                    if js.exists():
+                        text = js.read_text(); payload = json.loads(text[len('window.TATTLETALE = '):-2])
+                        published = {key: payload[key] for key in ['formatVersion', 'generatedAt', 'version', 'collectionHealth',
+                                                                   'publicationHealth', 'inventoryAsOf', 'map']}
+                    states.append(dict(name=step['name'], collectionHealth=copy.deepcopy(w.collection_health),
+                                       publicationHealth=dict(w.publication_health), inventoryAsOf=w._inventory_as_of,
+                                       map=page, events=[dict(time=r[0],kind=r[1],message=r[2]) for r in
+                                                        w.db.execute('SELECT time,kind,message FROM events ORDER BY id')],
+                                       startupMirror=dict(w.startup), baselines=dict(w.baseline), dirtyPrograms=dict(w.dirty_progs),
+                                       dirtyListeners=dict(w.dirty_listeners), startupVersions=[dict(path=r[0],hash=r[1],copyPath=r[2],seenAt=r[3]) for r in
+                                        w.db.execute('SELECT path,hash,copy_path,seen_at FROM startup_versions ORDER BY id')],
+                                       copies=[dict(path=p,hex=data.hex()) for p,data in sorted(store.items())], published=published))
+            results.append(dict(name=specification['name'], kind=specification['kind'], states=states))
+        finally: case.doCleanups()
+    return results
+
+
+def repair_case(specification):
+    def test(self):
+        result = repair_snapshots(specification)[0]; states = result['states']; name = specification['name']
+        self.assertEqual([s['name'] for s in states], [s['name'] for s in specification['steps']])
+        if name == 'finalEntryStates':
+            markers = ['directory', 'permission-denied', 'not-a-regular-file', 'not-a-regular-file',
+                       'not-a-regular-file', 'symlink-loop', 'dangling-link', 'file-too-large']
+            for state, marker in zip(states[1:], markers):
+                self.assertEqual(state['map']['startup']['/fixture/entry'], 'unreadable: ' + marker)
+                self.assertIn('/fixture/peer', state['map']['startup'])
+                self.assertEqual(state['collectionHealth']['startup']['error'], 'startup-unreadable')
+                self.assertEqual(state['collectionHealth']['crontab']['status'], 'ok')
+        elif name == 'ancestorRetention':
+            for state in states[1:-1]:
+                self.assertEqual(state['map'], states[0]['map'])
+                self.assertEqual(state['collectionHealth']['startup']['error'], 'startup-read')
+                self.assertEqual(state['collectionHealth']['crontab']['status'], 'ok')
+        elif name in ('readabilitySame', 'readabilityChanged'):
+            events = [event for event in states[-1]['events'] if event['kind'] == 'STARTUP~']
+            self.assertEqual(len(events), 0 if name == 'readabilitySame' else 1)
+            if events:
+                self.assertIn('-A\n+B', events[0]['message']); self.assertNotIn('before: None', events[0]['message'])
+        elif name == 'warningNotes':
+            self.assertEqual([e['message'] for e in states[-1]['events'] if e['kind'] == 'NOTE'],
+                             ['listeners collection degraded: lsof-warning'] * 3)
+        elif name == 'automaticRollback':
+            for field in ['map', 'events', 'startupMirror', 'baselines', 'startupVersions']:
+                self.assertEqual(states[1][field], states[0][field])
+            self.assertEqual(states[1]['collectionHealth']['startup']['error'], 'collection-db')
+            self.assertEqual(states[2]['collectionHealth']['startup']['status'], 'ok')
+        elif name == 'publicationRecovery':
+            for state in states[2:4]:
+                self.assertEqual(state['published']['map'], states[1]['map'])
+                self.assertEqual(state['publicationHealth']['lastSuccess'], states[1]['publicationHealth']['lastSuccess'])
+                self.assertTrue(state['dirtyPrograms'])
+            self.assertEqual(states[4]['dirtyPrograms'], {})
+            self.assertEqual(states[6]['published'], states[5]['published'])
+            self.assertEqual(states[6]['publicationHealth']['error'], 'collection-io')
+            self.assertEqual(states[8]['publicationHealth']['status'], 'unknown')
+            self.assertEqual(states[8]['inventoryAsOf'], specification['steps'][8]['at'])
+        elif name == 'publicationNoCache':
+            self.assertIsNone(states[0]['published']); self.assertIsNone(states[0]['inventoryAsOf'])
+            self.assertEqual(states[0]['baselines'], {}); self.assertTrue(states[0]['dirtyPrograms'])
+        elif name == 'pidFraming':
+            self.assertEqual([s['classification'] for s in states], ['other'] * 8 + ['watcher','absent','unknown','unknown','other','other'])
+    return test
+
+
+for _i, _specification in enumerate(FIXTURE.get('repairCases', [])):
+    setattr(CollectionHealthTests, 'test_repair_family_%02d' % _i, repair_case(_specification))

@@ -1,5 +1,5 @@
 {
-  "fixtureVersion": 1,
+  "fixtureVersion": 2,
   "clock": "2000-01-01T00:00:00Z",
   "scopeCases": [
     {
@@ -186,6 +186,863 @@
       "out": "",
       "err": "crontab: no crontab for fixture\nwarning\n",
       "expected": "degraded"
+    }
+  ],
+  "repairCases": [
+    {
+      "name": "finalEntryStates",
+      "kind": "startup",
+      "steps": [
+        {
+          "name": "regular",
+          "at": "2000-01-01T01:00:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "regular",
+              "text": "A\n"
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "directory",
+          "at": "2000-01-01T01:01:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "directory",
+              "text": null
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "permission-denied",
+          "at": "2000-01-01T01:02:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "permission-denied",
+              "text": null
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "fifo",
+          "at": "2000-01-01T01:03:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "fifo",
+              "text": null
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "socket",
+          "at": "2000-01-01T01:04:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "socket",
+              "text": null
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "device",
+          "at": "2000-01-01T01:05:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "device",
+              "text": null
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "symlink-loop",
+          "at": "2000-01-01T01:06:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "symlink-loop",
+              "text": null
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "dangling-link",
+          "at": "2000-01-01T01:07:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "dangling-link",
+              "text": null
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "file-too-large",
+          "at": "2000-01-01T01:07:30Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "file-too-large",
+              "text": null
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "ancestorRetention",
+      "kind": "startup",
+      "steps": [
+        {
+          "name": "baseline",
+          "at": "2000-01-01T01:08:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "regular",
+              "text": "A\n"
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "ancestor-permission",
+          "at": "2000-01-01T01:09:00Z",
+          "op": "startup",
+          "entries": [],
+          "sourceFailure": "ancestor-permission",
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "ancestor-broken-link",
+          "at": "2000-01-01T01:10:00Z",
+          "op": "startup",
+          "entries": [],
+          "sourceFailure": "ancestor-broken-link",
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "listed-disappeared",
+          "at": "2000-01-01T01:11:00Z",
+          "op": "startup",
+          "entries": [],
+          "sourceFailure": "listed-disappeared",
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "transient-io",
+          "at": "2000-01-01T01:12:00Z",
+          "op": "startup",
+          "entries": [],
+          "sourceFailure": "transient-io",
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "recovered",
+          "at": "2000-01-01T01:13:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "regular",
+              "text": "B\n"
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "readabilitySame",
+      "kind": "startup",
+      "steps": [
+        {
+          "name": "baseline",
+          "at": "2000-01-01T01:14:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "regular",
+              "text": "A\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 1,
+            "out": "",
+            "err": "no crontab for fixture\n"
+          }
+        },
+        {
+          "name": "unreadable",
+          "at": "2000-01-01T01:15:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "permission-denied",
+              "text": null
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 1,
+            "out": "",
+            "err": "no crontab for fixture\n"
+          }
+        },
+        {
+          "name": "repeated",
+          "at": "2000-01-01T01:16:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "permission-denied",
+              "text": null
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 1,
+            "out": "",
+            "err": "no crontab for fixture\n"
+          }
+        },
+        {
+          "name": "readable",
+          "at": "2000-01-01T01:17:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "regular",
+              "text": "A\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 1,
+            "out": "",
+            "err": "no crontab for fixture\n"
+          }
+        },
+        {
+          "name": "removed",
+          "at": "2000-01-01T01:18:00Z",
+          "op": "startup",
+          "entries": [],
+          "sourceFailure": null,
+          "cron": {
+            "code": 1,
+            "out": "",
+            "err": "no crontab for fixture\n"
+          }
+        }
+      ]
+    },
+    {
+      "name": "readabilityChanged",
+      "kind": "startup",
+      "steps": [
+        {
+          "name": "baseline",
+          "at": "2000-01-01T01:19:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "regular",
+              "text": "A\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 1,
+            "out": "",
+            "err": "no crontab for fixture\n"
+          }
+        },
+        {
+          "name": "unreadable",
+          "at": "2000-01-01T01:20:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "permission-denied",
+              "text": null
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 1,
+            "out": "",
+            "err": "no crontab for fixture\n"
+          }
+        },
+        {
+          "name": "repeated",
+          "at": "2000-01-01T01:21:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "permission-denied",
+              "text": null
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 1,
+            "out": "",
+            "err": "no crontab for fixture\n"
+          }
+        },
+        {
+          "name": "readable",
+          "at": "2000-01-01T01:22:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "regular",
+              "text": "B\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 1,
+            "out": "",
+            "err": "no crontab for fixture\n"
+          }
+        },
+        {
+          "name": "removed",
+          "at": "2000-01-01T01:23:00Z",
+          "op": "startup",
+          "entries": [],
+          "sourceFailure": null,
+          "cron": {
+            "code": 1,
+            "out": "",
+            "err": "no crontab for fixture\n"
+          }
+        }
+      ]
+    },
+    {
+      "name": "warningNotes",
+      "kind": "listeners",
+      "steps": [
+        {
+          "name": "baseline",
+          "at": "2000-01-01T01:24:00Z",
+          "op": "listeners",
+          "command": {
+            "code": 0,
+            "out": "",
+            "err": ""
+          }
+        },
+        {
+          "name": "warning",
+          "at": "2000-01-01T01:25:00Z",
+          "op": "listeners",
+          "command": {
+            "code": 0,
+            "out": "",
+            "err": "warning"
+          }
+        },
+        {
+          "name": "repeated",
+          "at": "2000-01-01T01:26:00Z",
+          "op": "listeners",
+          "command": {
+            "code": 0,
+            "out": "",
+            "err": "warning"
+          }
+        },
+        {
+          "name": "otherFailure",
+          "at": "2000-01-01T01:27:00Z",
+          "op": "listeners",
+          "command": {
+            "code": 7,
+            "out": "",
+            "err": ""
+          }
+        },
+        {
+          "name": "warningAgain",
+          "at": "2000-01-01T01:28:00Z",
+          "op": "listeners",
+          "command": {
+            "code": 0,
+            "out": "",
+            "err": "warning"
+          }
+        },
+        {
+          "name": "recovered",
+          "at": "2000-01-01T01:29:00Z",
+          "op": "listeners",
+          "command": {
+            "code": 0,
+            "out": "",
+            "err": ""
+          }
+        },
+        {
+          "name": "afterRecoveryWarning",
+          "at": "2000-01-01T01:30:00Z",
+          "op": "listeners",
+          "command": {
+            "code": 0,
+            "out": "",
+            "err": "warning"
+          }
+        }
+      ]
+    },
+    {
+      "name": "automaticRollback",
+      "kind": "rollback",
+      "steps": [
+        {
+          "name": "baseline",
+          "at": "2000-01-01T01:31:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "regular",
+              "text": "A\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 1,
+            "out": "",
+            "err": "no crontab for fixture\n"
+          }
+        },
+        {
+          "name": "rolledBack",
+          "at": "2000-01-01T01:32:00Z",
+          "op": "startup-rollback",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "regular",
+              "text": "B\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 1,
+            "out": "",
+            "err": "no crontab for fixture\n"
+          },
+          "sql": "CREATE TRIGGER fixture_auto_rollback BEFORE INSERT ON startup_items BEGIN SELECT RAISE(ROLLBACK,'fixture-original'); END"
+        },
+        {
+          "name": "recovered",
+          "at": "2000-01-01T01:33:00Z",
+          "op": "startup-drop-trigger",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "regular",
+              "text": "B\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 1,
+            "out": "",
+            "err": "no crontab for fixture\n"
+          },
+          "sql": "DROP TRIGGER fixture_auto_rollback"
+        }
+      ]
+    },
+    {
+      "name": "publicationRecovery",
+      "kind": "publication",
+      "steps": [
+        {
+          "name": "loaded",
+          "at": "2000-01-01T01:34:00Z",
+          "op": "load"
+        },
+        {
+          "name": "published",
+          "at": "2000-01-01T01:35:00Z",
+          "op": "save",
+          "fault": null,
+          "dirtyTime": null
+        },
+        {
+          "name": "flushFailed",
+          "at": "2000-01-01T01:36:00Z",
+          "op": "save",
+          "fault": "flush-abort",
+          "dirtyTime": "2000-01-01T02:00:00Z"
+        },
+        {
+          "name": "flushRepeated",
+          "at": "2000-01-01T01:37:00Z",
+          "op": "save",
+          "fault": "flush-abort",
+          "dirtyTime": null
+        },
+        {
+          "name": "projectionFailed",
+          "at": "2000-01-01T01:38:00Z",
+          "op": "save",
+          "fault": "projection-db",
+          "dirtyTime": null
+        },
+        {
+          "name": "recovered",
+          "at": "2000-01-01T01:39:00Z",
+          "op": "save",
+          "fault": null,
+          "dirtyTime": null
+        },
+        {
+          "name": "writeFailed",
+          "at": "2000-01-01T01:40:00Z",
+          "op": "save",
+          "fault": "atomic-write-io",
+          "dirtyTime": "2000-01-01T02:01:00Z"
+        },
+        {
+          "name": "writeRecovered",
+          "at": "2000-01-01T01:41:00Z",
+          "op": "save",
+          "fault": null,
+          "dirtyTime": null
+        },
+        {
+          "name": "restarted",
+          "at": "2000-01-01T01:42:00Z",
+          "op": "restart-load"
+        }
+      ]
+    },
+    {
+      "name": "publicationNoCache",
+      "kind": "publication-no-cache",
+      "steps": [
+        {
+          "name": "failed",
+          "at": "2000-01-01T01:43:00Z",
+          "op": "save-without-load",
+          "fault": "flush-abort",
+          "dirtyTime": "2000-01-01T02:00:00Z"
+        }
+      ]
+    },
+    {
+      "name": "pidFraming",
+      "kind": "pid",
+      "steps": [
+        {
+          "name": "nel",
+          "at": "2000-01-01T01:44:00Z",
+          "op": "pid",
+          "command": {
+            "code": 0,
+            "out": "/fixture/other --arg=a\u0085b\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "lineSeparator",
+          "at": "2000-01-01T01:45:00Z",
+          "op": "pid",
+          "command": {
+            "code": 0,
+            "out": "/fixture/other --arg=a\u2028b\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "paragraphSeparator",
+          "at": "2000-01-01T01:46:00Z",
+          "op": "pid",
+          "command": {
+            "code": 0,
+            "out": "/fixture/other --arg=a\u2029b\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "verticalTab",
+          "at": "2000-01-01T01:47:00Z",
+          "op": "pid",
+          "command": {
+            "code": 0,
+            "out": "/fixture/other --arg=a\u000bb\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "formFeed",
+          "at": "2000-01-01T01:48:00Z",
+          "op": "pid",
+          "command": {
+            "code": 0,
+            "out": "/fixture/other --arg=a\fb\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "fileSeparator",
+          "at": "2000-01-01T01:49:00Z",
+          "op": "pid",
+          "command": {
+            "code": 0,
+            "out": "/fixture/other --arg=a\u001cb\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "groupSeparator",
+          "at": "2000-01-01T01:50:00Z",
+          "op": "pid",
+          "command": {
+            "code": 0,
+            "out": "/fixture/other --arg=a\u001db\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "recordSeparator",
+          "at": "2000-01-01T01:51:00Z",
+          "op": "pid",
+          "command": {
+            "code": 0,
+            "out": "/fixture/other --arg=a\u001eb\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "watcher",
+          "at": "2000-01-01T01:52:00Z",
+          "op": "pid",
+          "command": {
+            "code": 0,
+            "out": "python tattletale.py --fixture\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "absent",
+          "at": "2000-01-01T01:53:00Z",
+          "op": "pid",
+          "command": {
+            "code": 1,
+            "out": "",
+            "err": ""
+          }
+        },
+        {
+          "name": "uncertain",
+          "at": "2000-01-01T01:54:00Z",
+          "op": "pid",
+          "command": {
+            "code": 7,
+            "out": "",
+            "err": ""
+          }
+        },
+        {
+          "name": "twoLines",
+          "at": "2000-01-01T01:55:00Z",
+          "op": "pid",
+          "command": {
+            "code": 0,
+            "out": "/fixture/other\n/fixture/other\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "crlfTransport",
+          "at": "2000-01-01T01:56:00Z",
+          "op": "pid",
+          "command": {
+            "code": 0,
+            "out": "/fixture/other --synthetic\r\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "crTransport",
+          "at": "2000-01-01T01:57:00Z",
+          "op": "pid",
+          "command": {
+            "code": 0,
+            "out": "/fixture/other --synthetic\r",
+            "err": ""
+          }
+        }
+      ]
     }
   ]
 }

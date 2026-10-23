@@ -30,6 +30,21 @@ The page preserves the last fully accepted file's inventory, health and update t
 a persistent refresh error, and names degraded/unknown checks alongside Live or Stale.
 Unknown may include a first attempt in flight with a non-null attempt time.
 
+Separate `publicationHealth` describes database/page saves, with `inventoryAsOf` dating
+the last complete database projection. A recoverable save failure can publish that cached
+inventory with current collector health and a degraded publication warning; it does not
+invent empty data or advance publication success. Failed atomic replacement keeps the old
+file and prior success. Both additive fields are compatible with older format-2 payloads
+when absent together; malformed present fields are shown as incomplete.
+
+Final startup directories/nonregular entries/loops and regular files over 16 MiB have
+explicit unreadable markers. Accepted regular files are fully hashed through 16 MiB;
+saved copies remain capped at 4 MiB. Readability flaps alone are not content changes;
+recovery to changed bytes compares with the last readable copy. Strict UTF-8 crontab output
+is deliberate: undecodable bytes degrade that partition with `collection-parse` and retain
+its prior inventory. Sound connections recover after proven automatic SQLite rollback;
+unknown disposition remains fatal.
+
 Run the Java fixture check from the repository root with JAVA_HOME pointing to JDK 25:
 
 ```sh

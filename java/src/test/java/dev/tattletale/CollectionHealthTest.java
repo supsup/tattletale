@@ -101,7 +101,7 @@ public final class CollectionHealthTest {
             test("command-policy-"+commands.size(),()->check(actual.equals(c.get("expected")),"command policy "+actual));
             commands.add(Map.of("tool",tool,"code",r.code(),"out",r.out(),"err",r.err(),"actual",actual));
         }
-        parity.put("fixtureVersion",1);parity.put("scopes",scopes);parity.put("commands",commands);
+        parity.put("fixtureVersion",2);parity.put("scopes",scopes);parity.put("commands",commands);
         test("initial-epoch-health",()->{try(Fixture f=new Fixture()) {for(String k:CollectionHealth.KEYS) {status(f.w,k,"unknown");check(health(f.w,k).get("lastAttempt")==null,"initial attempt");}}});
         test("listener-failure-partial-recovery",()->{try(Fixture f=new Fixture()) {
             f.seed();f.fake.lsof=new Proc.Result(0,"p42\ncfixture\nn127.0.0.1:12345\n","");f.w.checkListeners();status(f.w,"listeners","ok");
@@ -146,17 +146,12 @@ public final class CollectionHealthTest {
         test("atomic-copy-compares-existing",()->{Path dir=Files.createDirectory(root.resolve("atomic-copy"));Watch.Sources source=Proc::run;Path dest=dir.resolve("copy");byte[] value="complete".getBytes(StandardCharsets.UTF_8);source.copy(dest.toString(),value);source.copy(dest.toString(),value);check(Arrays.equals(Files.readAllBytes(dest),value),"atomic publish bytes");Files.writeString(dest,"partial");boolean rejected=false;try{source.copy(dest.toString(),value);}catch(IOException e){rejected=true;}check(rejected && Files.readString(dest).equals("partial"),"bad existing copy accepted/overwritten");});
         test("deferred-commit-failure-rolls-back",()->{try(Fixture f=new Fixture()){f.w.db.exec("PRAGMA foreign_keys=ON;\nCREATE TABLE fixture_parent(id INTEGER PRIMARY KEY);\nCREATE TABLE fixture_child(id INTEGER REFERENCES fixture_parent(id) DEFERRABLE INITIALLY DEFERRED);\nCREATE TRIGGER fail_commit AFTER INSERT ON programs BEGIN INSERT INTO fixture_child VALUES(42); END;");f.w.checkProcesses();status(f.w,"processes","degraded");check(f.w.knownProgs.isEmpty() && f.w.identQ.isEmpty() && f.w.prevPids==null && count(f.w,"BASELINE")==0,"commit failure adopted state");check(Db.asLong(f.w.db.scalar("SELECT count(*) FROM programs;"))==0 && Db.asLong(f.w.db.scalar("SELECT count(*) FROM fixture_child;"))==0,"failed COMMIT not rolled back");f.w.db.exec("DROP TRIGGER fail_commit;");f.w.checkProcesses();status(f.w,"processes","ok");}});
         test("stable-comm-path-with-spaces",()->{try(Fixture f=new Fixture()){String exe="/fixture/Example App.app/service",key=exe+" 127.0.0.1:12345";f.w.db.exec(Db.bind("INSERT INTO listeners(key,exe,address,port,command,pid,present,exposed) VALUES (?,?,?,?,?,?,?,?)",key,exe,"127.0.0.1",12345,"fixture",99,1,0));f.w.loadState();f.fake.lookup=new Proc.Result(0,exe+"\n","");f.fake.lsof=new Proc.Result(0,"p99\ncfixture\nn127.0.0.1:12345\n","");f.w.checkListeners();status(f.w,"listeners","ok");check(f.w.listeners.size()==1 && f.w.listeners.get(key).present && count(f.w,"UNLISTEN")==0,"space-containing executable key changed");}});
-        test("rollback-failure-closes-preserves-original",()->{try(Fixture f=new Fixture()) {
+        test("automatic-rollback-preserves-original-and-recovers",()->{try(Fixture f=new Fixture()) {
             f.w.db.exec("CREATE TABLE fixture_abort(id INTEGER);\nCREATE TRIGGER rollback_fixture BEFORE INSERT ON fixture_abort BEGIN SELECT RAISE(ROLLBACK,'original-fixture-error'); END;");
-            Db.DbException original=null;
-            try {f.w.db.transaction(List.of("INSERT INTO fixture_abort VALUES(1);"));}
-            catch(Db.Fatal e) {original=(Db.DbException)e.getCause();}
-            check(original!=null && original.getMessage().contains("original-fixture-error"),"original transaction exception lost");
-            boolean closed=false;
-            try {f.w.db.exec("SELECT 1;");} catch(Db.Fatal e) {closed=e.getCause().getMessage().equals("Cannot operate on a closed database.");}
-            check(closed,"connection remained usable after failed ROLLBACK");
-            boolean fatal=false;try{f.w.checkProcesses();}catch(Db.Fatal e){fatal=true;}check(fatal,"closed DB continued");
-            check(f.w.knownProgs.isEmpty() && f.w.identQ.isEmpty() && f.w.prevPids==null,"closed connection adopted later sample");
+            Db.DbException original=null;try{f.w.db.transaction(List.of("INSERT INTO fixture_abort VALUES(1);"));}catch(Db.DbException e){original=e;}
+            check(original!=null && original.getMessage().contains("original-fixture-error") && original.getSuppressed().length==1,"original/full rollback error lost");
+            check(Db.asLong(f.w.db.scalar("SELECT count(*) FROM fixture_abort;"))==0,"rollback left rows");
+            f.w.checkProcesses();status(f.w,"processes","ok");check(!f.w.knownProgs.isEmpty(),"reusable handle falsely fatal");
         }});
         test("cross-language-result-policy-edges",()->{try(Fixture f=new Fixture()) {
             f.fake.lsof=new Proc.Result(0,"p42\ncfixture\nfbad\nn127.0.0.1:12345\n","");f.w.checkListeners();status(f.w,"listeners","degraded");check(f.w.listeners.isEmpty(),"nonnumeric descriptor adopted");
@@ -187,6 +182,8 @@ public final class CollectionHealthTest {
             parity.put("snapshots",snapshots);
         }});
         RepairHealthTest.run();
+        RoundThreeTest.run();
+        RepairParityTest.run(shared);
         if(parityPath!=null) Files.writeString(parityPath,Json.write(parity)+"\n");
         StringBuilder x=new StringBuilder("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuite name=\"CollectionHealthTest\" timestamp=\"").append(Instant.now()).append("\" tests=\"").append(results.size()).append("\" failures=\"").append(results.stream().filter(r->r.get("status").equals("failure")).count()).append("\" errors=\"").append(results.stream().filter(r->r.get("status").equals("error")).count()).append("\" skipped=\"0\">\n");
         for(Map<String,Object> r:results) {x.append("<testcase classname=\"dev.tattletale.CollectionHealthTest\" name=\"").append(escape(r.get("name"))).append("\" timestamp=\"").append(r.get("timestamp")).append("\" time=\"").append(r.get("seconds")).append("\">");if(!r.get("status").equals("pass"))x.append('<').append(r.get("status")).append('>').append(escape(r.get("detail"))).append("</").append(r.get("status")).append('>');x.append("</testcase>\n");}x.append("</testsuite>\n");Files.writeString(xml,x);

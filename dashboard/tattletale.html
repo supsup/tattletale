@@ -231,7 +231,7 @@
 
   <div class="card section" aria-labelledby="health-h">
     <h2 id="health-h">Collection health</h2>
-    <p class="desc">The four polling checks in this watcher session. Live/Stale measures file freshness separately. Other collection paths, including log streaming and identity lookup, are not measured here.</p>
+    <p class="desc">The four polling checks in this watcher session, plus a separate database/page-publication result when supplied. Inventory as of dates the complete database projection; Live/Stale measures envelope freshness. Other collection paths, including log streaming and identity lookup, are not measured here.</p>
     <div id="collection-health"></div>
   </div>
 
@@ -473,33 +473,49 @@
   const SCOPE_NAMES = { loopback: "Loopback bind", wildcard: "All interfaces bind", "non-loopback": "Explicit non-loopback bind", unknown: "Unknown bind scope" };
   const unknownHealth = () => Object.fromEntries(Object.keys(HEALTH_NAMES).map((k) =>
     [k, { status: "unknown", lastAttempt: null, lastSuccess: null, error: null }]));
+  const timestamp = (v) => v === null || (typeof v === "string" &&
+    /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(v) && Number.isFinite(Date.parse(v)) &&
+    new Date(v).toISOString().replace(".000Z", "Z") === v);
+  function validHealth(v) {
+    return v && typeof v === "object" && !Array.isArray(v) &&
+      Object.keys(v).sort().join(",") === "error,lastAttempt,lastSuccess,status" &&
+      ["unknown", "ok", "degraded"].includes(v.status) && timestamp(v.lastAttempt) && timestamp(v.lastSuccess) &&
+      (v.error === null || (typeof v.error === "string" && /^[a-z][a-z0-9-]{0,63}$/.test(v.error))) &&
+      !(v.status === "ok" && (!v.lastAttempt || !v.lastSuccess || v.error !== null)) &&
+      !(v.status === "unknown" && (v.lastSuccess !== null || v.error !== null)) &&
+      !(v.status === "degraded" && (!v.lastAttempt || !v.error));
+  }
   function readHealth(D) {
     const h = D.collectionHealth, keys = Object.keys(HEALTH_NAMES);
-    const timestamp = (v) => v === null || (typeof v === "string" &&
-      /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(v) && Number.isFinite(Date.parse(v)) &&
-      new Date(v).toISOString().replace(".000Z", "Z") === v);
     if (D.formatVersion !== 2 || !h || typeof h !== "object" || Array.isArray(h) ||
         Object.keys(h).length !== keys.length || keys.some((k) => !Object.hasOwn(h, k))) return unknownHealth();
-    for (const k of keys) {
-      const v = h[k];
-      if (!v || typeof v !== "object" || Array.isArray(v) ||
-          Object.keys(v).sort().join(",") !== "error,lastAttempt,lastSuccess,status" ||
-          !["unknown", "ok", "degraded"].includes(v.status) || !timestamp(v.lastAttempt) || !timestamp(v.lastSuccess) ||
-          !(v.error === null || (typeof v.error === "string" && /^[a-z][a-z0-9-]{0,63}$/.test(v.error))) ||
-          (v.status === "ok" && (!v.lastAttempt || !v.lastSuccess || v.error !== null)) ||
-          (v.status === "unknown" && (v.lastSuccess !== null || v.error !== null)) ||
-          (v.status === "degraded" && (!v.lastAttempt || !v.error))) return unknownHealth();
-    }
+    if (keys.some((k) => !validHealth(h[k]))) return unknownHealth();
     return h;
+  }
+  function readPublication(D) {
+    const present = Object.hasOwn(D, "publicationHealth") || Object.hasOwn(D, "inventoryAsOf");
+    const unknown = { status: "unknown", lastAttempt: null, lastSuccess: null, error: null };
+    if (!present) return { present: false, health: unknown, asOf: null };
+    const h = D.publicationHealth;
+    if (D.formatVersion !== 2 || !Object.hasOwn(D, "publicationHealth") || !Object.hasOwn(D, "inventoryAsOf") ||
+        !validHealth(h) || !timestamp(D.inventoryAsOf) ||
+        ![null, "collection-db", "collection-io"].includes(h.error) ||
+        (h.status === "ok" && D.inventoryAsOf === null)) return { present: true, health: unknown, asOf: null };
+    return { present: true, health: h, asOf: D.inventoryAsOf };
   }
   const scopeOf = (v) => typeof v.bindScope === "string" && Object.hasOwn(SCOPE_NAMES, v.bindScope) ? v.bindScope :
     !Object.hasOwn(v, "bindScope") && v.exposed === true ? "wildcard" : "unknown";
   let health = unknownHealth(), loadFailed = false, hasData = false;
+  let publication = readPublication({});
   let acceptedPayload = null;
-  const complete = () => Object.values(health).every((v) => v.status === "ok");
+  const publicationIncomplete = () => publication.present && publication.health.status !== "ok";
+  const complete = () => Object.values(health).every((v) => v.status === "ok") && !publicationIncomplete();
   const incompleteChecks = () => Object.entries(HEALTH_NAMES).filter(([k]) => health[k].status !== "ok")
-    .map(([k, label]) => label + ": " + health[k].status + (health[k].error ? " (" + health[k].error + ")" : "")).join("; ");
-  const sampleNote = (k) => health[k].status === "ok" ? "Last accepted sample" : "Last-known values; collection " + health[k].status;
+    .map(([k, label]) => label + ": " + health[k].status + (health[k].error ? " (" + health[k].error + ")" : ""))
+    .concat(publicationIncomplete() ? ["Database publication: " + publication.health.status +
+      (publication.health.error ? " (" + publication.health.error + ")" : "")] : []).join("; ");
+  const sampleNote = (k) => publicationIncomplete() ? "Last-known inventory; database publication " + publication.health.status :
+    health[k].status === "ok" ? "Last accepted sample" : "Last-known values; collection " + health[k].status;
   function renderHealth() {
     const box = $("#collection-health");
     const rows = Object.entries(HEALTH_NAMES).map(([k, label]) => {
@@ -508,6 +524,15 @@
         el("span", { text: " | attempted: " + (v.lastAttempt || "not yet") + " | last accepted: " +
           (v.lastSuccess || "not yet") + (v.error ? " | " + v.error : "") }));
     });
+    if (publication.present) {
+      const v = publication.health;
+      rows.push(el("div", { class: "note" }, status(v.status === "ok" ? "good" : "warning", "Database publication: " + v.status),
+        el("span", { text: " | attempted: " + (v.lastAttempt || "not yet") + " | last successful publication: " +
+          (v.lastSuccess || "not yet") + (v.error ? " | " + v.error : "") })),
+      el("div", { class: "note", text: "Inventory as of: " + (publication.asOf || "unknown") +
+        ". This is the last complete database projection; file freshness uses the envelope generation time." }));
+      if (publicationIncomplete()) rows.push(el("div", { class: "note", text: "All displayed inventory is last-known; current collector health can describe newer samples." }));
+    }
     if (loadFailed && hasData) rows.unshift(el("div", { class: "note", text: "Last-known health from the last accepted data file; refresh failed." }));
     box.replaceChildren(...rows);
   }
@@ -530,7 +555,7 @@
       $("#" + id).replaceChildren();
     $("#progs tbody").replaceChildren();
     $("#sigFilter").replaceChildren(el("option", { value: "", text: "All signers" }));
-    lastGenerated = null; hasData = false; health = unknownHealth();
+    lastGenerated = null; hasData = false; health = unknownHealth(); publication = readPublication({});
     lastRows = []; lastNewRows = []; lastEvents = []; otherSigners = new Set(); baseT = 0;
   }
   function failLoad(message) {
@@ -570,6 +595,7 @@
   }
   function renderData(D) {
     health = readHealth(D);
+    publication = readPublication(D);
     loadFailed = false;
     hasData = true;
     renderHealth();
@@ -857,7 +883,8 @@
   }
   function renderListeners(lst) {
     const box = $("#listeners");
-    if (!lst.length) { box.replaceChildren(el("div", { class: "empty", text: health.listeners.status === "ok" ?
+    if (!lst.length) { box.replaceChildren(el("div", { class: "empty", text: publicationIncomplete() ?
+      "No listener values in last-known inventory. " + sampleNote("listeners") + "; no all-clear." : health.listeners.status === "ok" ?
       "No listeners in the last accepted sample." : "No listener values recorded. Collection " + health.listeners.status + "; no all-clear." })); return; }
     const present = lst.filter((v) => v.present).sort((a, b) => a.key.localeCompare(b.key));
     const gone = lst.filter((v) => !v.present).sort((a, b) => String(b.lastSeen).localeCompare(String(a.lastSeen)));
