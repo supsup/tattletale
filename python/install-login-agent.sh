@@ -2,10 +2,11 @@
 # Opt-in: run tattletale at login, for this user only, as a LaunchAgent.
 #   sh install-login-agent.sh            install and start it now
 #   sh install-login-agent.sh --dry-run  print the agent file, change nothing
-# Remove it with uninstall-login-agent.sh. Settings come from tattletale.env next to
-# tattletale.py, exactly as when you run it by hand.
+# Remove it with uninstall-login-agent.sh. Settings come from tattletale.env at the repository
+# root and data goes to <repo>/data/, exactly as when you run it by hand.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd) || { echo "install-login-agent: cannot locate this folder" >&2; exit 2; }
+data="$(dirname "$here")/data"
 label="io.github.tattletale"
 plist="$HOME/Library/LaunchAgents/$label.plist"
 python=$(command -v python3) || { echo "install-login-agent: python3 not found" >&2; exit 2; }
@@ -13,6 +14,7 @@ python=$(command -v python3) || { echo "install-login-agent: python3 not found" 
 xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 py=$(xml_escape "$python")
 dir=$(xml_escape "$here")
+out=$(xml_escape "$data")
 
 body=$(cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -31,8 +33,8 @@ body=$(cat <<EOF
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>30</integer>
   <key>ProcessType</key><string>Background</string>
-  <key>StandardOutPath</key><string>$dir/tattletale.stdout</string>
-  <key>StandardErrorPath</key><string>$dir/tattletale.stdout</string>
+  <key>StandardOutPath</key><string>$out/tattletale.stdout</string>
+  <key>StandardErrorPath</key><string>$out/tattletale.stdout</string>
 </dict>
 </plist>
 EOF
@@ -44,13 +46,13 @@ if [ "${1:-}" = "--dry-run" ]; then
     exit 0
 fi
 
-if [ -f "$here/tattletale.pid" ] && kill -0 "$(cat "$here/tattletale.pid")" 2>/dev/null; then
-    echo "install-login-agent: a tattletale started by hand is running (pid $(cat "$here/tattletale.pid")); stop it first:" >&2
-    echo "  kill \$(cat \"$here/tattletale.pid\")" >&2
+if [ -f "$data/tattletale.pid" ] && kill -0 "$(cat "$data/tattletale.pid")" 2>/dev/null; then
+    echo "install-login-agent: a tattletale started by hand is running (pid $(cat "$data/tattletale.pid")); stop it first:" >&2
+    echo "  kill \$(cat \"$data/tattletale.pid\")" >&2
     exit 1
 fi
 
-mkdir -p "$HOME/Library/LaunchAgents"
+mkdir -p "$HOME/Library/LaunchAgents" "$data"
 tmp=$(mktemp "$plist.XXXXXX")
 printf '%s\n' "$body" > "$tmp"
 plutil -lint "$tmp" >/dev/null || { rm -f "$tmp"; echo "install-login-agent: generated plist is invalid" >&2; exit 2; }

@@ -1,5 +1,8 @@
 # Machine data: never commit. These hold a process list, ports, command lines and copies of
 # startup files from the machine that ran the watcher.
+# Since v0.0.2 both versions keep all of it in data/; the names below catch a v0.0.1 data set
+# left at the repo root before its one-time move.
+data/
 tattletale.env
 tattletale.log
 tattletale.log.*
@@ -16,3 +19,6 @@ tattletale.stdout
 startup-snapshots/
 .tattletale-*.tmp
 __pycache__/
+
+# Java build output
+java/build/

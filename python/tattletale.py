@@ -60,6 +60,10 @@ import time
 import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# v0.0.2 layout: <repo>/python/tattletale.py; the Java version shares <repo>/data/ and the page.
+REPO = os.path.dirname(HERE)
+DATA = os.path.join(REPO, "data")
+DASHBOARD = os.path.join(REPO, "dashboard", "tattletale.html")
 HOME = os.path.expanduser("~")
 
 # Programs that ask for, or broker, a credential. Matched on the executable's base name.
@@ -100,7 +104,7 @@ def now():
 
 
 # ---- database ----
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 SCHEMA_VERSION = 1
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
@@ -187,6 +191,7 @@ class Watch:
         self.listen_every, self.startup_every = listen_every, startup_every
         self.extra_startup = list(extra_startup)
         self.data_dir = os.path.dirname(os.path.abspath(db_path))
+        os.makedirs(self.data_dir, exist_ok=True)
         self.snap_dir = os.path.join(self.data_dir, "startup-snapshots")
         self.db = open_db(db_path)
         self.cred_seen_pids = set()
@@ -815,8 +820,30 @@ class Watch:
         except (OSError, ValueError, TypeError):
             pass
 
+    def install_dashboard(self):
+        """Copy the shared page next to the data file (where it loads tattletale-data.js from)
+        whenever its bytes differ, so an upgraded page reaches an existing data directory."""
+        dst = os.path.join(self.data_dir, "tattletale.html")
+        try:
+            with open(DASHBOARD, "rb") as f:
+                page = f.read()
+        except OSError as e:
+            self.log("NOTE", f"dashboard not copied: {e}")
+            return
+        try:
+            with open(dst, "rb") as f:
+                if f.read() == page:
+                    return
+        except OSError:
+            pass
+        fd, tmp = tempfile.mkstemp(dir=self.data_dir, prefix=".tattletale-page.", suffix=".tmp")
+        with os.fdopen(fd, "wb") as f:
+            f.write(page)
+        os.replace(tmp, dst)
+
     def run(self):
         self.claim_pid_file()
+        self.install_dashboard()
         self.log("START", f"tattletale {__version__} pid {os.getpid()} db {self.db_path}")
         self.load_state()
         self._safe("retention", self.retain)
@@ -861,9 +888,9 @@ class Watch:
 # a line in the config file it is TATTLETALE_NAME_WITH_UNDERSCORES. See tattletale.env.example.
 SETTINGS = {
     # name:              (type,  default,                              help)
-    "log":               (str,   os.path.join(HERE, "tattletale.log"),  "log file"),
-    "db":                (str,   os.path.join(HERE, "tattletale.db"),   "state database (SQLite); the page data file and startup copies are kept beside it"),
-    "map":               (str,   os.path.join(HERE, "tattletale-map.json"), "old JSON state map, imported once into an empty database; never written"),
+    "log":               (str,   os.path.join(DATA, "tattletale.log"),  "log file"),
+    "db":                (str,   os.path.join(DATA, "tattletale.db"),   "state database (SQLite); the page data file and startup copies are kept beside it"),
+    "map":               (str,   os.path.join(DATA, "tattletale-map.json"), "old JSON state map, imported once into an empty database; never written"),
     "process_interval":  (float, 3,     "seconds between process-list scans"),
     "listen_interval":   (float, 30,    "seconds between listening-port scans"),
     "startup_interval":  (float, 300,   "seconds between startup-item scans"),
@@ -915,7 +942,7 @@ def convert(name, kind, raw):
 
 def resolve_settings(args):
     """Effective settings and where each came from (flag, env, config or default)."""
-    cfg_path = args.config or os.environ.get("TATTLETALE_CONFIG") or os.path.join(HERE, "tattletale.env")
+    cfg_path = args.config or os.environ.get("TATTLETALE_CONFIG") or os.path.join(REPO, "tattletale.env")
     file_vals = {}
     if os.path.exists(os.path.expanduser(cfg_path)):
         file_vals = parse_env_file(os.path.expanduser(cfg_path))
@@ -988,9 +1015,53 @@ def run_query(db_path, sql):
         sys.exit(f"tattletale: query failed: {e}")
 
 
+# Files v0.0.1 kept next to tattletale.py, which was then the repo root.
+V001_FILES = ("tattletale.db", "tattletale.db-wal", "tattletale.db-shm", "tattletale-data.js",
+              "tattletale.stdout", "tattletale-map.json", "startup-snapshots")
+
+
+def migrate_v001(data_dir):
+    """One-time move of a v0.0.1 data set from the repo root into data/. Runs only with the
+    default database path, only when data/ has no database yet, and never while a v0.0.1
+    watcher still holds the old pid file."""
+    old_db = os.path.join(REPO, "tattletale.db")
+    if not os.path.exists(old_db) or os.path.exists(os.path.join(data_dir, "tattletale.db")):
+        return None
+    old_pid = os.path.join(REPO, "tattletale.pid")
+    try:
+        with open(old_pid) as f:
+            pid = int(f.read().strip() or 0)
+        r = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True)
+        if pid and r.returncode == 0 and "tattletale.py" in r.stdout:
+            sys.exit(f"tattletale: a v0.0.1 watcher (pid {pid}) is still using {old_db}; "
+                     f"stop it first (kill {pid}), then start again to move its data into {data_dir}")
+    except (OSError, ValueError):
+        pass
+    os.makedirs(data_dir, exist_ok=True)
+    moved = []
+    names = list(V001_FILES) + sorted(n for n in os.listdir(REPO) if n.startswith("tattletale.log"))
+    for name in names:
+        src = os.path.join(REPO, name)
+        if os.path.exists(src):
+            os.replace(src, os.path.join(data_dir, name))
+            moved.append(name)
+    try:
+        os.remove(old_pid)  # dead, checked above
+    except OSError:
+        pass
+    old_snap = os.path.join(REPO, "startup-snapshots")
+    new_snap = os.path.join(data_dir, "startup-snapshots")
+    conn = sqlite3.connect(os.path.join(data_dir, "tattletale.db"))
+    with conn:
+        conn.execute("UPDATE startup_versions SET copy_path = ? || substr(copy_path, ?) "
+                     "WHERE copy_path LIKE ? || '%'", (new_snap, len(old_snap) + 1, old_snap))
+    conn.close()
+    return moved
+
+
 def main():
     ap = argparse.ArgumentParser(description="Watch for credential prompts, new listeners, new programs and startup changes.")
-    ap.add_argument("--config", help="settings file (default: tattletale.env next to this script)")
+    ap.add_argument("--config", help="settings file (default: tattletale.env at the repository root)")
     ap.add_argument("--version", action="version", version=f"tattletale {__version__}")
     ap.add_argument("--report", action="store_true", help="print a summary of the database and exit")
     ap.add_argument("--query", metavar="SQL", help="run one read-only SELECT against the database, print tab-separated rows, and exit")
@@ -1017,6 +1088,11 @@ def main():
     if a.query is not None:
         run_query(eff["db"], a.query)
         return
+    if src["db"] == "default":
+        moved = migrate_v001(os.path.dirname(eff["db"]))
+        if moved:
+            print(f"tattletale: moved the v0.0.1 data into {os.path.dirname(eff['db'])}: "
+                  + ", ".join(moved), file=sys.stderr)
     w = Watch(eff["log"], eff["db"], eff["listen_interval"], eff["startup_interval"],
               eff["extra_startup"], notify=eff["notify"],
               rotate_bytes=int(eff["rotate_mb"] * 1024 * 1024), keep_logs=max(0, eff["keep_logs"]),
