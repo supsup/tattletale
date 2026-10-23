@@ -55,6 +55,22 @@ second one (of either version) refuses and tells you which pid holds `data/`.
 Open `data/tattletale.html` in your browser (`open data/tattletale.html`). The watcher puts
 it there next to its data. It reloads every minute. Start with **Needs attention** at the top.
 
+Check both kinds of status. **Live** means the data file is recent; it becomes **Stale**
+after 180 seconds. Collection health separately reports processes, listeners, startup and
+crontab as `unknown`, `ok` or `degraded`, with their attempt and accepted-success times.
+Failed checks keep last-known values rather than reporting stopped listeners or removed
+startup items. A new watcher starts with unknown health even when it loads old inventory;
+legacy or unsupported health is unknown too. Live does not mean every check succeeded.
+
+Listener labels describe **bind scope**: loopback, wildcard, non-loopback or unknown.
+For example, `127.0.0.1` is loopback and `192.0.2.10` is a non-loopback literal. These labels
+do not test firewall rules or access from another machine. The older `EXPOSED` log label
+means wildcard binding, not demonstrated reachability.
+
+The four health checks follow the existing polling schedule; no automatic retry is added.
+They do not cover every watcher component. More detail, including startup/crontab rejection
+and accepted-empty results, is in [the data contract](docs/DATA_FORMAT.md#collection-health).
+
 ## 4. Optional: settings
 
 ```sh

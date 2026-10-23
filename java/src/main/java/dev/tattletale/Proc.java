@@ -52,7 +52,10 @@ final class Proc {
             Thread.currentThread().interrupt();
             throw new IOException("interrupted", e);
         }
-        return new Result(p.exitValue(), text(out.bytes()), text(err.bytes()));
+        if (out.failure != null || err.failure != null) throw new IOException("collector-stream");
+        try {
+            return new Result(p.exitValue(), text(out.bytes()), text(err.bytes()));
+        } catch (java.nio.charset.CharacterCodingException e) { throw new IOException("collector-decode", e); }
     }
 
     static Result run(List<String> cmd) throws IOException, Timeout {
@@ -60,15 +63,16 @@ final class Proc {
     }
 
     /** Text mode decoding with universal newlines, as subprocess(text=True) gives. */
-    static String text(byte[] b) {
-        String s = new String(b, StandardCharsets.UTF_8);
+    static String text(byte[] b) throws java.nio.charset.CharacterCodingException {
+        String s = StandardCharsets.UTF_8.newDecoder().decode(java.nio.ByteBuffer.wrap(b)).toString();
         if (s.indexOf('\r') < 0) return s;
         return s.replace("\r\n", "\n").replace('\r', '\n');
     }
 
-    private static final class Reader extends Thread {
+    static final class Reader extends Thread {
         private final InputStream in;
         private final ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        IOException failure;
 
         Reader(InputStream in) {
             this.in = in;
@@ -79,8 +83,8 @@ final class Proc {
         public void run() {
             try (in) {
                 in.transferTo(buf);
-            } catch (IOException ignored) {
-                // the process went away; keep what was read
+            } catch (IOException e) {
+                failure = e;
             }
         }
 

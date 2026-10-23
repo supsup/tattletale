@@ -35,12 +35,13 @@ data/        created on first run: database, log, dashboard copy (git-ignored)
 | Check | How often | What you learn |
 |---|---|---|
 | **Credential prompts** | every 3 s, plus the macOS log | Every time a git credential helper, `git-remote-https`, the macOS password dialog (SecurityAgent) or an askpass helper runs, with its command line and the chain of processes that started it. Short-lived helpers are caught from the macOS unified log and looked up immediately, so "something asked for my GitHub password" becomes "`git-remote-https https://github.com/example/private-repo` started by `git` started by `your-build-tool`". |
-| **Listening ports** | every 30 s | Each new program, address and port that accepts connections. A listener on all interfaces (`*`, `0.0.0.0`, `::`) is flagged as **exposed**: reachable from other machines on your network. Ports that stop listening are noted too. |
+| **Listening ports** | every 30 s | Each observed program, address and listening port, classified as loopback, wildcard, non-loopback or unknown. These are bind scopes, not remote-reachability or firewall results. Ports absent from a successful later sample are noted too. |
 | **New programs** | every 3 s | Every executable that runs for the first time, busy or not, with its full path, command line, parent chain, SHA-256 and code-signing identity (Apple, a named developer, ad-hoc or unsigned). |
 | **Startup items** | every 5 min | Launch agents and daemons, crontab and shell startup files. Any addition, change or removal is logged, with a copy of the before and after versions and a diff. |
 
 The first run records what is already there as a **baseline** and reports only what changes
-after it.
+after it. Failed or partial polling samples retain the last-good inventory and baseline;
+they do not turn missing output into stopped listeners or removed startup items.
 
 ## What it does not do
 
@@ -77,7 +78,7 @@ or `sh java/build.sh` once and then `java -jar java/build/tattletale.jar`. Then 
 copies it into `data/` on start, next to `tattletale-data.js`, which it rewrites about once a
 minute; the page refreshes itself every 60 seconds. It shows:
 
-- **Needs attention**: exposed ports, unsigned or ad-hoc programs, new programs,
+- **Needs attention**: wildcard and explicit non-loopback binds, unsigned or ad-hoc programs, new programs,
   credential prompts, startup changes and watcher restarts, each linking to its details
 - summary tiles, listening ports, credential prompts with their process chains
 - new programs over time, who signed your programs, startup items
@@ -86,6 +87,27 @@ minute; the page refreshes itself every 60 seconds. It shows:
 It opens in dark mode; the Theme button switches to light and the page remembers your choice. It
 works at phone width too. Click or press Enter on any row for its details. The footer names the
 version that wrote the data.
+
+The page's **Live/Stale** indicator measures data-file freshness (Stale after 180 seconds).
+Separately, collection health shows the last attempt, last accepted success and
+`unknown`/`ok`/`degraded` state for four polling checks: processes, listeners, startup and
+crontab. A Live page can still have degraded observations. A restart begins with unknown
+health even when retained inventory is shown; missing or unsupported health is also unknown,
+never an all-clear. Values retained after a failed check are labelled last-known.
+
+Startup files and crontab form one accepted sample: files are staged first, crontab last.
+Both success timestamps advance only when that sample is accepted. A failure before the
+crontab attempt leaves its prior health untouched; a later rejection degrades both checks
+without discarding their last-good data. The existing polling schedule is unchanged, with
+no added automatic retries. These four checks do not represent universal watcher, identity
+or log-stream health.
+
+The generated data is now `formatVersion: 2`; SQLite remains schema 1 and the producer's
+version string is independent. Listener `bindScope` comes from the recorded address without
+DNS or network probing. The legacy `exposed` flag means wildcard binding only: neither its
+value nor a bind-scope label proves network reachability. See
+[the data contract](docs/DATA_FORMAT.md#collection-health) for accepted-empty command rules
+and retained-state semantics.
 
 ## Command line
 
@@ -133,9 +155,12 @@ ignored.
 ## Notifications
 
 When something needs attention, Tattletale shows a macOS notification: a credential prompt,
-a git network credential lookup, a password dialog, a newly exposed port, a startup change,
-or a new program with no named signer. The first one may ask macOS for permission to show
+a git network credential lookup, a password dialog, a new wildcard-bound listener, a startup
+change, or a new program with no named signer. The first one may ask macOS for permission to show
 notifications. Turn them off with `--no-notify` or `TATTLETALE_NOTIFY=false`.
+
+The existing `LISTEN!` notification and `EXPOSED on all interfaces` log wording refer to
+wildcard binding; they are not remote-reachability measurements.
 
 ## Run at login (optional)
 
@@ -158,6 +183,22 @@ flags), `credential_events`, `startup_items` and `startup_versions`, `events` (e
 line) and `schema_version`. History is trimmed by the retention settings; programs,
 listeners and startup items are kept. The full contract, column by column, is
 [docs/DATA_FORMAT.md](docs/DATA_FORMAT.md).
+
+## Collection-health fixture checks
+
+The collection-health checks use the standard libraries and built-in test runners:
+
+```sh
+python3 tests/run_python_health_tests.py --xml /tmp/tattletale-python-health.xml
+sh tests/run_java_health_tests.sh --xml /tmp/tattletale-java-health.xml --scratch "$(mktemp -d)/fixtures"
+node --test tests/test_dashboard_health.js
+```
+
+They use synthetic command results, files and clocks, without running a live collector or
+reading host inventory. Set JAVA_HOME to JDK 25 for the Java checks, which also require the
+sqlite3 command and build only the jar. No native-image build is needed. The dashboard check
+uses Node's built-in test runner. These checks cover collection health and bind scope, not
+unrelated privacy, locking, platform or identity-refresh changes.
 
 ## Upgrading from 0.0.1
 

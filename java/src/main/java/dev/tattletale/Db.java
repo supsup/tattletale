@@ -153,15 +153,18 @@ final class Db implements AutoCloseable {
         exec("BEGIN;");
         try {
             for (String s : statements) exec(s);
+            exec("COMMIT;");
         } catch (DbException e) {
             try {
                 exec("ROLLBACK;");
-            } catch (DbException ignored) {
-                // no transaction left to roll back
+            } catch (DbException rollbackFailure) {
+                // Transaction disposition is unknown; never reuse this connection, even if
+                // SQLite already rolled back automatically. Keep the original error primary.
+                e.addSuppressed(rollbackFailure);
+                close();
             }
             throw e;
         }
-        exec("COMMIT;");
     }
 
     @Override

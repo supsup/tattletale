@@ -229,6 +229,12 @@
 
   <div class="banner" id="banner" role="status"></div>
 
+  <div class="card section" aria-labelledby="health-h">
+    <h2 id="health-h">Collection health</h2>
+    <p class="desc">The four polling checks in this watcher session. Live/Stale measures file freshness separately. Other collection paths, including log streaming and identity lookup, are not measured here.</p>
+    <div id="collection-health"></div>
+  </div>
+
   <div class="card section att" id="attention" aria-labelledby="att-h">
     <h2 id="att-h">Needs attention</h2>
     <div id="att-list"></div>
@@ -238,7 +244,7 @@
 
   <div class="card section" id="sec-listeners">
     <h2>Listening ports</h2>
-    <p class="desc">Programs accepting network connections. Exposed means reachable from other machines on your network. Click a row for details.</p>
+    <p class="desc">Listening sockets in the last accepted sample. Bind scope describes the address; firewall rules and remote access are not tested. Click a row for details.</p>
     <div id="listeners"></div>
   </div>
 
@@ -462,11 +468,78 @@
     STOP: "warning", UNLISTEN: "neutral", UNSIGNED: "serious", ERROR: "critical" };
   const LOG_CRED_KINDS = ["CRED-NET", "PASSWORD", "CRED-LOG"];
 
+  // Health describes accepted samples in this watcher epoch, independently of file freshness.
+  const HEALTH_NAMES = { processes: "Process list", listeners: "Listening sockets", startup: "Startup items", crontab: "Crontab" };
+  const SCOPE_NAMES = { loopback: "Loopback bind", wildcard: "All interfaces bind", "non-loopback": "Explicit non-loopback bind", unknown: "Unknown bind scope" };
+  const unknownHealth = () => Object.fromEntries(Object.keys(HEALTH_NAMES).map((k) =>
+    [k, { status: "unknown", lastAttempt: null, lastSuccess: null, error: null }]));
+  function readHealth(D) {
+    const h = D.collectionHealth, keys = Object.keys(HEALTH_NAMES);
+    const timestamp = (v) => v === null || (typeof v === "string" &&
+      /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(v) && Number.isFinite(Date.parse(v)) &&
+      new Date(v).toISOString().replace(".000Z", "Z") === v);
+    if (D.formatVersion !== 2 || !h || typeof h !== "object" || Array.isArray(h) ||
+        Object.keys(h).length !== keys.length || keys.some((k) => !Object.hasOwn(h, k))) return unknownHealth();
+    for (const k of keys) {
+      const v = h[k];
+      if (!v || typeof v !== "object" || Array.isArray(v) ||
+          Object.keys(v).sort().join(",") !== "error,lastAttempt,lastSuccess,status" ||
+          !["unknown", "ok", "degraded"].includes(v.status) || !timestamp(v.lastAttempt) || !timestamp(v.lastSuccess) ||
+          !(v.error === null || (typeof v.error === "string" && /^[a-z][a-z0-9-]{0,63}$/.test(v.error))) ||
+          (v.status === "ok" && (!v.lastAttempt || !v.lastSuccess || v.error !== null)) ||
+          (v.status === "unknown" && (v.lastAttempt !== null || v.lastSuccess !== null || v.error !== null)) ||
+          (v.status === "degraded" && (!v.lastAttempt || !v.error))) return unknownHealth();
+    }
+    return h;
+  }
+  const scopeOf = (v) => typeof v.bindScope === "string" && Object.hasOwn(SCOPE_NAMES, v.bindScope) ? v.bindScope : "unknown";
+  let health = unknownHealth(), loadFailed = false, hasData = false;
+  const complete = () => Object.values(health).every((v) => v.status === "ok");
+  const sampleNote = (k) => health[k].status === "ok" ? "Last accepted sample" : "Last-known values; collection " + health[k].status;
+  function renderHealth() {
+    const box = $("#collection-health");
+    box.replaceChildren(...Object.entries(HEALTH_NAMES).map(([k, label]) => {
+      const v = health[k];
+      return el("div", { class: "note" }, status(v.status === "ok" ? "good" : "warning", label + ": " + v.status),
+        el("span", { text: " | attempted: " + (v.lastAttempt || "not yet") + " | last accepted: " +
+          (v.lastSuccess || "not yet") + (v.error ? " | " + v.error : "") }));
+    }));
+  }
+
   // ---- render ----
   let sortKey = "firstSeen", sortDir = -1, activeKinds = null, knownKinds = new Set();
   let lastGenerated = null, baseT = 0, otherSigners = new Set(), lastNewRows = [], lastEvents = [];
 
+  function failLoad(message) {
+    loadFailed = true;
+    health = unknownHealth();
+    renderHealth();
+    $("#updated").textContent = "";
+    $("#live").replaceChildren(status("critical", "No data"));
+    $("#att-list").replaceChildren(status("warning", "Collection incomplete; no accepted refresh"));
+    const banner = $("#banner");
+    banner.replaceChildren(status("critical", "No data"), el("span", { text: message }));
+    banner.classList.add("show");
+  }
   function render(D) {
+    try {
+      const object = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+      if (!object(D) || !object(D.map) || !Array.isArray(D.log || []) ||
+          !object(D.map.programs || {}) || !object(D.map.listeners || {}) || !object(D.map.startup || {}) ||
+          !Array.isArray(D.map.credentials || []) ||
+          Object.values(D.map.programs || {}).some((v) => !object(v) || (v.signer != null && typeof v.signer !== "string")) ||
+          Object.values(D.map.listeners || {}).some((v) => !object(v)) ||
+          (D.map.credentials || []).some((v) => !object(v))) throw Error("invalid-data");
+      renderData(D);
+    } catch (_) {
+      failLoad("The data file could not be accepted. Previously displayed inventory may be last-known; refresh after the watcher writes valid data.");
+    }
+  }
+  function renderData(D) {
+    health = readHealth(D);
+    loadFailed = false;
+    hasData = true;
+    renderHealth();
     const map = D.map || {}, progs = map.programs || {}, listeners = map.listeners || {};
     const creds = map.credentials || [], startup = map.startup || {};
     const events = parseLog(D.log || []);
@@ -475,9 +548,9 @@
     const rows = Object.entries(progs).map(([exe, v]) => ({ exe, ...v, signerClass: signerClass(v) }));
     for (const r of rows) r.isNew = Date.parse(r.firstSeen) > baseT;
     const newRows = rows.filter((r) => r.isNew);
-    const lst = Object.entries(listeners).map(([key, v]) => ({ key, ...v, present: isPresent(v) }));
+    const lst = Object.entries(listeners).map(([key, v]) => ({ key, ...v, bindScope: scopeOf(v), present: isPresent(v) }));
     const present = lst.filter((l) => l.present);
-    const exposed = present.filter((l) => l.exposed);
+    const exposed = present.filter((l) => l.bindScope === "wildcard" || l.bindScope === "non-loopback");
     const startupEvents = events.filter((e) => e.kind.startsWith("STARTUP"));
     const risky = rows.filter((r) => isRisky(r.signerClass));
     const adhoc = risky.filter((r) => r.signerClass === "Ad-hoc (no identity)").length;
@@ -500,17 +573,18 @@
     $("#tiles").replaceChildren(
       tile("Programs tracked", rows.length.toLocaleString(), ["since " + local(new Date(baseT - 5000).toISOString())], true),
       tile("New since baseline", newRows.length.toLocaleString(),
-        [newRows.length ? "latest " + ago(newRows.map((r) => r.firstSeen).sort().pop()) : "none yet"], !newRows.length),
-      tile("Exposed ports", exposed.length.toLocaleString(),
-        ["of " + present.length + " listening", exposed.length ? status("warning", "reachable from the network") : status("good", "none exposed")], !exposed.length),
+        [newRows.length ? "latest " + ago(newRows.map((r) => r.firstSeen).sort().pop()) : "none recorded", sampleNote("processes")], !newRows.length),
+      tile("Non-loopback binds", exposed.length.toLocaleString(),
+        ["of " + present.length + " in the retained sample", sampleNote("listeners"),
+          present.filter((l) => l.bindScope === "unknown").length + " with unknown bind scope"], !exposed.length),
       tile("Unsigned or ad-hoc", risky.length.toLocaleString(),
         [adhoc + " ad-hoc, " + (risky.length - adhoc) + " unsigned",
-         risky.length ? status("serious", "review these") : status("good", "all signed")].concat(
+         risky.length ? status("serious", "review these") : "no unsigned or ad-hoc programs recorded"].concat(
          unchecked ? [el("span", { class: "muted", text: unchecked + " not checked yet" })] : []), !risky.length),
       tile("Credential prompts", creds.length.toLocaleString(),
-        [creds.length ? status("warning", "last " + ago(creds[creds.length - 1].time)) : status("good", "none seen")], !creds.length),
+        [creds.length ? status("warning", "last " + ago(creds[creds.length - 1].time)) : "none recorded", sampleNote("processes")], !creds.length),
       tile("Startup changes", startupEvents.length.toLocaleString(),
-        [startupEvents.length ? status("warning", "last " + ago(startupEvents[startupEvents.length - 1].t)) : status("good", "no changes")], !startupEvents.length),
+        [startupEvents.length ? status("warning", "last " + ago(startupEvents[startupEvents.length - 1].t)) : "no changes recorded", sampleNote("startup")], !startupEvents.length),
     );
 
     renderListeners(lst);
@@ -525,15 +599,20 @@
 
   // header chip: live or stale, refreshed between data loads
   function tick() {
-    if (!lastGenerated) return;
+    if (loadFailed) return;
+    if (!hasData) return;
     const age = (Date.now() - Date.parse(lastGenerated)) / 1000;
-    const stale = age > 180;
-    $("#live").replaceChildren(stale ? status("serious", "Stale, " + ago(lastGenerated)) : status("good", "Live, " + ago(lastGenerated)));
+    const stale = !Number.isFinite(age) || age > 180;
+    $("#live").replaceChildren(stale ? status("serious", Number.isFinite(age) ? "Stale, " + ago(lastGenerated) : "Stale, unknown timestamp") : status("good", "Live, " + ago(lastGenerated)));
     const banner = $("#banner");
     if (stale) {
       banner.replaceChildren(status("serious", "Stale"),
-        el("span", { text: "The watcher has not written data for " + ago(lastGenerated).replace(" ago", "") +
+        el("span", { text: "The watcher has not written data for " + (Number.isFinite(age) ? ago(lastGenerated).replace(" ago", "") : "an unknown interval") +
           ". It may be stopped: start it from the repository with python3 python/tattletale.py or java -jar java/build/tattletale.jar." }));
+      banner.classList.add("show");
+    } else if (!complete()) {
+      banner.replaceChildren(status("warning", "Collection incomplete"),
+        el("span", { text: "Some samples are degraded or unknown. Retained values are last-known observations; an empty view is not an all-clear." }));
       banner.classList.add("show");
     } else banner.classList.remove("show");
   }
@@ -554,7 +633,7 @@
     const add = (level, label, count, names, target, linkText, before) => {
       if (count) items.push({ level, label, count, names, target, linkText, before });
     };
-    add("warning", "Exposed listening ports", f.exposed.length,
+    add("warning", "Non-loopback listener binds in retained sample", f.exposed.length,
       f.exposed.map((l) => (l.command || base(l.key)) + " " + l.key.slice(l.key.lastIndexOf(" ") + 1)), "sec-listeners", "Listening ports");
     add("serious", "Unsigned or ad-hoc programs", f.risky.length, f.risky.map((r) => base(r.exe)),
       "sec-programs", "Show in table", setProgFilter("__risky"));
@@ -573,7 +652,8 @@
       f.stops.slice().reverse().map((e) => "stopped " + when(e.t)), "sec-events", "Show events", showKinds(["START", "STOP"]));
 
     const box = $("#att-list");
-    if (!items.length) { box.replaceChildren(el("div", { class: "att-ok" }, status("good", "Nothing needs attention"))); return; }
+    if (!items.length) { box.replaceChildren(el("div", { class: "att-ok" },
+      status(complete() ? "neutral" : "warning", complete() ? "No new observations to review" : "Collection incomplete; review collection health"))); return; }
     box.replaceChildren(...items.map((it) => {
       const uniq = [...new Set(it.names)];
       const shown = uniq.slice(0, 3).join(", ") + (uniq.length > 3 ? ", ..." : "");
@@ -714,10 +794,10 @@
     box.replaceChildren(...kids);
   }
 
-  // ---- listeners: present first, exposed first; gone ones folded away ----
+  // ---- listeners: bind scope describes the address, not remote reachability ----
   function listenerTable(items) {
     const tbl = el("table", null, el("thead", null, el("tr", null,
-      el("th", { text: "Program" }), el("th", { text: "Address" }), el("th", { text: "Reach" }))));
+      el("th", { text: "Program" }), el("th", { text: "Address" }), el("th", { text: "Bind scope" }))));
     const body = el("tbody");
     for (const v of items) {
       const sp = v.key.lastIndexOf(" ");
@@ -727,8 +807,8 @@
         el("td", null, el("div", { text: v.command || base(path) }),
           el("div", { class: "muted small", text: bundle ? "in " + bundle : dirOf(path) || path })),
         el("td", { class: "mono nowrap", text: addr }),
-        el("td", null, !v.present ? status("neutral", "Gone, last seen " + ago(v.lastSeen))
-          : v.exposed ? status("warning", "Exposed") : el("span", { class: "muted", text: "This Mac only" })));
+        el("td", null, el("span", { text: SCOPE_NAMES[v.bindScope] }),
+          !v.present ? status("neutral", "Absent from last accepted sample, last seen " + ago(v.lastSeen)) : null));
       tr.addEventListener("mousemove", (e) => showTip(e, (v.command || "") + " on " + addr,
         [path, "user " + (v.user || "?"), "chain: " + (v.chain || "?")]));
       tr.addEventListener("mouseleave", hideTip);
@@ -741,22 +821,25 @@
   }
   function renderListeners(lst) {
     const box = $("#listeners");
-    if (!lst.length) { box.replaceChildren(el("div", { class: "empty", text: "No listeners recorded." })); return; }
-    const present = lst.filter((v) => v.present).sort((a, b) => (b.exposed - a.exposed) || a.key.localeCompare(b.key));
+    if (!lst.length) { box.replaceChildren(el("div", { class: "empty", text: health.listeners.status === "ok" ?
+      "No listeners in the last accepted sample." : "No listener values recorded. Collection " + health.listeners.status + "; no all-clear." })); return; }
+    const present = lst.filter((v) => v.present).sort((a, b) => a.key.localeCompare(b.key));
     const gone = lst.filter((v) => !v.present).sort((a, b) => String(b.lastSeen).localeCompare(String(a.lastSeen)));
-    const exposed = present.filter((v) => v.exposed), localOnly = present.filter((v) => !v.exposed);
-    const kids = [];
-    if (exposed.length) kids.push(listenerTable(exposed));
-    else kids.push(el("div", { class: "empty" }, status("good", present.length ? "Nothing exposed to the network" : "Nothing is listening right now")));
-    if (localOnly.length) kids.push(el("details", exposed.length ? null : { open: "" },
-      el("summary", { text: localOnly.length + " listening on this Mac only" }), listenerTable(localOnly)));
-    if (gone.length) kids.push(el("details", null, el("summary", { text: gone.length + " no longer listening" }), listenerTable(gone)));
+    const kids = [el("div", { class: "muted", text: sampleNote("listeners") + ". Bind scope does not establish remote access." })];
+    for (const scope of ["wildcard", "non-loopback", "loopback", "unknown"]) {
+      const group = present.filter((v) => v.bindScope === scope);
+      if (group.length) kids.push(el("details", { open: "" },
+        el("summary", { text: SCOPE_NAMES[scope] + ": " + group.length }), listenerTable(group)));
+    }
+    if (!present.length) kids.push(el("div", { class: "empty", text: "No listeners present in the last accepted sample." }));
+    if (gone.length) kids.push(el("details", null, el("summary", { text: gone.length + " absent from last accepted sample" }), listenerTable(gone)));
     box.replaceChildren(...kids);
   }
 
   function renderCreds(creds) {
     const box = $("#creds");
-    if (!creds.length) { box.replaceChildren(el("div", { class: "empty" }, status("good", "None seen"), " since the watcher started.")); return; }
+    if (!creds.length) { box.replaceChildren(el("div", { class: "empty", text:
+      "No credential prompts recorded. " + sampleNote("processes") + "; log-stream coverage is not measured here." })); return; }
     box.replaceChildren(el("div", { class: "scroll" }, ...creds.slice().reverse().map((c) => el("div", { class: "cred" },
       el("div", { class: "top" }, status("warning", when(c.time)), el("span", { class: "muted small", text: ago(c.time) }),
         el("b", { class: "mono", text: base(c.exe) }),
@@ -866,41 +949,59 @@
     const box = $("#startup");
     const items = Object.entries(startup).sort((a, b) => a[0].localeCompare(b[0]))
       .map(([p, h]) => ({ p, h, changes: startupEvents.filter((e) => e.msg.includes(p)) }));
-    if (!items.length) { box.replaceChildren(el("div", { class: "empty", text: "No startup items recorded." })); return; }
+    if (!items.length) { box.replaceChildren(el("div", { class: "empty", text: "No startup items recorded. " + sampleNote("startup") })); return; }
     const table = (list) => {
       const tbl = el("table", null, el("thead", null, el("tr", null, el("th", { text: "Item" }), el("th", { text: "Changes" }))));
       tbl.append(el("tbody", null, ...list.map((it) => {
         const tr = el("tr", null,
           el("td", null, el("div", { class: "mono", text: base(it.p) }), el("div", { class: "muted small mono", text: dirOf(it.p) })),
           el("td", null, it.changes.length ? status("warning", plural(it.changes.length, "change") + ", last " + ago(it.changes[it.changes.length - 1].t))
-            : el("span", { class: "muted", text: "unchanged" })));
+            : el("span", { class: "muted", text: "no changes recorded" })));
         detailRow(tr, 2, () => [["path", it.p], ["sha256", it.h]].concat(it.changes.map((e) => [e.kind + " " + local(e.t), e.msg])));
         return tr;
       })));
       return tbl;
     };
     const changed = items.filter((it) => it.changes.length), same = items.filter((it) => !it.changes.length);
-    const kids = [];
+    const kids = [el("div", { class: "muted", text: sampleNote("startup") })];
     if (changed.length) kids.push(table(changed));
     if (same.length) kids.push(el("details", null,
-      el("summary", { text: changed.length ? plural(same.length, "other item") + ", unchanged" : plural(same.length, "item") + ", all unchanged" }),
+      el("summary", { text: plural(same.length, "item") + ", no changes recorded" }),
       table(same)));
     box.replaceChildren(...kids);
   }
 
   // ---- loading: a script tag works from a file:// page, where fetch of JSON does not ----
+  let loadSequence = 0;
+  const scriptPayloads = new WeakMap();
+  let assignedPayload;
+  Object.defineProperty(window, "TATTLETALE", {
+    configurable: true,
+    get: () => assignedPayload,
+    set: (data) => {
+      assignedPayload = data;
+      // An older overlapping script must never supply the newer request's payload.
+      const script = document.currentScript;
+      if (script) scriptPayloads.set(script, data);
+    }
+  });
   function load() {
+    const sequence = ++loadSequence;
+    window.TATTLETALE = undefined;
     const s = document.createElement("script");
     s.src = "tattletale-data.js?t=" + Date.now();
-    s.onload = () => { s.remove(); if (window.TATTLETALE) render(window.TATTLETALE); };
+    s.onload = () => {
+      s.remove();
+      if (sequence !== loadSequence) return;
+      const data = scriptPayloads.get(s);
+      scriptPayloads.delete(s);
+      window.TATTLETALE = undefined;
+      if (data) render(data); else s.onerror();
+    };
     s.onerror = () => {
       s.remove();
-      $("#updated").textContent = "";
-      $("#live").replaceChildren(status("critical", "No data"));
-      const banner = $("#banner");
-      banner.replaceChildren(status("critical", "No data"),
-        el("span", { text: "tattletale-data.js was not found next to this page. Start the watcher from the repository: python3 python/tattletale.py or java -jar java/build/tattletale.jar" }));
-      banner.classList.add("show");
+      if (sequence !== loadSequence) return;
+      failLoad("tattletale-data.js did not supply new data next to this page. Start the watcher from the repository: python3 python/tattletale.py or java -jar java/build/tattletale.jar");
     };
     document.head.append(s);
   }

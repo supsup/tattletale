@@ -1,0 +1,191 @@
+{
+  "fixtureVersion": 1,
+  "clock": "2000-01-01T00:00:00Z",
+  "scopeCases": [
+    {
+      "host": "*",
+      "expected": "wildcard"
+    },
+    {
+      "host": "0.0.0.0",
+      "expected": "wildcard"
+    },
+    {
+      "host": "::",
+      "expected": "wildcard"
+    },
+    {
+      "host": "[::]",
+      "expected": "wildcard"
+    },
+    {
+      "host": "127.0.0.1",
+      "expected": "loopback"
+    },
+    {
+      "host": "127.23.4.5",
+      "expected": "loopback"
+    },
+    {
+      "host": "::1",
+      "expected": "loopback"
+    },
+    {
+      "host": "[::1]",
+      "expected": "loopback"
+    },
+    {
+      "host": "0:0:0:0:0:0:0:1",
+      "expected": "loopback"
+    },
+    {
+      "host": "::ffff:127.0.0.1",
+      "expected": "loopback"
+    },
+    {
+      "host": "[::ffff:127.0.0.1]",
+      "expected": "loopback"
+    },
+    {
+      "host": "192.0.2.10",
+      "expected": "non-loopback"
+    },
+    {
+      "host": "2001:db8::10",
+      "expected": "non-loopback"
+    },
+    {
+      "host": "[2001:db8::10]",
+      "expected": "non-loopback"
+    },
+    {
+      "host": "fe80::1%fixture0",
+      "expected": "non-loopback"
+    },
+    {
+      "host": "[fe80::1%fixture0]",
+      "expected": "non-loopback"
+    },
+    {
+      "host": "localhost",
+      "expected": "unknown"
+    },
+    {
+      "host": "",
+      "expected": "unknown"
+    },
+    {
+      "host": "127.000.0.1",
+      "expected": "unknown"
+    },
+    {
+      "host": "999.1.1.1",
+      "expected": "unknown"
+    },
+    {
+      "host": "not-an-address",
+      "expected": "unknown"
+    },
+    {
+      "host": "[::1",
+      "expected": "unknown"
+    },
+    {
+      "host": "::1%",
+      "expected": "unknown"
+    }
+  ],
+  "commandCases": [
+    {
+      "tool": "lsof",
+      "code": 0,
+      "out": "",
+      "err": "",
+      "expected": "ok-empty"
+    },
+    {
+      "tool": "lsof",
+      "code": 1,
+      "out": "",
+      "err": "",
+      "expected": "ok-empty"
+    },
+    {
+      "tool": "lsof",
+      "code": 7,
+      "out": "",
+      "err": "",
+      "expected": "degraded"
+    },
+    {
+      "tool": "lsof",
+      "code": 1,
+      "out": "",
+      "err": "permission denied",
+      "expected": "degraded"
+    },
+    {
+      "tool": "lsof",
+      "code": 1,
+      "out": "p42\ncfixture\nn127.0.0.1:12345\n",
+      "err": "",
+      "expected": "degraded"
+    },
+    {
+      "tool": "lsof",
+      "code": 0,
+      "out": "p42\ncfixture\nn127.0.0.1:12345\n",
+      "err": "warning",
+      "expected": "degraded"
+    },
+    {
+      "tool": "crontab",
+      "code": 0,
+      "out": "",
+      "err": "",
+      "expected": "ok-empty"
+    },
+    {
+      "tool": "crontab",
+      "code": 1,
+      "out": "",
+      "err": "crontab: no crontab for fixture\n",
+      "expected": "ok-absent"
+    },
+    {
+      "tool": "crontab",
+      "code": 1,
+      "out": "",
+      "err": "no crontab for fixture\n",
+      "expected": "ok-absent"
+    },
+    {
+      "tool": "crontab",
+      "code": 1,
+      "out": "",
+      "err": "",
+      "expected": "degraded"
+    },
+    {
+      "tool": "crontab",
+      "code": 1,
+      "out": "",
+      "err": "permission denied",
+      "expected": "degraded"
+    },
+    {
+      "tool": "crontab",
+      "code": 1,
+      "out": "partial",
+      "err": "crontab: no crontab for fixture\n",
+      "expected": "degraded"
+    },
+    {
+      "tool": "crontab",
+      "code": 1,
+      "out": "",
+      "err": "crontab: no crontab for fixture\nwarning\n",
+      "expected": "degraded"
+    }
+  ]
+}

@@ -9,6 +9,31 @@ Both versions share one data directory, `<repo>/data/`, one database (schema v1,
 `tattletale.pid`. Run one of them at a time. The Java version refuses to start while a Python or
 Java tattletale holds the pid file.
 
+Both producers write generated dashboard data with `formatVersion: 2`, while SQLite schema
+1 and the producer version string remain independent and unchanged by this format update.
+The shared [data contract](../docs/DATA_FORMAT.md#collection-health) defines current-epoch
+`collectionHealth` for processes, listeners, startup and crontab. Restarted watchers begin
+with unknown health, including when retained inventory exists. Failed or partial samples
+keep last-known inventory and do not emit false listener or startup removals. Startup files
+are staged before crontab; both successes advance only after the combined sample is
+accepted. Rejection after a crontab attempt degrades both checks; a rejection before that
+attempt leaves crontab health untouched.
+
+The page becomes Stale after 180 seconds; that freshness is separate from observation
+health. Listener `bindScope` classifies recorded IP literals without DNS, firewall or reachability probes;
+the legacy `exposed` flag still means wildcard binding only. This change covers the four
+polling checks, not universal watcher health or a new identity-refresh policy.
+
+Run the Java fixture check from the repository root with JAVA_HOME pointing to JDK 25:
+
+```sh
+sh tests/run_java_health_tests.sh --xml /tmp/tattletale-java-health.xml --scratch "$(mktemp -d)/fixtures"
+```
+
+It requires sqlite3 and builds only the jar. The matching Python and dashboard entry points
+are listed in the root [README](../README.md#collection-health-fixture-checks). They use
+synthetic fixtures rather than live collectors or host inventory.
+
 ## Build
 
     sh java/build.sh              # jar, then the native binary if GraalVM is found

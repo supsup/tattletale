@@ -51,6 +51,7 @@ import json
 import os
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -58,6 +59,7 @@ import threading
 import ctypes
 import time
 import urllib.parse
+import ipaddress
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # v0.0.2 layout: <repo>/python/tattletale.py; the Java version shares <repo>/data/ and the page.
@@ -117,6 +119,70 @@ def now():
 # ---- database ----
 __version__ = "0.0.2"
 SCHEMA_VERSION = 1
+FORMAT_VERSION = 2
+CHECKS = ("processes", "listeners", "startup", "crontab")
+
+
+class CollectionError(ValueError):
+    """A fixed, non-observed diagnostic; never put command output in health."""
+
+
+def bind_scope(host):
+    """Classify a literal bind address, without DNS or reachability claims."""
+    if not isinstance(host, str) or not host or host != host.strip():
+        return "unknown"
+    if host == "*":
+        return "wildcard"
+    if host.startswith("[") or host.endswith("]"):
+        if not (host.startswith("[") and host.endswith("]")):
+            return "unknown"
+        host = host[1:-1]
+        if ":" not in host:
+            return "unknown"
+    if "%" in host:
+        host, sep, zone = host.partition("%")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", zone) or ":" not in host:
+            return "unknown"
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return "unknown"
+    address = getattr(address, "ipv4_mapped", None) or address
+    if address.is_unspecified:
+        return "wildcard"
+    return "loopback" if address.is_loopback else "non-loopback"
+
+
+def command_result(argv, timeout):
+    """Run one collector with strict decoding. Callers validate its exit policy."""
+    try:
+        result = subprocess.run(argv, capture_output=True, timeout=timeout,
+                                env=dict(os.environ, LC_ALL="C"))
+        out = result.stdout.decode("utf-8") if isinstance(result.stdout, bytes) else result.stdout
+        err = result.stderr.decode("utf-8") if isinstance(result.stderr, bytes) else result.stderr
+    except subprocess.TimeoutExpired:
+        raise CollectionError("collection-timeout") from None
+    except (OSError, subprocess.SubprocessError):
+        raise CollectionError("collection-io") from None
+    except UnicodeError:
+        raise CollectionError("collection-parse") from None
+    if not isinstance(out, str) or not isinstance(err, str):
+        raise CollectionError("collection-parse")
+    return result.returncode, out, err
+
+
+def command_policy(tool, code, out, err):
+    """The supported empty-result conventions, separate from inventory parsing."""
+    if tool == "lsof" and code == 1 and out == "" and err == "":
+        return "ok-empty"
+    if tool == "crontab" and code == 1 and out == "" and re.fullmatch(
+            r"(?:crontab: )?no crontab for [^\s]+\n?", err):
+        return "ok-absent"
+    if code != 0:
+        raise CollectionError(tool + "-command")
+    if err:
+        raise CollectionError(tool + "-command")
+    return "ok-empty" if not out else "ok"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS programs(
@@ -182,10 +248,16 @@ def transaction(conn):
     conn.execute("BEGIN")
     try:
         yield conn
+        conn.execute("COMMIT")
     except BaseException:
-        conn.execute("ROLLBACK")
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            try:
+                conn.close()  # Unknown transaction state must never be reused.
+            except sqlite3.Error:
+                pass
         raise
-    conn.execute("COMMIT")
 
 
 class Watch:
@@ -216,6 +288,34 @@ class Watch:
         self.prev_pids = None        # pid -> exe at the last process scan (None before the first)
         self.dirty_progs, self.dirty_listeners = {}, {}   # last_seen updates, flushed by save()
         self.baseline = {}
+        self.crontab_text = ""
+        # Health describes this watcher epoch; persisted inventory may be older.
+        self.collection_health = {k: {"lastAttempt": None, "lastSuccess": None,
+                                      "status": "unknown", "error": None} for k in CHECKS}
+
+    def _attempt(self, name):
+        with lock:
+            self.collection_health[name]["lastAttempt"] = now()
+
+    def _accepted(self, name):
+        with lock:
+            self.collection_health[name].update(lastSuccess=now(), status="ok", error=None)
+
+    def _rejected(self, name, error):
+        if isinstance(error, CollectionError):
+            reason = str(error) if str(error) in {"ps-command", "ps-parse", "lsof-command",
+                "lsof-parse", "crontab-command", "startup-read", "collection-io",
+                "collection-timeout", "collection-db", "collection-parse"} else "collection-parse"
+        elif isinstance(error, sqlite3.Error):
+            reason = "collection-db"
+        elif isinstance(error, subprocess.TimeoutExpired):
+            reason = "collection-timeout"
+        elif isinstance(error, OSError):
+            reason = "collection-io"
+        else:
+            reason = "collection-parse"
+        with lock:
+            self.collection_health[name].update(status="degraded", error=reason[:64])
 
     # ---- persistence ----
     def load_state(self):
@@ -333,10 +433,10 @@ class Watch:
             programs[r[0]] = v
         listeners = {}
         for r in c.execute("SELECT key, first_seen, last_seen, pid, command, exposed, user, args,"
-                           " chain, present FROM listeners"):
+                            " chain, present, address FROM listeners"):
             listeners[r[0]] = {"firstSeen": r[1], "lastSeen": r[2], "pid": r[3], "command": r[4],
                                "exposed": bool(r[5]), "user": r[6], "args": r[7], "chain": r[8],
-                               "present": bool(r[9])}
+                                "present": bool(r[9]), "bindScope": bind_scope(r[10])}
         creds = [{"time": r[0], "pid": r[1], "user": r[2], "exe": r[3], "args": r[4], "chain": r[5],
                   "source": r[6]}
                  for r in c.execute("SELECT time, pid, user, exe, args, chain, source FROM"
@@ -356,7 +456,10 @@ class Watch:
                 tail = f.read().decode("utf-8", "replace").splitlines()[-500:]
         except OSError:
             tail = []
-        payload = {"generatedAt": now(), "version": __version__, "pid": os.getpid(), "map": state, "log": tail}
+        with lock:
+            health = {k: dict(v) for k, v in self.collection_health.items()}
+        payload = {"generatedAt": now(), "version": __version__, "pid": os.getpid(), "map": state,
+                   "log": tail, "formatVersion": FORMAT_VERSION, "collectionHealth": health}
         fd, tmp = tempfile.mkstemp(dir=d, prefix=".tattletale-data.", suffix=".tmp")
         with os.fdopen(fd, "w") as f:
             f.write("window.TATTLETALE = ")
@@ -365,21 +468,22 @@ class Watch:
         os.replace(tmp, os.path.join(d, "tattletale-data.js"))
 
     NOTIFY_KINDS = {"CREDENTIAL": "Credential prompt", "CRED-NET": "Git network credential lookup",
-                    "LISTEN!": "Port exposed to the network", "STARTUP+": "Startup item added",
+                    "LISTEN!": "Listener bound to all interfaces", "STARTUP+": "Startup item added",
                     "STARTUP~": "Startup item changed", "STARTUP-": "Startup item removed",
                     "UNSIGNED": "Unsigned program ran", "PASSWORD": "Password dialog"}
 
-    def log(self, kind, msg):
-        t = now()
+    def log(self, kind, msg, stored=False, event_time=None):
+        t = event_time or now()
         line = f"{t}  {kind:<9} {msg}"
         with lock:
             self._rotate()
             with open(self.log_path, "a") as f:
                 f.write(line + "\n")
-            try:
-                self.db.execute("INSERT INTO events(time, kind, message) VALUES (?,?,?)", (t, kind, msg))
-            except sqlite3.Error as e:
-                print(f"tattletale: event not stored in database: {e}", file=sys.stderr, flush=True)
+            if not stored:
+                try:
+                    self.db.execute("INSERT INTO events(time, kind, message) VALUES (?,?,?)", (t, kind, msg))
+                except sqlite3.Error as e:
+                    print(f"tattletale: event not stored in database: {e}", file=sys.stderr, flush=True)
         print(line, flush=True)
         if kind in self.NOTIFY_KINDS:
             self.notify(kind, msg)
@@ -417,27 +521,33 @@ class Watch:
     # ---- process table ----
     @staticmethod
     def processes():
-        """pid -> (ppid, user, exe path, args). ps comm= is the full executable path on macOS;
-        args= is the command line, read separately so a helper started through a shell
-        (argv: /bin/sh .../git-credential-x) is still recognised by name."""
-        out = subprocess.run(["ps", "-axo", "pid=,ppid=,user=,comm="], capture_output=True,
-                             text=True, errors="replace", timeout=20).stdout
-        argv = subprocess.run(["ps", "-axo", "pid=,args="], capture_output=True,
-                              text=True, errors="replace", timeout=20).stdout
+        """A complete, validated pair of ps samples; PID churn between them is normal."""
+        code, out, err = command_result(["ps", "-axo", "pid=,ppid=,user=,comm="], 20)
+        command_policy("ps", code, out, err)
+        code, argv, err = command_result(["ps", "-axo", "pid=,args="], 20)
+        command_policy("ps", code, argv, err)
         args = {}
         for line in argv.splitlines():
+            if not line.strip():
+                continue
             parts = line.split(None, 1)
-            if len(parts) == 2 and parts[0].isdigit():
-                args[int(parts[0])] = parts[1].strip()
+            if not parts or not parts[0].isdigit() or int(parts[0]) <= 0 or int(parts[0]) in args:
+                raise CollectionError("ps-parse")
+            args[int(parts[0])] = parts[1].strip() if len(parts) == 2 else ""
         procs = {}
         for line in out.splitlines():
+            if not line.strip():
+                continue
             parts = line.split(None, 3)
-            if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
-                pid = int(parts[0])
-                exe = parts[3].strip()
-                if not exe.startswith("/") and not exe.startswith("("):
-                    exe = pid_path(pid) or exe
-                procs[pid] = (int(parts[1]), parts[2], exe, args.get(pid, ""))
+            if (len(parts) != 4 or not parts[0].isdigit() or not parts[1].isdigit()
+                    or int(parts[0]) <= 0 or int(parts[0]) in procs or not parts[3].strip()):
+                raise CollectionError("ps-parse")
+            pid, exe = int(parts[0]), parts[3].strip()
+            if not exe.startswith("/") and not exe.startswith("("):
+                exe = pid_path(pid) or exe
+            procs[pid] = (int(parts[1]), parts[2], exe, args.get(pid, ""))
+        if not procs or not args:
+            raise CollectionError("ps-parse")
         return procs
 
     @staticmethod
@@ -522,134 +632,212 @@ class Watch:
 
     # ---- 1 and 3: processes ----
     def check_processes(self):
-        procs = self.processes()
-        t = now()
-        first_scan = self.prev_pids is None
-        cur, new_progs, sightings, creds = {}, [], [], []
-        for pid, (ppid, user, exe, argline) in procs.items():
-            if (exe.startswith("(") and exe.endswith(")")) or exe == "<defunct>":
-                continue  # a process in the middle of exiting; its name is not a program path
-            cur[pid] = exe
-            if first_scan or self.prev_pids.get(pid) != exe:
-                sightings.append((t, pid, exe, user, argline[:1000], self.chain(procs, pid, 8)))
-            base = os.path.basename(exe)
-            head = " ".join(os.path.basename(a) for a in argline.split()[:2])
-            if (any(c.lower() in base.lower() or c.lower() in head.lower() for c in CRED_NAMES)
-                    and pid not in self.cred_seen_pids):
-                self.cred_seen_pids.add(pid)
-                if not self.baseline["programs"]:
-                    chain = self.chain(procs, pid)
-                    self.log("CREDENTIAL", f"pid {pid} user {user} {exe} | args: {argline[:300]} "
-                                           f"| chain: {chain}")
-                    creds.append((t, "ps", pid, user, exe, argline[:1000], self.chain(procs, pid, 12)))
-            if exe not in self.known_progs:
-                self.known_progs.add(exe)
-                new_progs.append((exe, t, t, user, pid, argline[:1000], self.chain(procs, ppid, 6)))
-                if not self.baseline["programs"]:
-                    with lock:
-                        self.announce[exe] = argline[:1000]
-                    self.log("NEW-PROG", f"pid {pid} user {user} {exe} | args: {argline[:300]} "
-                                         f"| chain: {self.chain(procs, pid)}")
-            else:
-                self.dirty_progs[exe] = t
-        with lock, transaction(self.db) as c:
-            c.executemany("INSERT OR IGNORE INTO programs(exe, first_seen, last_seen, user, first_pid,"
-                          " first_args, parent) VALUES (?,?,?,?,?,?,?)", new_progs)
-            if first_scan:
-                # A restart must not re-record instances the last run already saw.
-                sightings = [s for s in sightings if c.execute(
-                    "SELECT 1 FROM sightings WHERE exe=? AND pid=? LIMIT 1", (s[2], s[1])).fetchone() is None]
-            c.executemany("INSERT INTO sightings(time, pid, exe, user, args, chain) VALUES (?,?,?,?,?,?)",
-                          sightings)
-            c.executemany("INSERT INTO credential_events(time, source, pid, user, exe, args, chain)"
-                          " VALUES (?,?,?,?,?,?,?)", creds)
-        # Queue identity lookups only now, so the program row exists when the worker updates it.
+        self._attempt("processes")
+        try:
+            procs = self.processes()
+            t = now()
+            first_scan = self.prev_pids is None
+            cur, new_progs, sightings, creds, events = {}, [], [], [], []
+            known, cred_seen = set(self.known_progs), set(self.cred_seen_pids)
+            announce, dirty = {}, dict(self.dirty_progs)
+            for pid, (ppid, user, exe, argline) in procs.items():
+                if (exe.startswith("(") and exe.endswith(")")) or exe == "<defunct>":
+                    continue
+                cur[pid] = exe
+                if first_scan or self.prev_pids.get(pid) != exe:
+                    sightings.append((t, pid, exe, user, argline[:1000], self.chain(procs, pid, 8)))
+                base = os.path.basename(exe)
+                head = " ".join(os.path.basename(a) for a in argline.split()[:2])
+                if (any(c.lower() in base.lower() or c.lower() in head.lower() for c in CRED_NAMES)
+                        and pid not in cred_seen):
+                    cred_seen.add(pid)
+                    if not self.baseline["programs"]:
+                        chain = self.chain(procs, pid)
+                        events.append(("CREDENTIAL", f"pid {pid} user {user} {exe} | args: {argline[:300]} "
+                                       f"| chain: {chain}"))
+                        creds.append((t, "ps", pid, user, exe, argline[:1000], self.chain(procs, pid, 12)))
+                if exe not in known:
+                    known.add(exe)
+                    new_progs.append((exe, t, t, user, pid, argline[:1000], self.chain(procs, ppid, 6)))
+                    if not self.baseline["programs"]:
+                        announce[exe] = argline[:1000]
+                        events.append(("NEW-PROG", f"pid {pid} user {user} {exe} | args: {argline[:300]} "
+                                       f"| chain: {self.chain(procs, pid)}"))
+                else:
+                    dirty[exe] = t
+            if self.baseline["programs"]:
+                events.append(("BASELINE", f"programs: {len(known)} recorded"))
+            with lock:
+                with transaction(self.db) as c:
+                    c.executemany("INSERT OR IGNORE INTO programs(exe, first_seen, last_seen, user, first_pid,"
+                                  " first_args, parent) VALUES (?,?,?,?,?,?,?)", new_progs)
+                    if first_scan:
+                        sightings = [s for s in sightings if c.execute(
+                            "SELECT 1 FROM sightings WHERE exe=? AND pid=? LIMIT 1", (s[2], s[1])).fetchone() is None]
+                    c.executemany("INSERT INTO sightings(time, pid, exe, user, args, chain) VALUES (?,?,?,?,?,?)",
+                                  sightings)
+                    c.executemany("INSERT INTO credential_events(time, source, pid, user, exe, args, chain)"
+                                  " VALUES (?,?,?,?,?,?,?)", creds)
+                    c.executemany("INSERT INTO events(time, kind, message) VALUES (?,?,?)",
+                                  [(t, kind, message) for kind, message in events])
+                self.known_progs, self.cred_seen_pids = known, cred_seen & set(procs)
+                # Identity completion can remove older announcements during collection.
+                self.announce.update(announce)
+                self.dirty_progs, self.prev_pids = dirty, cur
+                self.baseline["programs"] = False
+        except (OSError, subprocess.SubprocessError, sqlite3.Error, ValueError) as e:
+            self._rejected("processes", e)
+            return False
         for row in new_progs:
             if row[0].startswith("/"):
                 self.ident_q.put(row[0])
-        self.prev_pids = cur
-        self.cred_seen_pids &= set(procs)
-        if self.baseline["programs"]:
-            self.log("BASELINE", f"programs: {len(self.known_progs)} recorded")
-            self.baseline["programs"] = False
+        self._accepted("processes")
+        for kind, message in events:
+            self.log(kind, message, stored=True, event_time=t)
+        return True
 
     # ---- 2: listeners ----
     def check_listeners(self):
-        out = subprocess.run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"],
-                             capture_output=True, text=True, timeout=60).stdout
-        seen = self.listeners
-        procs = self.processes()
-        present = set()
-        new_rows = []
-        pid, cmd = None, None
-        t = now()
-        for line in out.splitlines():
-            if line.startswith("p"):
-                pid = line[1:]
-            elif line.startswith("c"):
-                cmd = line[1:]
-            elif line.startswith("n") and pid:
-                addr = line[1:]
-                host, _, port = addr.rpartition(":")
-                exposed = host in ("*", "0.0.0.0", "[::]", "::")
-                # The full path, which may hold spaces ("/Applications/Google Chrome.app/...");
-                # the first word of the command line would cut it at the first space.
-                exe = (procs.get(int(pid), (0, "", "", ""))[2] if str(pid).isdigit() else "") or \
-                      (pid_path(int(pid)) if str(pid).isdigit() else None) or \
-                      self.args(pid).split(" ")[0] or cmd
+        self._attempt("listeners")
+        try:
+            code, out, err = command_result(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"], 60)
+            command_policy("lsof", code, out, err)
+            records, pid, cmd, named, pending_fd = [], None, None, False, False
+            for line in out.splitlines():
+                if not line:
+                    continue
+                tag, value = line[0], line[1:]
+                if tag == "p":
+                    if pending_fd or (pid is not None and not named):
+                        raise CollectionError("lsof-parse")
+                    if not value.isdigit() or int(value) <= 0:
+                        raise CollectionError("lsof-parse")
+                    pid, cmd, named = int(value), None, False
+                elif tag == "c" and pid is not None and cmd is None and value:
+                    cmd = value
+                elif tag == "f" and pid is not None and cmd:
+                    if pending_fd or not re.fullmatch(r"[0-9]+", value):
+                        raise CollectionError("lsof-parse")
+                    pending_fd = True
+                elif tag == "n" and pid is not None and cmd:
+                    host, sep, port = value.rpartition(":")
+                    if not sep or not host or any(x.isspace() for x in host) or not port.isdigit() or not 0 < int(port) <= 65535:
+                        raise CollectionError("lsof-parse")
+                    records.append((pid, cmd, value, host, int(port)))
+                    named = True
+                    pending_fd = False
+                else:
+                    raise CollectionError("lsof-parse")
+            if pending_fd or (pid is not None and not named) or (out and not records):
+                raise CollectionError("lsof-parse")
+            procs = self.processes() if records else {}
+            seen = {k: dict(v) for k, v in self.listeners.items()}
+            dirty = dict(self.dirty_listeners)
+            present, new_rows, events = set(), [], []
+            t = now()
+            for pid, cmd, addr, host, port in records:
+                p = procs.get(pid)
+                exe = p[2] if p else pid_path(pid)
+                if not exe or not exe.startswith("/"):
+                    code, comm, err = command_result(["ps", "-o", "comm=", "-p", str(pid)], 20)
+                    rows = comm.splitlines()
+                    if code != 0 or err or len(rows) != 1 or not rows[0].strip():
+                        raise CollectionError("lsof-parse")
+                    exe = rows[0].strip()
+                if (not exe.startswith("/") or exe == "<defunct>"
+                        or (exe.startswith("(") and exe.endswith(")"))):
+                    raise CollectionError("lsof-parse")
                 key = f"{exe} {addr}"
                 if key in present:
                     continue
                 present.add(key)
+                exposed = host in ("*", "0.0.0.0", "[::]", "::")
                 if key not in seen:
-                    p = procs.get(int(pid), (0, "?", exe, ""))
-                    chain = self.chain(procs, int(pid), 8)
+                    user, args = (p[1], p[3]) if p else ("?", "")
+                    chain = self.chain(procs, pid, 8)
                     seen[key] = {"present": True, "exposed": exposed}
-                    new_rows.append((key, exe, host, int(port) if port.isdigit() else None, cmd,
-                                     int(pid), p[1], p[3][:1000], chain, int(exposed), 1, t, t))
+                    new_rows.append((key, exe, host, port, cmd, pid, user, args[:1000], chain,
+                                     int(exposed), 1, t, t))
                     if not self.baseline["listeners"]:
-                        self.log("LISTEN" + ("!" if exposed else ""),
-                                 f"{'EXPOSED on all interfaces ' if exposed else ''}{cmd} pid {pid} "
-                                 f"listening on {addr} ({exe}) user {p[1]} "
-                                 f"| chain: {chain}")
+                        events.append(("LISTEN" + ("!" if exposed else ""),
+                                       f"{'EXPOSED on all interfaces ' if exposed else ''}{cmd} pid {pid} "
+                                       f"listening on {addr} ({exe}) user {user} | chain: {chain}"))
                 else:
-                    self.dirty_listeners[key] = t
-        changed = []
-        for k, v in seen.items():
-            was = v["present"]
-            v["present"] = k in present
-            if was != v["present"]:
-                changed.append((int(v["present"]), k))
-            if was and not v["present"] and not self.baseline["listeners"]:
-                self.log("UNLISTEN", f"stopped listening: {k}")
-        with lock, transaction(self.db) as c:
-            c.executemany("INSERT OR IGNORE INTO listeners(key, exe, address, port, command, pid, user,"
-                          " args, chain, exposed, present, first_seen, last_seen)"
-                          " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", new_rows)
-            c.executemany("UPDATE listeners SET present=? WHERE key=?", changed)
-        if self.baseline["listeners"]:
-            exposed = [k for k, v in seen.items() if v["exposed"]]
-            self.log("BASELINE", f"listeners: {len(seen)} recorded, {len(exposed)} on all interfaces: "
-                                 + "; ".join(exposed))
-            self.baseline["listeners"] = False
+                    dirty[key] = t
+            changed = []
+            for key, value in seen.items():
+                was = value["present"]
+                value["present"] = key in present
+                if was != value["present"]:
+                    changed.append((int(value["present"]), key))
+                if was and not value["present"] and not self.baseline["listeners"]:
+                    events.append(("UNLISTEN", f"stopped listening: {key}"))
+            if self.baseline["listeners"]:
+                exposed = [k for k, v in seen.items() if v["exposed"]]
+                events.append(("BASELINE", f"listeners: {len(seen)} recorded, {len(exposed)} on all interfaces: "
+                               + "; ".join(exposed)))
+            with lock:
+                with transaction(self.db) as c:
+                    c.executemany("INSERT OR IGNORE INTO listeners(key, exe, address, port, command, pid, user,"
+                                  " args, chain, exposed, present, first_seen, last_seen)"
+                                  " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", new_rows)
+                    c.executemany("UPDATE listeners SET present=? WHERE key=?", changed)
+                    c.executemany("INSERT INTO events(time, kind, message) VALUES (?,?,?)",
+                                  [(t, kind, message) for kind, message in events])
+                self.listeners, self.dirty_listeners = seen, dirty
+                self.baseline["listeners"] = False
+        except (OSError, subprocess.SubprocessError, sqlite3.Error, ValueError) as e:
+            self._rejected("listeners", e)
+            return False
+        self._accepted("listeners")
+        for kind, message in events:
+            self.log(kind, message, stored=True, event_time=t)
+        return True
 
     # ---- 4: startup items ----
-    def startup_snapshot(self):
-        snap = {}
-        for d in STARTUP_DIRS:
+    def _startup_files(self):
+        """Stage filesystem hashes and copy bytes without changing any accepted state."""
+        def optional_absent(path):
+            if os.path.lexists(path):
+                raise CollectionError("startup-read")
+            ancestor = os.path.dirname(os.path.abspath(path))
+            while True:
+                if os.path.islink(ancestor) and not os.path.exists(ancestor):
+                    raise CollectionError("startup-read")
+                parent = os.path.dirname(ancestor)
+                if parent == ancestor:
+                    break
+                ancestor = parent
+        contents = {}
+        for directory in STARTUP_DIRS:
             try:
-                names = sorted(os.listdir(d))
-            except OSError:
+                names = sorted(os.listdir(directory))
+            except FileNotFoundError:
+                optional_absent(directory)
                 continue
-            for n in names:
-                p = os.path.join(d, n)
-                snap[p] = self.hash_file(p)
-        for p in STARTUP_FILES + self.extra_startup:
-            if os.path.exists(p):
-                snap[p] = self.hash_file(p)
-        r = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-        self.crontab_text = r.stdout if r.returncode == 0 else ""
-        snap["crontab -l"] = hashlib.sha256(r.stdout.encode()).hexdigest() if r.returncode == 0 else "none"
+            for name in names:
+                path = os.path.join(directory, name)
+                with open(path, "rb") as f:
+                    contents[path] = f.read()
+        for path in STARTUP_FILES + self.extra_startup:
+            try:
+                with open(path, "rb") as f:
+                    contents[path] = f.read()
+            except FileNotFoundError:
+                optional_absent(path)
+        return {p: hashlib.sha256(data).hexdigest() for p, data in contents.items()}, contents
+
+    @staticmethod
+    def _crontab_sample():
+        code, out, err = command_result(["crontab", "-l"], 20)
+        policy = command_policy("crontab", code, out, err)
+        return ("none" if policy == "ok-absent" else hashlib.sha256(out.encode()).hexdigest()), out
+
+    def startup_snapshot(self):
+        """Return a validated candidate map; accepted state/text belongs to check_startup."""
+        snap, _ = self._startup_files()
+        digest, _ = self._crontab_sample()
+        snap["crontab -l"] = digest
         return snap
 
     def content(self, p):
@@ -665,18 +853,43 @@ class Watch:
     def safe_name(p):
         return re.sub(r"[^A-Za-z0-9._-]+", "_", p.strip("/")) or "root"
 
-    def keep_copy(self, p, digest):
+    def keep_copy(self, p, digest, data=None):
         """Save a copy of a startup item under startup-snapshots/, named by path and hash, so
         any later change can be diffed against it. Returns the copy's path or None."""
-        data = self.content(p)
+        if data is None:
+            data = self.content(p)
+        elif p != "crontab -l":
+            data = data[:4 * 1024 * 1024]
         if data is None or digest.startswith("unreadable"):
             return None
         d = os.path.join(self.snap_dir, self.safe_name(p))
         os.makedirs(d, exist_ok=True)
         dest = os.path.join(d, digest[:16])
-        if not os.path.exists(dest):
-            with open(dest, "wb") as f:
+        def existing_matches():
+            try:
+                fd = os.open(dest, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            except FileNotFoundError:
+                return False
+            with os.fdopen(fd, "rb") as f:
+                if not stat.S_ISREG(os.fstat(f.fileno()).st_mode) or f.read(len(data) + 1) != data:
+                    raise OSError("startup-copy")
+            return True
+        if existing_matches():
+            return dest
+        fd, pending = tempfile.mkstemp(prefix=".copy-", dir=d)
+        try:
+            with os.fdopen(fd, "wb") as f:
                 f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.link(pending, dest)
+            except FileExistsError:
+                if not existing_matches():
+                    raise OSError("startup-copy")
+        finally:
+            if os.path.exists(pending):
+                os.unlink(pending)
         return dest
 
     def diff(self, old_copy, new_copy, limit=40):
@@ -698,38 +911,57 @@ class Watch:
             return f"unreadable: {e.strerror}"
 
     def check_startup(self):
-        snap = self.startup_snapshot()
-        old = self.startup
-        t = now()
-        versions = []  # (path, hash, copy_path, seen_at) for each version not seen before
-        if self.baseline["startup"]:
-            for p, h in snap.items():
-                versions.append((p, h, self.keep_copy(p, h), t))
-        else:
-            for p in sorted(set(snap) | set(old)):
-                if p not in old:
-                    c = self.keep_copy(p, snap[p])
-                    versions.append((p, snap[p], c, t))
-                    self.log("STARTUP+", f"added: {p} | copy: {c}")
-                elif p not in snap:
-                    self.log("STARTUP-", f"removed: {p} | last copy: "
-                                         f"{os.path.join(self.snap_dir, self.safe_name(p), old[p][:16])}")
-                elif snap[p] != old[p]:
-                    old_copy = os.path.join(self.snap_dir, self.safe_name(p), old[p][:16])
-                    new_copy = self.keep_copy(p, snap[p])
-                    versions.append((p, snap[p], new_copy, t))
-                    self.log("STARTUP~", f"changed: {p} | before: {old_copy} | after: {new_copy}\n"
-                                         + self.diff(old_copy, new_copy))
-        with lock, transaction(self.db) as c:
-            c.executemany("DELETE FROM startup_items WHERE path=?", [(p,) for p in old if p not in snap])
-            c.executemany("INSERT OR REPLACE INTO startup_items(path, hash, last_checked) VALUES (?,?,?)",
-                          [(p, h, t) for p, h in snap.items()])
-            c.executemany("INSERT INTO startup_versions(path, hash, copy_path, seen_at) VALUES (?,?,?,?)",
-                          versions)
-        self.startup = snap
-        if self.baseline["startup"]:
-            self.log("BASELINE", f"startup items: {len(snap)} recorded, copies in {self.snap_dir}")
-            self.baseline["startup"] = False
+        self._attempt("startup")
+        crontab_attempted = False
+        try:
+            try:
+                snap, contents = self._startup_files()
+            except OSError:
+                raise CollectionError("startup-read") from None
+            self._attempt("crontab")
+            crontab_attempted = True
+            digest, crontab_text = self._crontab_sample()
+            snap["crontab -l"], contents["crontab -l"] = digest, crontab_text.encode()
+            old, t = self.startup, now()
+            versions, events = [], []
+            for path in sorted(snap):
+                if self.baseline["startup"] or path not in old or old[path] != snap[path]:
+                    copy = self.keep_copy(path, snap[path], contents[path])
+                    versions.append((path, snap[path], copy, t))
+                    if not self.baseline["startup"]:
+                        if path not in old:
+                            events.append(("STARTUP+", f"added: {path} | copy: {copy}"))
+                        else:
+                            before = os.path.join(self.snap_dir, self.safe_name(path), old[path][:16])
+                            events.append(("STARTUP~", f"changed: {path} | before: {before} | after: {copy}\n"
+                                           + self.diff(before, copy)))
+            if not self.baseline["startup"]:
+                for path in sorted(set(old) - set(snap)):
+                    before = os.path.join(self.snap_dir, self.safe_name(path), old[path][:16])
+                    events.append(("STARTUP-", f"removed: {path} | last copy: {before}"))
+            if self.baseline["startup"]:
+                events.append(("BASELINE", f"startup items: {len(snap)} recorded, copies in {self.snap_dir}"))
+            with lock:
+                with transaction(self.db) as c:
+                    c.executemany("DELETE FROM startup_items WHERE path=?", [(p,) for p in old if p not in snap])
+                    c.executemany("INSERT OR REPLACE INTO startup_items(path, hash, last_checked) VALUES (?,?,?)",
+                                  [(p, h, t) for p, h in snap.items()])
+                    c.executemany("INSERT INTO startup_versions(path, hash, copy_path, seen_at) VALUES (?,?,?,?)",
+                                  versions)
+                    c.executemany("INSERT INTO events(time, kind, message) VALUES (?,?,?)",
+                                  [(t, kind, message) for kind, message in events])
+                self.startup, self.crontab_text = snap, crontab_text
+                self.baseline["startup"] = False
+        except (OSError, subprocess.SubprocessError, sqlite3.Error, ValueError) as e:
+            self._rejected("startup", e)
+            if crontab_attempted:
+                self._rejected("crontab", e)
+            return False
+        self._accepted("startup")
+        self._accepted("crontab")
+        for kind, message in events:
+            self.log(kind, message, stored=True, event_time=t)
+        return True
 
     # ---- 1b: short-lived credential and git network helpers from the unified log ----
     STREAM_PROCS = ("git-credential-osxkeychain", "git-remote-https", "git-remote-http",

@@ -38,6 +38,79 @@ import java.util.regex.Pattern;
 final class Watch {
     static final String VERSION = "0.0.2";
     static final int SCHEMA_VERSION = 1;
+    final CollectionHealth collectionHealth = new CollectionHealth();
+    java.util.function.Supplier<String> clock = Watch::now;
+    interface Sources {
+        Proc.Result run(List<String> command, long timeout) throws IOException, Proc.Timeout;
+        default String pidPath(long pid) { return PidPath.of(pid); }
+        default List<String> dirs() { return startupDirs(); }
+        default List<String> files() { return startupFiles(); }
+        default List<String> list(String dir) throws IOException {
+            List<String> result = new ArrayList<>();
+            try (java.nio.file.DirectoryStream<Path> ds = Files.newDirectoryStream(Path.of(dir))) {
+                for (Path p : ds) result.add(p.toString());
+            } catch (java.nio.file.NoSuchFileException e) { if (!optionalMissing(dir)) throw e; return result; }
+            result.sort(Watch::codepointCompare); return result;
+        }
+        default boolean optionalMissing(String name) {
+            Path path=Path.of(name).toAbsolutePath();
+            // A broken link, including an ancestor link, is failed observation, not absence.
+            for(Path p=path;p!=null;p=p.getParent()) if(Files.isSymbolicLink(p) && !Files.exists(p)) return false;
+            return !Files.exists(path,java.nio.file.LinkOption.NOFOLLOW_LINKS);
+        }
+        default String copyRoot(String actual) { return actual; }
+        default void copy(String destination, byte[] value) throws IOException {
+            Path dest=Path.of(destination), parent=dest.getParent(); Files.createDirectories(parent);
+            if(Files.exists(dest,java.nio.file.LinkOption.NOFOLLOW_LINKS)) { compareCopy(dest,value); return; }
+            Path tmp=Files.createTempFile(parent,".tattletale-copy-",".tmp");
+            try {
+                Files.write(tmp,value);
+                // Hard-link publication is atomic and never replaces an existing immutable copy.
+                try { Files.createLink(dest,tmp); }
+                catch(java.nio.file.FileAlreadyExistsException e) { compareCopy(dest,value); }
+                compareCopy(dest,value);
+            } finally { Files.deleteIfExists(tmp); }
+        }
+        default void compareCopy(Path dest,byte[] value) throws IOException {
+            if(!Files.isRegularFile(dest,java.nio.file.LinkOption.NOFOLLOW_LINKS) || !Arrays.equals(Files.readAllBytes(dest),value))
+                throw new IOException("startup-copy");
+        }
+        default byte[] copyBytes(String file) throws IOException { return Files.readAllBytes(Path.of(file)); }
+        default byte[] read(String file) throws IOException {
+            try { return Files.readAllBytes(Path.of(file)); }
+            catch (java.nio.file.NoSuchFileException e) { if (!optionalMissing(file)) throw e; return null; }
+        }
+    }
+    Sources sources = Proc::run;
+    record PendingEvent(String kind, String message) {}
+    void commitSample(List<String> sql, List<PendingEvent> events, String time) throws DbException {
+        List<String> batch = new ArrayList<>(sql);
+        for (PendingEvent e : events) batch.add(Db.bind("INSERT INTO events(time,kind,message) VALUES (?,?,?)", time,e.kind(),e.message()));
+        synchronized (LOCK) { db.transaction(batch); }
+    }
+    void publishEvents(List<PendingEvent> events, String time) {
+        for (PendingEvent e : events) {
+            String line=time+"  "+Py.ljust(e.kind(),9)+" "+e.message();
+            synchronized (LOCK) {
+                rotate();
+                try { Files.writeString(Path.of(logPath),line+"\n",StandardCharsets.UTF_8,StandardOpenOption.CREATE,StandardOpenOption.APPEND); }
+                catch(IOException ignored) { ERR.println("tattletale: event log write failed"); }
+            }
+            OUT.println(line);
+            if(NOTIFY_KINDS.containsKey(e.kind())) notify(e.kind(),e.message());
+        }
+    }
+    interface CollectionCheck { void run() throws IOException, Proc.Timeout, DbException; }
+    void collect(String key, CollectionCheck check) {
+        collectionHealth.attempt(key,clock.get());
+        try { check.run(); collectionHealth.success(key,clock.get()); }
+        catch(CollectionHealth.Rejected e) { collectionHealth.fail(key,e.code); }
+        catch(IOException e) { collectionHealth.fail(key,CollectionHealth.ioError(e)); }
+        catch(Proc.Timeout e) { collectionHealth.fail(key,"collection-timeout"); }
+        catch(DbException e) { collectionHealth.fail(key,"collection-db"); }
+        catch(IllegalArgumentException e) { collectionHealth.fail(key,"collection-parse"); }
+    }
+
     // Byte-identical to python/tattletale.py's SCHEMA, so both versions share one database.
     static final String SCHEMA = """
 
@@ -78,7 +151,7 @@ final class Watch {
     static {
         NOTIFY_KINDS.put("CREDENTIAL", "Credential prompt");
         NOTIFY_KINDS.put("CRED-NET", "Git network credential lookup");
-        NOTIFY_KINDS.put("LISTEN!", "Port exposed to the network");
+        NOTIFY_KINDS.put("LISTEN!", "Listener bound to all interfaces");
         NOTIFY_KINDS.put("STARTUP+", "Startup item added");
         NOTIFY_KINDS.put("STARTUP~", "Startup item changed");
         NOTIFY_KINDS.put("STARTUP-", "Startup item removed");
@@ -422,7 +495,7 @@ final class Watch {
             programs.put(Db.asStr(r.get("exe")), v);
         }
         Map<String, Object> ls = new LinkedHashMap<>();
-        for (Map<String, Object> r : db.query("SELECT key, first_seen, last_seen, pid, command, exposed, user, args,"
+        for (Map<String, Object> r : db.query("SELECT key, address, first_seen, last_seen, pid, command, exposed, user, args,"
                 + " chain, present FROM listeners;")) {
             Map<String, Object> v = new LinkedHashMap<>();
             v.put("firstSeen", r.get("first_seen"));
@@ -430,6 +503,7 @@ final class Watch {
             v.put("pid", r.get("pid"));
             v.put("command", r.get("command"));
             v.put("exposed", Py.truthy(r.get("exposed")));
+            v.put("bindScope", CollectionHealth.bindScope(Db.asStr(r.get("address"))));
             v.put("user", r.get("user"));
             v.put("args", r.get("args"));
             v.put("chain", r.get("chain"));
@@ -472,7 +546,9 @@ final class Watch {
     /** tattletale-data.js for tattletale.html, written to a temp file and renamed into place. */
     void writePageData(String d, Map<String, Object> state) throws IOException {
         Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("generatedAt", now());
+        payload.put("generatedAt", clock.get());
+        payload.put("formatVersion", 2);
+        payload.put("collectionHealth", collectionHealth.snapshot());
         payload.put("version", VERSION);
         payload.put("pid", ProcessHandle.current().pid());
         payload.put("map", state);
@@ -563,27 +639,32 @@ final class Watch {
      * is the command line, read separately so a helper started through a shell is still
      * recognised by name.
      */
-    static Map<Long, P> processes() throws IOException, Proc.Timeout {
-        String out = Proc.run(List.of("ps", "-axo", "pid=,ppid=,user=,comm="), 20).out();
-        String argv = Proc.run(List.of("ps", "-axo", "pid=,args="), 20).out();
-        Map<Long, String> args = new HashMap<>();
-        for (String line : Py.splitlines(argv)) {
-            List<String> parts = Py.split(line, 1);
-            if (parts.size() == 2 && Py.isDigits(parts.get(0))) args.put(Long.parseLong(parts.get(0)), Py.strip(parts.get(1)));
+    Map<Long, P> processes() throws IOException, Proc.Timeout {
+        Proc.Result comm = sources.run(List.of("ps","-axo","pid=,ppid=,user=,comm="),20);
+        Proc.Result argv = sources.run(List.of("ps","-axo","pid=,args="),20);
+        CollectionHealth.command("ps",comm); CollectionHealth.command("ps",argv);
+        Map<Long,String> args = new HashMap<>();
+        for(String line:Py.splitlines(argv.out())) {
+            if(line.isBlank()) continue;
+            List<String> parts=Py.split(line,1);
+            if(parts.isEmpty() || !Py.isDigits(parts.get(0))) throw new CollectionHealth.Rejected("ps-parse");
+            long pid=Long.parseLong(parts.get(0)); if(pid<=0) throw new CollectionHealth.Rejected("ps-parse");
+            if(args.put(pid,parts.size()==1?"":Py.strip(parts.get(1)))!=null) throw new CollectionHealth.Rejected("ps-parse");
         }
-        Map<Long, P> procs = new LinkedHashMap<>();
-        for (String line : Py.splitlines(out)) {
-            List<String> parts = Py.split(line, 3);
-            if (parts.size() == 4 && Py.isDigits(parts.get(0)) && Py.isDigits(parts.get(1))) {
-                long pid = Long.parseLong(parts.get(0));
-                String exe = Py.strip(parts.get(3));
-                if (!exe.startsWith("/") && !exe.startsWith("(")) {
-                    String pp = PidPath.of(pid);
-                    if (pp != null && !pp.isEmpty()) exe = pp;
-                }
-                procs.put(pid, new P(Long.parseLong(parts.get(1)), parts.get(2), exe, args.getOrDefault(pid, "")));
+        Map<Long,P> procs=new LinkedHashMap<>();
+        for(String line:Py.splitlines(comm.out())) {
+            if(line.isBlank()) continue;
+            List<String> parts=Py.split(line,3);
+            if(parts.size()!=4 || !Py.isDigits(parts.get(0)) || !Py.isDigits(parts.get(1))) throw new CollectionHealth.Rejected("ps-parse");
+            long pid=Long.parseLong(parts.get(0)); if(pid<=0) throw new CollectionHealth.Rejected("ps-parse"); String exe=Py.strip(parts.get(3));
+            if(!exe.startsWith("/") && !exe.startsWith("(")) {
+                String pp=sources.pidPath(pid); if(pp!=null && !pp.isEmpty()) exe=pp;
             }
+            // ps calls race normally: a missing argv row does not erase a primary process.
+            if(procs.put(pid,new P(Long.parseLong(parts.get(1)),parts.get(2),exe,args.getOrDefault(pid,"")))!=null)
+                throw new CollectionHealth.Rejected("ps-parse");
         }
+        if(procs.isEmpty() || args.isEmpty()) throw new CollectionHealth.Rejected("ps-parse");
         return procs;
     }
 
@@ -704,9 +785,15 @@ final class Watch {
     }
 
     // ---- 1 and 3: processes ----
-    void checkProcesses() throws IOException, Proc.Timeout, DbException {
+    void checkProcesses() { collect("processes",this::applyProcesses); }
+    void applyProcesses() throws IOException, Proc.Timeout, DbException {
         Map<Long, P> procs = processes();
-        String t = now();
+        String t = clock.get();
+        Set<String> proposedKnown = new HashSet<>(knownProgs);
+        Set<Long> proposedCreds = new HashSet<>(credSeenPids);
+        Map<String,String> proposedDirty = new LinkedHashMap<>(dirtyProgs);
+        Map<String,String> proposedAnnounce = new LinkedHashMap<>();
+        List<PendingEvent> events = new ArrayList<>();
         boolean firstScan = prevPids == null;
         Map<Long, String> cur = new HashMap<>();
         List<String> newProgs = new ArrayList<>();
@@ -744,146 +831,118 @@ final class Watch {
                     break;
                 }
             }
-            if (isCred && !credSeenPids.contains(pid)) {
-                credSeenPids.add(pid);
+            if (isCred && !proposedCreds.contains(pid)) {
+                proposedCreds.add(pid);
                 if (!baseline.get("programs")) {
                     String ch = chain(procs, pid);
-                    log("CREDENTIAL", "pid " + pid + " user " + user + " " + exe + " | args: " + Py.cut(argline, 300)
-                            + " | chain: " + ch);
+                    events.add(new PendingEvent("CREDENTIAL", "pid " + pid + " user " + user + " " + exe + " | args: " + Py.cut(argline, 300)
+                            + " | chain: " + ch));
                     creds.add(Db.bind("INSERT INTO credential_events(time, source, pid, user, exe, args, chain)"
                             + " VALUES (?,?,?,?,?,?,?)", t, "ps", pid, user, exe, Py.cut(argline, 1000),
                             chain(procs, pid, 12)));
                 }
             }
-            if (!knownProgs.contains(exe)) {
-                knownProgs.add(exe);
+            if (!proposedKnown.contains(exe)) {
+                proposedKnown.add(exe);
                 newProgs.add(Db.bind("INSERT OR IGNORE INTO programs(exe, first_seen, last_seen, user, first_pid,"
                         + " first_args, parent) VALUES (?,?,?,?,?,?,?)", exe, t, t, user, pid, Py.cut(argline, 1000),
                         chain(procs, p.ppid(), 6)));
                 newProgExes.add(exe);
                 if (!baseline.get("programs")) {
                     synchronized (LOCK) {
-                        announce.put(exe, Py.cut(argline, 1000));
+                        proposedAnnounce.put(exe, Py.cut(argline, 1000));
                     }
-                    log("NEW-PROG", "pid " + pid + " user " + user + " " + exe + " | args: " + Py.cut(argline, 300)
-                            + " | chain: " + chain(procs, pid));
+                    events.add(new PendingEvent("NEW-PROG", "pid " + pid + " user " + user + " " + exe + " | args: " + Py.cut(argline, 300)
+                            + " | chain: " + chain(procs, pid)));
                 }
             } else {
-                dirtyProgs.put(exe, t);
+                proposedDirty.put(exe, t);
             }
         }
         List<String> sql = new ArrayList<>(newProgs);
         sql.addAll(sightings);
         sql.addAll(creds);
-        synchronized (LOCK) {
-            db.transaction(sql);
-        }
+        if (baseline.get("programs")) events.add(new PendingEvent("BASELINE", "programs: " + proposedKnown.size() + " recorded"));
+        commitSample(sql,events,t);
+        proposedCreds.retainAll(procs.keySet());
+        knownProgs=proposedKnown; credSeenPids.clear(); credSeenPids.addAll(proposedCreds);
+        dirtyProgs=proposedDirty;
+        synchronized(LOCK) { announce.putAll(proposedAnnounce); }
         // Queue identity lookups only now, so the program row exists when the worker updates it.
         for (String exe : newProgExes) if (exe.startsWith("/")) identQ.add(exe);
         prevPids = cur;
-        credSeenPids.retainAll(procs.keySet());
-        if (baseline.get("programs")) {
-            log("BASELINE", "programs: " + knownProgs.size() + " recorded");
-            baseline.put("programs", false);
-        }
+        baseline.put("programs",false);
+        publishEvents(events,t);
     }
 
     // ---- 2: listeners ----
-    void checkListeners() throws IOException, Proc.Timeout, DbException {
-        String out = Proc.run(List.of("lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"), 60).out();
-        Map<String, Listener> seen = listeners;
-        Map<Long, P> procs = processes();
-        Set<String> present = new HashSet<>();
-        List<String> newRows = new ArrayList<>();
-        String pid = null, cmd = null;
-        String t = now();
-        for (String line : Py.splitlines(out)) {
-            if (line.startsWith("p")) pid = line.substring(1);
-            else if (line.startsWith("c")) cmd = line.substring(1);
-            else if (line.startsWith("n") && pid != null && !pid.isEmpty()) {
-                String addr = line.substring(1);
-                int c = addr.lastIndexOf(':');
-                String host = c < 0 ? "" : addr.substring(0, c);
-                String port = c < 0 ? addr : addr.substring(c + 1);
-                boolean exposed = host.equals("*") || host.equals("0.0.0.0") || host.equals("[::]") || host.equals("::");
-                boolean digit = Py.isDigits(pid);
-                // The full path, which may hold spaces ("/Applications/Google Chrome.app/..."); the
-                // first word of the command line would cut it at the first space.
-                String exe = digit && procs.containsKey(Long.parseLong(pid)) ? procs.get(Long.parseLong(pid)).exe() : "";
-                if (exe.isEmpty()) {
-                    String pp = digit ? PidPath.of(Long.parseLong(pid)) : null;
-                    exe = pp != null && !pp.isEmpty() ? pp : "";
-                }
-                if (exe.isEmpty()) exe = args(pid).split(" ", -1)[0];
-                if (exe.isEmpty()) exe = cmd;
-                String key = exe + " " + addr;
-                if (present.contains(key)) continue;
-                present.add(key);
-                if (!seen.containsKey(key)) {
-                    long ipid = Long.parseLong(pid);
-                    P p = procs.getOrDefault(ipid, new P(0, "?", exe, ""));
-                    String ch = chain(procs, ipid, 8);
-                    seen.put(key, new Listener(true, exposed));
-                    newRows.add(Db.bind("INSERT OR IGNORE INTO listeners(key, exe, address, port, command, pid, user,"
-                            + " args, chain, exposed, present, first_seen, last_seen)"
-                            + " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", key, exe, host,
-                            Py.isDigits(port) ? (Object) Long.parseLong(port) : null, cmd, ipid, p.user(),
-                            Py.cut(p.args(), 1000), ch, exposed ? 1L : 0L, 1L, t, t));
-                    if (!baseline.get("listeners")) {
-                        log("LISTEN" + (exposed ? "!" : ""), (exposed ? "EXPOSED on all interfaces " : "") + Py.str(cmd)
-                                + " pid " + pid + " listening on " + addr + " (" + exe + ") user " + p.user()
-                                + " | chain: " + ch);
-                    }
-                } else {
-                    dirtyListeners.put(key, t);
-                }
+    void checkListeners() { collect("listeners",this::applyListeners); }
+    void applyListeners() throws IOException, Proc.Timeout, DbException {
+        Proc.Result result=sources.run(List.of("lsof","-nP","-iTCP","-sTCP:LISTEN","-F","pcn"),60);
+        CollectionHealth.command("lsof",result);
+        record Row(long pid,String command,String address,String host,long port) {}
+        List<Row> rows=new ArrayList<>(); String pid=null,cmd=null; boolean addressSeen=false,inFile=false,fileAddressSeen=false;
+        for(String line:Py.splitlines(result.out())) {
+            if(line.startsWith("p")) {
+                if(pid!=null && (!addressSeen || (inFile && !fileAddressSeen))) throw new CollectionHealth.Rejected("lsof-parse");
+                pid=line.substring(1); cmd=null; addressSeen=false; inFile=false; fileAddressSeen=false;
+                if(!Py.isDigits(pid)) throw new CollectionHealth.Rejected("lsof-parse");
+                if(Long.parseLong(pid)<=0) throw new CollectionHealth.Rejected("lsof-parse");
+            } else if(line.startsWith("c") && pid!=null) {
+                if(cmd!=null || addressSeen || inFile || line.length()==1) throw new CollectionHealth.Rejected("lsof-parse");
+                cmd=line.substring(1);
+            } else if(line.startsWith("f") && pid!=null && cmd!=null) {
+                if(!line.substring(1).matches("[0-9]+") || (inFile && !fileAddressSeen)) throw new CollectionHealth.Rejected("lsof-parse");
+                inFile=true; fileAddressSeen=false;
+            } else if(line.startsWith("n") && pid!=null && cmd!=null) {
+                String addr=line.substring(1); int colon=addr.lastIndexOf(':');
+                if(colon<=0 || !Py.isDigits(addr.substring(colon+1))) throw new CollectionHealth.Rejected("lsof-parse");
+                long port=Long.parseLong(addr.substring(colon+1)); if(port<1 || port>65535 || addr.substring(0,colon).chars().anyMatch(Character::isWhitespace)) throw new CollectionHealth.Rejected("lsof-parse");
+                rows.add(new Row(Long.parseLong(pid),cmd,addr,addr.substring(0,colon),port)); addressSeen=true; fileAddressSeen=true;
+            } else throw new CollectionHealth.Rejected("lsof-parse");
+        }
+        if(pid!=null && (!addressSeen || (inFile && !fileAddressSeen))) throw new CollectionHealth.Rejected("lsof-parse");
+        Map<Long,P> procs=rows.isEmpty()?Map.of():processes();
+        Map<String,Listener> seen=new LinkedHashMap<>();
+        listeners.forEach((k,v)->seen.put(k,new Listener(v.present,v.exposed)));
+        Map<String,String> dirty=new LinkedHashMap<>(dirtyListeners);
+        Set<String> present=new HashSet<>(); List<String> sql=new ArrayList<>();
+        List<PendingEvent> events=new ArrayList<>(); String t=clock.get();
+        for(Row row:rows) {
+            P p=procs.get(row.pid()); String exe=p==null?"":p.exe();
+            if(!exe.startsWith("/")) { String pp=sources.pidPath(row.pid()); exe=pp==null?"":pp; }
+            if(!exe.startsWith("/")) {
+                Proc.Result lookup=sources.run(List.of("ps","-o","comm=","-p",Long.toString(row.pid())),20);
+                List<String> lines=Py.splitlines(lookup.out());
+                if(lookup.code()!=0 || !lookup.err().isEmpty() || lines.size()!=1)
+                    throw new CollectionHealth.Rejected("lsof-parse");
+                exe=Py.strip(lines.getFirst());
+                if(!exe.startsWith("/")) throw new CollectionHealth.Rejected("lsof-parse");
+                // comm= is the full executable path on macOS, including spaces. Never split it.
+
             }
+            String key=exe+" "+row.address(); if(!present.add(key)) continue;
+            boolean exposed=List.of("*","0.0.0.0","::","[::]").contains(row.host());
+            if(p==null) p=new P(0,"?",exe,"");
+            if(!seen.containsKey(key)) {
+                seen.put(key,new Listener(true,exposed)); String ch=chain(procs,row.pid(),8);
+                sql.add(Db.bind("INSERT OR IGNORE INTO listeners(key,exe,address,port,command,pid,user,args,chain,exposed,present,first_seen,last_seen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",key,exe,row.host(),row.port(),row.command(),row.pid(),p.user(),Py.cut(p.args(),1000),ch,exposed?1L:0L,1L,t,t));
+                if(!baseline.get("listeners")) events.add(new PendingEvent("LISTEN"+(exposed?"!":""),(exposed?"EXPOSED on all interfaces ":"")+row.command()+" pid "+row.pid()+" listening on "+row.address()+" ("+exe+") user "+p.user()+" | chain: "+ch));
+            } else dirty.put(key,t);
         }
-        List<String> changed = new ArrayList<>();
-        for (Map.Entry<String, Listener> e : seen.entrySet()) {
-            Listener v = e.getValue();
-            boolean was = v.present;
-            v.present = present.contains(e.getKey());
-            if (was != v.present) changed.add(Db.bind("UPDATE listeners SET present=? WHERE key=?", v.present ? 1L : 0L,
-                    e.getKey()));
-            if (was && !v.present && !baseline.get("listeners")) log("UNLISTEN", "stopped listening: " + e.getKey());
+        for(Map.Entry<String,Listener> e:seen.entrySet()) {
+            boolean was=e.getValue().present, next=present.contains(e.getKey()); e.getValue().present=next;
+            if(was!=next) sql.add(Db.bind("UPDATE listeners SET present=? WHERE key=?",next?1L:0L,e.getKey()));
+            if(was && !next && !baseline.get("listeners")) events.add(new PendingEvent("UNLISTEN","stopped listening: "+e.getKey()));
         }
-        List<String> sql = new ArrayList<>(newRows);
-        sql.addAll(changed);
-        synchronized (LOCK) {
-            db.transaction(sql);
+        if(baseline.get("listeners")) {
+            List<String> exposed=new ArrayList<>(); seen.forEach((k,v)->{if(v.exposed) exposed.add(k);});
+            events.add(new PendingEvent("BASELINE","listeners: "+seen.size()+" recorded, "+exposed.size()+" on all interfaces: "+String.join("; ",exposed)));
         }
-        if (baseline.get("listeners")) {
-            List<String> exposed = new ArrayList<>();
-            for (Map.Entry<String, Listener> e : seen.entrySet()) if (e.getValue().exposed) exposed.add(e.getKey());
-            log("BASELINE", "listeners: " + seen.size() + " recorded, " + exposed.size() + " on all interfaces: "
-                    + String.join("; ", exposed));
-            baseline.put("listeners", false);
-        }
+        commitSample(sql,events,t); listeners=seen; dirtyListeners=dirty; baseline.put("listeners",false); publishEvents(events,t);
     }
 
     // ---- 4: startup items ----
-    Map<String, String> startupSnapshot() throws IOException, Proc.Timeout {
-        Map<String, String> snap = new LinkedHashMap<>();
-        for (String d : startupDirs()) {
-            String[] names = new java.io.File(d).list();
-            if (names == null) continue;
-            Arrays.sort(names, Watch::codepointCompare);
-            for (String n : names) {
-                String p = Paths.join(d, n);
-                snap.put(p, hashFile(p));
-            }
-        }
-        List<String> files = new ArrayList<>(startupFiles());
-        files.addAll(extraStartup);
-        for (String p : files) if (Files.exists(Path.of(p))) snap.put(p, hashFile(p));
-        Proc.Result r = Proc.run(List.of("crontab", "-l"));
-        crontabText = r.code() == 0 ? r.out() : "";
-        snap.put("crontab -l", r.code() == 0 ? HexFormat.of().formatHex(sha256().digest(r.out().getBytes(StandardCharsets.UTF_8)))
-                : "none");
-        return snap;
-    }
-
     static int codepointCompare(String a, String b) {
         int i = 0, j = 0;
         while (i < a.length() && j < b.length()) {
@@ -929,8 +988,8 @@ final class Watch {
         List<String> a, b;
         try {
             if (oldCopy == null || newCopy == null) throw new IOException("missing");
-            a = Py.splitlines(new String(Files.readAllBytes(Path.of(oldCopy)), StandardCharsets.UTF_8));
-            b = Py.splitlines(new String(Files.readAllBytes(Path.of(newCopy)), StandardCharsets.UTF_8));
+            a = Py.splitlines(new String(sources.copyBytes(oldCopy), StandardCharsets.UTF_8));
+            b = Py.splitlines(new String(sources.copyBytes(newCopy), StandardCharsets.UTF_8));
         } catch (IOException e) {
             return "(no text diff: binary or missing copy)";
         }
@@ -948,49 +1007,52 @@ final class Watch {
         }
     }
 
-    void checkStartup() throws IOException, Proc.Timeout, DbException {
-        Map<String, String> snap = startupSnapshot();
-        Map<String, String> old = startup;
-        String t = now();
-        List<Object[]> versions = new ArrayList<>();
-        if (baseline.get("startup")) {
-            for (Map.Entry<String, String> e : snap.entrySet())
-                versions.add(new Object[] {e.getKey(), e.getValue(), keepCopy(e.getKey(), e.getValue()), t});
-        } else {
-            TreeSet<String> all = new TreeSet<>(Watch::codepointCompare);
-            all.addAll(snap.keySet());
-            all.addAll(old.keySet());
-            for (String p : all) {
-                if (!old.containsKey(p)) {
-                    String c = keepCopy(p, snap.get(p));
-                    versions.add(new Object[] {p, snap.get(p), c, t});
-                    log("STARTUP+", "added: " + p + " | copy: " + Py.str(c));
-                } else if (!snap.containsKey(p)) {
-                    log("STARTUP-", "removed: " + p + " | last copy: "
-                            + Paths.join(snapDir, safeName(p), Py.cut(old.get(p), 16)));
-                } else if (!snap.get(p).equals(old.get(p))) {
-                    String oldCopy = Paths.join(snapDir, safeName(p), Py.cut(old.get(p), 16));
-                    String newCopy = keepCopy(p, snap.get(p));
-                    versions.add(new Object[] {p, snap.get(p), newCopy, t});
-                    log("STARTUP~", "changed: " + p + " | before: " + oldCopy + " | after: " + Py.str(newCopy) + "\n"
-                            + diff(oldCopy, newCopy, 40));
+    void checkStartup() {
+        collectionHealth.attempt("startup",clock.get()); boolean cronAttempt=false;
+        try {
+            Map<String,byte[]> bytes=new LinkedHashMap<>();
+            for(String dir:sources.dirs()) for(String file:sources.list(dir)) {
+                byte[] value=sources.read(file); if(value==null) throw new CollectionHealth.Rejected("startup-read"); bytes.put(file,value);
+            }
+            List<String> files=new ArrayList<>(sources.files()); files.addAll(extraStartup);
+            for(String file:files) { byte[] value=sources.read(file); if(value!=null) bytes.put(file,value); }
+            // Filesystem FIRST, crontab LAST. Neither success is adopted before the aggregate commits.
+            cronAttempt=true; collectionHealth.attempt("crontab",clock.get());
+            Proc.Result cron=sources.run(List.of("crontab","-l"),20);
+            String disposition=CollectionHealth.command("crontab",cron);
+            String proposedCron=disposition.equals("ok-absent")?"":cron.out();
+            bytes.put("crontab -l",proposedCron.getBytes(StandardCharsets.UTF_8));
+            Map<String,String> snap=new LinkedHashMap<>();
+            for(Map.Entry<String,byte[]> e:bytes.entrySet()) snap.put(e.getKey(),e.getKey().equals("crontab -l") && disposition.equals("ok-absent")?"none":HexFormat.of().formatHex(sha256().digest(e.getValue())));
+            String t=clock.get(); String copies=sources.copyRoot(snapDir); List<String> sql=new ArrayList<>(); List<PendingEvent> events=new ArrayList<>();
+            TreeSet<String> all=new TreeSet<>(Watch::codepointCompare); all.addAll(snap.keySet()); all.addAll(startup.keySet());
+            for(String file:all) {
+                String digest=snap.get(file), old=startup.get(file);
+                if(digest==null) {
+                    sql.add(Db.bind("DELETE FROM startup_items WHERE path=?",file));
+                    if(!baseline.get("startup")) events.add(new PendingEvent("STARTUP-","removed: "+file+" | last copy: "+Paths.join(copies,safeName(file),Py.cut(old,16))));
+                } else {
+                    sql.add(Db.bind("INSERT OR REPLACE INTO startup_items(path,hash,last_checked) VALUES (?,?,?)",file,digest,t));
+                    if(old==null || !old.equals(digest) || baseline.get("startup")) {
+                        String dest=Paths.join(copies,safeName(file),Py.cut(digest,16));
+                        byte[] value=bytes.get(file);
+                        // Preserve the existing saved-copy policy: full hash, first 4 MiB of files;
+                        // crontab content has always been saved in full.
+                        sources.copy(dest,file.equals("crontab -l")?value:Arrays.copyOf(value,Math.min(value.length,4*1024*1024)));
+                        sql.add(Db.bind("INSERT INTO startup_versions(path,hash,copy_path,seen_at) VALUES (?,?,?,?)",file,digest,dest,t));
+                        if(!baseline.get("startup")) {
+                            if(old==null) events.add(new PendingEvent("STARTUP+","added: "+file+" | copy: "+dest));
+                            else { String before=Paths.join(copies,safeName(file),Py.cut(old,16)); events.add(new PendingEvent("STARTUP~","changed: "+file+" | before: "+before+" | after: "+dest+"\n"+diff(before,dest,40))); }
+                        }
+                    }
                 }
             }
-        }
-        List<String> sql = new ArrayList<>();
-        for (String p : old.keySet()) if (!snap.containsKey(p)) sql.add(Db.bind("DELETE FROM startup_items WHERE path=?", p));
-        for (Map.Entry<String, String> e : snap.entrySet())
-            sql.add(Db.bind("INSERT OR REPLACE INTO startup_items(path, hash, last_checked) VALUES (?,?,?)", e.getKey(),
-                    e.getValue(), t));
-        for (Object[] v : versions)
-            sql.add(Db.bind("INSERT INTO startup_versions(path, hash, copy_path, seen_at) VALUES (?,?,?,?)", v));
-        synchronized (LOCK) {
-            db.transaction(sql);
-        }
-        startup = snap;
-        if (baseline.get("startup")) {
-            log("BASELINE", "startup items: " + snap.size() + " recorded, copies in " + snapDir);
-            baseline.put("startup", false);
+            if(baseline.get("startup")) events.add(new PendingEvent("BASELINE","startup items: "+snap.size()+" recorded, copies in "+copies));
+            commitSample(sql,events,t); startup=snap; crontabText=proposedCron; baseline.put("startup",false);
+            collectionHealth.success("startup",clock.get()); collectionHealth.success("crontab",clock.get()); publishEvents(events,t);
+        } catch(Exception e) {
+            String code=e instanceof CollectionHealth.Rejected r?r.code:e instanceof Proc.Timeout?"collection-timeout":e instanceof DbException?"collection-db":e instanceof IOException io && CollectionHealth.ioError(io).equals("collection-parse")?"collection-parse":!cronAttempt?"startup-read":"collection-io";
+            collectionHealth.fail("startup",code); if(cronAttempt) collectionHealth.fail("crontab",code);
         }
     }
 
