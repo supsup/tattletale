@@ -1,30 +1,40 @@
 # Tattletale quick start
 
-Two minutes from clone to dashboard.
+Two minutes from clone to dashboard. Pick the Python or the Java version; they do the same
+job and share the same data folder.
 
 ## 1. Get it
 
 ```sh
 git clone https://github.com/supsup/tattletale.git
 cd tattletale
-python3 --version        # 3.9 or newer; Apple's Command Line Tools Python is fine
 ```
 
-No packages to install.
+**Python:** `python3 --version` must be 3.9 or newer (Apple's Command Line Tools Python is
+fine). Nothing to install.
+
+**Java:** a JDK 25 on your PATH (or `JAVA_HOME`). Build once:
+
+```sh
+sh java/build.sh              # java/build/tattletale.jar, plus a native binary if GRAALVM_HOME is set
+```
 
 ## 2. Start the watcher
 
+From the repository folder:
+
 ```sh
-python3 tattletale.py
+python3 python/tattletale.py              # Python
+java -jar java/build/tattletale.jar       # Java (or java/build/tattletale for the native binary)
 ```
 
 You will see something like:
 
 ```text
-2026-01-15T09:00:00Z  START     tattletale 0.0.1 pid 4242 db /path/to/tattletale/tattletale.db
+2026-01-15T09:00:00Z  START     tattletale 0.0.2 pid 4242 db /path/to/tattletale/data/tattletale.db
 2026-01-15T09:00:01Z  BASELINE  programs: 512 recorded
 2026-01-15T09:00:04Z  BASELINE  listeners: 18 recorded, 3 on all interfaces: ...
-2026-01-15T09:00:04Z  BASELINE  startup items: 14 recorded, copies in .../startup-snapshots
+2026-01-15T09:00:04Z  BASELINE  startup items: 14 recorded, copies in .../data/startup-snapshots
 ```
 
 The first run records what is already on your Mac as the baseline. From then on it reports
@@ -37,19 +47,19 @@ only changes, for example:
 2026-01-15T09:25:00Z  LISTEN!   EXPOSED on all interfaces example-server pid 7070 listening on *:8000 ...
 ```
 
-Leave it running in a terminal tab. Stop it with Ctrl-C.
+Leave it running in a terminal tab. Stop it with Ctrl-C. Only one watcher runs at a time; a
+second one (of either version) refuses and tells you which pid holds `data/`.
 
 ## 3. Open the dashboard
 
-Open `tattletale.html` from this folder in your browser (double-click it, or
-`open tattletale.html`). It reloads its data every minute. Start with **Needs attention** at
-the top.
+Open `data/tattletale.html` in your browser (`open data/tattletale.html`). The watcher puts
+it there next to its data. It reloads every minute. Start with **Needs attention** at the top.
 
 ## 4. Optional: settings
 
 ```sh
-cp tattletale.env.example tattletale.env      # then edit; it is git-ignored
-python3 tattletale.py --show-settings          # check what took effect
+cp tattletale.env.example tattletale.env       # at the repository root; git-ignored; both versions read it
+python3 python/tattletale.py --show-settings   # check what took effect
 ```
 
 Common changes: `TATTLETALE_NOTIFY=false` to turn off notifications, or a longer
@@ -58,20 +68,23 @@ Common changes: `TATTLETALE_NOTIFY=false` to turn off notifications, or a longer
 ## 5. Optional: run at login
 
 ```sh
-sh install-login-agent.sh          # install and start; it now runs at every login
-sh uninstall-login-agent.sh        # remove it again
+sh python/install-login-agent.sh      # Python: install and start; it now runs at every login
+sh java/install-login-agent.sh        # or Java (uses the native binary when built)
+sh python/uninstall-login-agent.sh    # remove it again (either uninstall script works)
 ```
 
 ## Ask it questions
 
 ```sh
-python3 tattletale.py --report
-python3 tattletale.py --query "SELECT time, exe, args, chain FROM credential_events ORDER BY time DESC LIMIT 10"
-python3 tattletale.py --query "SELECT key FROM listeners WHERE exposed = 1 AND present = 1"
+python3 python/tattletale.py --report
+python3 python/tattletale.py --query "SELECT time, exe, args, chain FROM credential_events ORDER BY time DESC LIMIT 10"
+python3 python/tattletale.py --query "SELECT key FROM listeners WHERE exposed = 1 AND present = 1"
 ```
+
+(The Java version takes the same flags.)
 
 ## Remove it
 
-Stop the watcher (or run `sh uninstall-login-agent.sh`), then delete this folder. Tattletale
-writes nothing outside it except the optional login agent in
+Stop the watcher (or run the uninstall script), then delete this folder. Tattletale writes
+nothing outside it except the optional login agent in
 `~/Library/LaunchAgents/io.github.tattletale.plist`.

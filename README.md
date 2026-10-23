@@ -4,8 +4,31 @@ Tattletale tells you what's going on behind your back on macOS: who asked for yo
 passwords, what opened a port, what new program ran, and what changed at login. Read-only,
 no dependencies, with a local dashboard.
 
-> **Beta, version 0.0.1.** It works and is tested on macOS with Python 3.9, but expect rough
-> edges and changes to the data format.
+> **Beta, version 0.0.2.** It works and is tested on macOS, but expect rough edges and
+> changes to the data format.
+
+## Two versions, one dashboard
+
+Tattletale comes in two versions that do exactly the same job. Pick whichever runtime you
+already have:
+
+| Version | Run it with | Needs |
+|---|---|---|
+| **Python** (`python/`) | `python3 python/tattletale.py` | Python 3.9 or newer; nothing to install |
+| **Java** (`java/`) | `java -jar java/build/tattletale.jar`, or the native binary `java/build/tattletale` | JDK 25 to build; GraalVM to build the native binary, which then needs nothing |
+
+Both write the same database, the same log and the same dashboard data into `data/`, so you
+can switch between them and keep your history. Only one may run at a time: each refuses to
+start while the other holds `data/tattletale.pid`. The format both follow is written down in
+[docs/DATA_FORMAT.md](docs/DATA_FORMAT.md).
+
+```
+dashboard/   the one page, tattletale.html
+python/      the Python watcher and its login-agent scripts
+java/        the Java watcher, build.sh and its login-agent scripts (see java/README.md)
+docs/        the data format and the demo recording
+data/        created on first run: database, log, dashboard copy (git-ignored)
+```
 
 ## What it watches
 
@@ -32,26 +55,27 @@ after it.
 
 ## Privacy
 
-Everything Tattletale records stays in its folder on your Mac: a SQLite database, a log, the
+Everything Tattletale records stays in `data/` on your Mac: a SQLite database, a log, the
 dashboard's data file and copies of your startup files. These contain your process list,
-command lines and file contents, so **all of them are git-ignored**. Never commit them, and
+command lines and file contents, so **the whole folder is git-ignored**. Never commit it, and
 look before you share a screenshot of the dashboard.
 
 ## Quick start
 
-See [QUICKSTART.md](QUICKSTART.md). In short:
+See [QUICKSTART.md](QUICKSTART.md). In short, from the repository folder:
 
 ```sh
-python3 tattletale.py
+python3 python/tattletale.py
 ```
 
-then open `tattletale.html` in a browser.
+or `sh java/build.sh` once and then `java -jar java/build/tattletale.jar`. Then open
+`data/tattletale.html` in a browser.
 
 ## The dashboard
 
-`tattletale.html` is a single local page with no external resources. It loads
-`tattletale-data.js`, which the watcher rewrites about once a minute, and refreshes itself
-every 60 seconds. It shows:
+`dashboard/tattletale.html` is a single local page with no external resources. The watcher
+copies it into `data/` on start, next to `tattletale-data.js`, which it rewrites about once a
+minute; the page refreshes itself every 60 seconds. It shows:
 
 - **Needs attention**: exposed ports, unsigned or ad-hoc programs, new programs,
   credential prompts, startup changes and watcher restarts, each linking to its details
@@ -60,16 +84,20 @@ every 60 seconds. It shows:
 - the recent event log (filterable) and a searchable, sortable table of every program
 
 It opens in dark mode; the Theme button switches to light and the page remembers your choice. It
-works at phone width too. Click or press Enter on any row for its details.
+works at phone width too. Click or press Enter on any row for its details. The footer names the
+version that wrote the data.
 
 ## Command line
 
+The same flags work for both versions; replace `python3 python/tattletale.py` with
+`java -jar java/build/tattletale.jar` (or `java/build/tattletale`) for Java.
+
 ```sh
-python3 tattletale.py                  # run the watcher (Ctrl-C to stop)
-python3 tattletale.py --report         # summary of what has been recorded
-python3 tattletale.py --show-settings  # every setting, its value and where it came from
-python3 tattletale.py --version        # prints the version (this is 0.0.1)
-python3 tattletale.py --query "SELECT exe, signer FROM programs WHERE signer = 'adhoc'"
+python3 python/tattletale.py                  # run the watcher (Ctrl-C to stop)
+python3 python/tattletale.py --report         # summary of what has been recorded
+python3 python/tattletale.py --show-settings  # every setting, its value and where it came from
+python3 python/tattletale.py --version        # prints the version (this is 0.0.2)
+python3 python/tattletale.py --query "SELECT exe, signer FROM programs WHERE signer = 'adhoc'"
 ```
 
 `--query` opens the database read-only and accepts a single `SELECT` or `WITH` statement.
@@ -80,17 +108,18 @@ Each setting has one name, usable three ways. Highest priority first:
 
 1. a command-line flag: `--keep-logs 5`
 2. an environment variable: `TATTLETALE_KEEP_LOGS=5`
-3. a line in `tattletale.env` next to `tattletale.py` (or `--config PATH`):
+3. a line in `tattletale.env` at the repository root (or `--config PATH`):
    `TATTLETALE_KEEP_LOGS=5`
 
-Copy [`tattletale.env.example`](tattletale.env.example) to `tattletale.env` to start.
-Unknown names and malformed values are refused with a message, not ignored.
+Copy [`tattletale.env.example`](tattletale.env.example) to `tattletale.env` to start; both
+versions read the same file. Unknown names and malformed values are refused with a message, not
+ignored.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `db` | `tattletale.db` next to the script | SQLite database; the dashboard data file and `startup-snapshots/` are written beside it |
-| `log` | `tattletale.log` next to the script | human-readable log |
-| `map` | `tattletale-map.json` | only read once, to import a JSON map from an older version |
+| `db` | `data/tattletale.db` | SQLite database; the dashboard data file and `startup-snapshots/` are written beside it |
+| `log` | `data/tattletale.log` | human-readable log |
+| `map` | `data/tattletale-map.json` | only read once, to import a JSON map from an older version |
 | `process_interval` | `3` | seconds between process-list scans |
 | `listen_interval` | `30` | seconds between listening-port scans |
 | `startup_interval` | `300` | seconds between startup-item scans |
@@ -111,29 +140,43 @@ notifications. Turn them off with `--no-notify` or `TATTLETALE_NOTIFY=false`.
 ## Run at login (optional)
 
 ```sh
-sh install-login-agent.sh --dry-run    # see the LaunchAgent it would install
-sh install-login-agent.sh              # install for your user and start it
-sh uninstall-login-agent.sh            # stop and remove it (your data is kept)
+sh python/install-login-agent.sh --dry-run    # see the LaunchAgent it would install
+sh python/install-login-agent.sh              # install for your user and start it
+sh python/uninstall-login-agent.sh            # stop and remove it (your data is kept)
 ```
 
-The agent runs `tattletale.py` from this folder with your `tattletale.env`. Tattletale will
-report its own new agent as a startup change, which is the point.
+For Java use `java/install-login-agent.sh` and `java/uninstall-login-agent.sh` (they run the
+native binary when it is built, else the jar). Both versions install the same agent label,
+so installing one replaces the other. Tattletale will report its own new agent as a startup
+change, which is the point.
 
 ## Data model
 
-SQLite (`tattletale.db`, WAL mode). Tables: `programs` (one row per executable, with
+SQLite (`data/tattletale.db`, WAL mode). Tables: `programs` (one row per executable, with
 identity), `sightings` (each new process instance), `listeners` (with exposed and present
 flags), `credential_events`, `startup_items` and `startup_versions`, `events` (every log
 line) and `schema_version`. History is trimmed by the retention settings; programs,
-listeners and startup items are kept.
+listeners and startup items are kept. The full contract, column by column, is
+[docs/DATA_FORMAT.md](docs/DATA_FORMAT.md).
+
+## Upgrading from 0.0.1
+
+0.0.1 kept its data next to `tattletale.py` at the repository root. On the first start with
+default paths, either version moves that data into `data/` once (database, log, startup
+copies) and says so; it refuses while a 0.0.1 watcher is still running against it. Also fixed
+in 0.0.2: `tattletale.env` was refused line by line in 0.0.1 (flags and environment variables
+always worked), and the Python watcher left its `log stream` helper running after it stopped.
 
 ## Requirements
 
 - **macOS.** Tested on macOS 27.0.1 on Apple silicon. Other versions have not been tested
   yet; reports are welcome. It should work on any recent macOS that has the tools below.
-- **Python 3.9 or newer.** The `python3` from Apple's Command Line Tools is fine (`xcode-select
-  --install` if `python3` is missing). No packages to install.
-- **Built-in macOS tools** it runs: `ps`, `lsof`, `codesign`, `crontab`, `osascript` (for
+- **Python version:** Python 3.9 or newer. The `python3` from Apple's Command Line Tools is
+  fine (`xcode-select --install` if `python3` is missing). No packages to install.
+- **Java version:** a JDK 25 to build and run the jar; GraalVM 25 (`GRAALVM_HOME`) to build
+  the native binary, which then runs on its own. No third-party libraries. It uses macOS's
+  built-in `/usr/bin/sqlite3`.
+- **Built-in macOS tools** both run: `ps`, `lsof`, `codesign`, `crontab`, `osascript` (for
   notifications) and `log stream --style ndjson` (for catching short-lived credential
   helpers).
 
