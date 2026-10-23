@@ -1,0 +1,18 @@
+# Machine data: never commit. These hold a process list, ports, command lines and copies of
+# startup files from the machine that ran the watcher.
+tattletale.env
+tattletale.log
+tattletale.log.*
+tattletale.prev-*
+tattletale-map.json
+tattletale.db
+tattletale.db-wal
+tattletale.db-shm
+tattletale.db-journal
+tattletale-map.prev-*
+tattletale-data.js
+tattletale.pid
+tattletale.stdout
+startup-snapshots/
+.tattletale-*.tmp
+__pycache__/

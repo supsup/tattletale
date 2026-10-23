@@ -1,0 +1,913 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tattletale</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7;
+    --surface: #fcfcfb;
+    --surface-2: #f3f2ee;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --muted: #6f6e69;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --ring: rgba(11, 11, 11, 0.10);
+    --series: #2a78d6;
+    --good: #0ca30c;
+    --warning: #fab219;
+    --serious: #ec835a;
+    --critical: #d03b3b;
+    --glyph-light: #ffffff;
+    --glyph-dark: #0b0b0b;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  /* Dark: #898781 measured 4.4:1 on --surface-2, under AA; #9a9891 is 6.0:1 on surface-2, 6.7:1 on page. */
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page: #0d0d0d;
+      --surface: #1a1a19;
+      --surface-2: #232321;
+      --ink: #f0efec;
+      --ink-2: #c3c2b7;
+      --muted: #9a9891;
+      --grid: #2c2c2a;
+      --axis: #383835;
+      --ring: rgba(255, 255, 255, 0.10);
+      --series: #3987e5;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --surface-2: #232321;
+    --ink: #f0efec;
+    --ink-2: #c3c2b7;
+    --muted: #9a9891;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --ring: rgba(255, 255, 255, 0.10);
+    --series: #3987e5;
+  }
+  * { box-sizing: border-box; }
+  html, body { overflow-x: hidden; }
+  body {
+    margin: 0; background: var(--page); color: var(--ink);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-variant-numeric: tabular-nums;
+  }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 24px 16px 64px; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-bottom: 16px; }
+  h1 { font-size: 22px; margin: 0; letter-spacing: -0.01em; }
+  h2 { font-size: 15px; margin: 0 0 4px; }
+  .sub { color: var(--ink-2); font-size: 13px; }
+  .grow { flex: 1; }
+  button, input, select {
+    font: inherit; color: var(--ink); background: var(--surface);
+    border: 1px solid var(--ring); border-radius: 8px; padding: 6px 10px; max-width: 100%;
+  }
+  button { cursor: pointer; }
+  button:hover { background: var(--surface-2); }
+  :focus-visible { outline: 2px solid var(--series); outline-offset: 2px; }
+  a { color: var(--series); }
+  .card {
+    background: var(--surface); border: 1px solid var(--ring); border-radius: 12px;
+    padding: 16px; margin-bottom: 16px; min-width: 0;
+  }
+  .card .desc { color: var(--ink-2); font-size: 13px; margin: 0 0 12px; }
+  .livechip { display: inline-flex; align-items: center; border: 1px solid var(--ring); border-radius: 999px; padding: 3px 10px 3px 7px; background: var(--surface); }
+
+  /* needs attention */
+  .att h2 { margin-bottom: 8px; }
+  .att-row {
+    display: grid; grid-template-columns: 18px minmax(150px, 230px) 44px 1fr auto; gap: 4px 10px;
+    align-items: baseline; padding: 7px 0; border-top: 1px solid var(--grid);
+  }
+  .att-row:first-of-type { border-top: 0; }
+  .att-row .mk { align-self: center; display: flex; }
+  .att-row .lbl { font-weight: 600; }
+  .att-row .cnt { text-align: right; font-weight: 650; }
+  .att-row .names { color: var(--ink-2); font-size: 13px; overflow-wrap: anywhere; min-width: 0; }
+  .att-row a { font-size: 13px; white-space: nowrap; }
+  .att-ok { display: flex; align-items: center; gap: 8px; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(170px, 100%), 1fr)); gap: 12px; margin-bottom: 16px; }
+  .tile { background: var(--surface); border: 1px solid var(--ring); border-radius: 12px; padding: 14px 16px; min-width: 0; }
+  .tile .label { color: var(--ink-2); font-size: 12px; }
+  .tile .value { font-size: 30px; font-weight: 650; letter-spacing: -0.02em; margin-top: 2px; }
+  .tile.quiet .value { color: var(--ink-2); font-weight: 500; }
+  .tile .note { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .tile .note + .note { margin-top: 4px; }
+  .tile .status, td .status { white-space: normal; }
+  .more { margin-top: 8px; }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(340px, 100%), 1fr)); gap: 16px; }
+  .grid2 > .card { margin-bottom: 0; }
+  .section { margin-bottom: 16px; scroll-margin-top: 12px; }
+  .banner {
+    display: none; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px 14px; border-radius: 10px;
+    border: 1px solid var(--ring); background: var(--surface); margin-bottom: 16px;
+  }
+  .banner.show { display: flex; }
+
+  /* status marks: colour + shape + label */
+  .status { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; font-size: 12px; white-space: nowrap; overflow-wrap: normal; }
+  .mark { width: 14px; height: 14px; flex: none; display: block; }
+  .mark .disc { fill: var(--muted); }
+  .m-good .disc { fill: var(--good); }
+  .m-warning .disc { fill: var(--warning); }
+  .m-serious .disc { fill: var(--serious); }
+  .m-critical .disc { fill: var(--critical); }
+  .m-neutral .disc { fill: none; stroke: var(--muted); stroke-width: 1.6; }
+  .mark .gl { fill: none; stroke: var(--glyph-light); stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+  .mark .gd { fill: var(--glyph-dark); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--ink-2); font-weight: 600; font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--axis); position: sticky; top: 0; background: var(--surface); z-index: 1; }
+  td { padding: 6px 8px; border-bottom: 1px solid var(--grid); vertical-align: top; overflow-wrap: break-word; }
+  tbody tr:hover td { background: var(--surface-2); }
+  tr.clickable { cursor: pointer; }
+  tr.detail td, tr.detail:hover td { background: var(--surface-2); }
+  .nowrap { white-space: nowrap; overflow-wrap: normal; }
+  .mono { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+  .scroll { max-height: 420px; overflow: auto; border-radius: 8px; }
+  .muted { color: var(--muted); }
+  .small { font-size: 12px; }
+  .pname { font-weight: 600; }
+  .newtag { display: inline-block; font: 600 10px/1.2 system-ui, sans-serif; color: var(--series); border: 1px solid var(--series); border-radius: 4px; padding: 0 4px; margin-left: 6px; vertical-align: 1px; }
+  dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px; margin: 2px 0; font-size: 12px; }
+  dl.kv dt { color: var(--ink-2); }
+  dl.kv dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; min-width: 0; }
+
+  th button.sort { all: unset; cursor: pointer; display: inline-flex; gap: 4px; align-items: center; white-space: nowrap; }
+  th button.sort:focus-visible { outline: 2px solid var(--series); outline-offset: 2px; border-radius: 3px; }
+  th .arrow { color: var(--muted); font-size: 10px; width: 10px; display: inline-block; }
+  th[aria-sort] .arrow { color: var(--ink); }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+  .chip { border-radius: 999px; padding: 4px 10px; font-size: 12px; display: inline-flex; align-items: center; gap: 6px; }
+  .chip[aria-pressed="true"] { background: var(--surface-2); border-color: var(--ink-2); box-shadow: 0 0 0 1px var(--ink-2); font-weight: 600; }
+  .chip[aria-pressed="false"] { color: var(--muted); background: transparent; }
+  .chip[aria-pressed="false"] .c { text-decoration: line-through; }
+  .chip .c { color: var(--ink-2); font-weight: 400; }
+  .chip[aria-pressed="false"] .c { color: var(--muted); }
+
+  .feed { font-family: var(--mono); font-size: 12px; }
+  .feed .row { display: grid; grid-template-columns: 128px 112px 1fr; gap: 8px; padding: 5px 4px; border-bottom: 1px solid var(--grid); }
+  .feed .kind { font-weight: 650; }
+  .feed .msg { overflow-wrap: anywhere; white-space: pre-wrap; min-width: 0; }
+  .tools { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; align-items: center; }
+  .tools input { flex: 1; min-width: min(200px, 100%); }
+  .chart svg { display: block; overflow: visible; }
+  .axis-label { fill: var(--muted); font-size: 11px; }
+  .axis-date { fill: var(--ink-2); font-size: 11px; font-weight: 600; }
+  .bar { fill: var(--series); pointer-events: none; }
+  .bar-hit { fill: transparent; cursor: default; outline: none; }
+  .bar-hit:hover + .bar, .bar-hit:focus + .bar { fill-opacity: 0.8; }
+  .bar-hit:focus-visible { stroke: var(--series); stroke-width: 2; }
+  .gridline { stroke: var(--grid); stroke-width: 1; }
+  .baseline, .tick { stroke: var(--axis); stroke-width: 1; }
+
+  .apple-line { display: flex; align-items: center; gap: 8px; padding: 4px 0 8px; color: var(--ink-2); font-size: 13px; border-bottom: 1px solid var(--grid); margin-bottom: 4px; }
+  .hbar-row { display: grid; grid-template-columns: minmax(120px, 230px) 1fr 44px; gap: 10px; align-items: center; padding: 4px 4px; border-radius: 6px; cursor: pointer; }
+  .hbar-row:hover, .hbar-row[aria-expanded="true"] { background: var(--surface-2); }
+  .hbar-row .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .hbar-track { height: 14px; background: var(--surface-2); border-radius: 0 4px 4px 0; position: relative; }
+  .hbar-row:hover .hbar-track, .hbar-row[aria-expanded="true"] .hbar-track { background: var(--grid); }
+  .hbar-fill { position: absolute; left: 0; top: 0; bottom: 0; background: var(--series); border-radius: 0 4px 4px 0; min-width: 2px; }
+  .hbar-row .n { text-align: right; color: var(--ink-2); }
+  .hbar-detail { padding: 6px 8px 10px; margin: 0 0 4px; background: var(--surface-2); border-radius: 6px; font-size: 12px; }
+  .hbar-detail ul { margin: 0 0 8px; padding-left: 16px; }
+  .hbar-detail li { font-family: var(--mono); overflow-wrap: anywhere; }
+
+  .cred { padding: 8px 0; border-bottom: 1px solid var(--grid); }
+  .cred:last-child { border-bottom: 0; }
+  .cred .top { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
+  .cred .top b { font-weight: 600; }
+
+  .tip {
+    position: fixed; pointer-events: none; z-index: 10; max-width: min(420px, calc(100vw - 16px));
+    background: var(--surface); color: var(--ink); border: 1px solid var(--ring);
+    border-radius: 10px; padding: 8px 10px; font-size: 12px; box-shadow: 0 6px 24px rgba(0,0,0,0.18);
+    display: none;
+  }
+  .tip b { display: block; margin-bottom: 4px; }
+  .tip .mono { display: block; }
+  .empty { color: var(--muted); padding: 12px 4px; }
+  details > summary { cursor: pointer; color: var(--ink-2); font-size: 13px; margin-top: 8px; }
+  details[open] > summary { margin-bottom: 6px; }
+  @media (max-width: 640px) {
+    .feed .row { grid-template-columns: 1fr; gap: 2px; }
+    .hbar-row { grid-template-columns: 1fr 44px; }
+    .hbar-row .name { grid-column: 1; grid-row: 1; }
+    .hbar-row .n { grid-column: 2; grid-row: 1; }
+    .hbar-row .hbar-track { grid-column: 1 / -1; grid-row: 2; }
+    .tiles { grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr)); }
+    .tile .value { font-size: 26px; }
+    .col-user, .col-last, .pdir { display: none; }
+    .scroll { max-height: none; }
+    .att-row { grid-template-columns: 18px 1fr auto; }
+    .att-row .names { grid-column: 2 / -1; }
+    .att-row a { grid-column: 2 / -1; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Tattletale</h1>
+    <span class="livechip" id="live"><span class="sub">loading...</span></span>
+    <span class="sub" id="updated"></span>
+    <span class="grow"></span>
+    <button id="refresh" type="button">Refresh now</button>
+    <button id="theme" type="button">Theme</button>
+  </header>
+
+  <div class="banner" id="banner" role="status"></div>
+
+  <div class="card section att" id="attention" aria-labelledby="att-h">
+    <h2 id="att-h">Needs attention</h2>
+    <div id="att-list"></div>
+  </div>
+
+  <div class="tiles" id="tiles"></div>
+
+  <div class="card section" id="sec-listeners">
+    <h2>Listening ports</h2>
+    <p class="desc">Programs accepting network connections. Exposed means reachable from other machines on your network. Click a row for details.</p>
+    <div id="listeners"></div>
+  </div>
+
+  <div class="card section" id="sec-creds">
+    <h2>Credential prompts</h2>
+    <p class="desc">Every time a git credential helper, password dialog or similar ran, with the chain of programs that started it.</p>
+    <div id="creds"></div>
+  </div>
+
+  <div class="card section chart" id="sec-chart">
+    <h2>New programs over time</h2>
+    <p class="desc" id="chart-desc">Programs seen for the first time, per hour, after the baseline. Hover or focus a bar for the list.</p>
+    <div id="timeline"></div>
+  </div>
+
+  <div class="grid2 section">
+    <div class="card" id="sec-signers">
+      <h2>Who signed the programs</h2>
+      <p class="desc">Code-signing identity of every program in the map. Unsigned and ad-hoc programs are the ones to look at. Click a bar for its programs.</p>
+      <div id="signers"></div>
+    </div>
+    <div class="card" id="sec-startup">
+      <h2>Startup items</h2>
+      <p class="desc">Files that run at login or boot. A change is logged with a before-and-after copy in startup-snapshots/.</p>
+      <div id="startup"></div>
+    </div>
+  </div>
+
+  <div class="card section" id="sec-events">
+    <h2>Recent events</h2>
+    <p class="desc">The last 500 lines of the watcher's log, newest first. Click a kind to show or hide it.</p>
+    <div class="chips" id="chips"></div>
+    <div class="scroll"><div class="feed" id="feed"></div></div>
+    <div id="feedMore"></div>
+  </div>
+
+  <div class="card section" id="sec-programs">
+    <h2>All programs</h2>
+    <p class="desc">Every program in the map. Search by path, signer or user; sort by a column; click a row for its details.</p>
+    <div class="tools">
+      <input id="q" type="search" placeholder="Search programs" aria-label="Search programs">
+      <select id="sigFilter" aria-label="Filter by signer">
+        <option value="">All signers</option>
+      </select>
+      <span class="sub" id="progCount"></span>
+    </div>
+    <div class="scroll"><table id="progs"><thead><tr>
+      <th data-k="exe">Program</th><th data-k="signerClass">Signer</th><th data-k="user" class="col-user">User</th>
+      <th data-k="firstSeen">First seen</th><th data-k="lastSeen" class="col-last">Last seen</th>
+    </tr></thead><tbody></tbody></table></div>
+    <div id="progMore"></div>
+  </div>
+
+  <p class="sub">Data: tattletale-data.js, written by tattletale.py<span id="ver"></span> next to this page. The page reloads it every 60 seconds.</p>
+</div>
+<div class="tip" id="tip"></div>
+
+<script>
+(function () {
+  "use strict";
+  const $ = (s) => document.querySelector(s);
+  const el = (tag, attrs, ...kids) => {
+    const n = document.createElement(tag);
+    if (attrs) for (const [k, v] of Object.entries(attrs)) {
+      if (v == null) continue;
+      if (k === "class") n.className = v;
+      else if (k === "text") n.textContent = v;
+      else n.setAttribute(k, v);
+    }
+    for (const k of kids) if (k != null) n.append(k.nodeType ? k : document.createTextNode(String(k)));
+    return n;
+  };
+  const SVGNS = "http://www.w3.org/2000/svg";
+  const svgEl = (tag, attrs) => {
+    const n = document.createElementNS(SVGNS, tag);
+    for (const [k, v] of Object.entries(attrs || {})) n.setAttribute(k, v);
+    return n;
+  };
+  const base = (p) => String(p || "").split("/").pop();
+  // The folder part of a path; "" when there is no "/" (a bare name such as "docker" or
+  // "crontab -l"), never the name with its last character cut off.
+  const dirOf = (p) => { const s = String(p || ""), i = s.lastIndexOf("/"); return i < 0 ? "" : i === 0 ? "/" : s.slice(0, i); };
+  const plural = (n, w) => n + " " + w + (n === 1 ? "" : "s");
+
+  // ---- theme: dark by default; a remembered per-viewer choice overrides it ----
+  const root = document.documentElement;
+  try {
+    const t = localStorage.getItem("tattletale-theme");
+    if (t === "light" || t === "dark") root.dataset.theme = t;
+  } catch (e) {}
+  const currentTheme = () => root.dataset.theme === "light" ? "light" : "dark";
+  function themeLabel() {
+    const t = currentTheme();
+    $("#theme").textContent = "Theme: " + (t === "dark" ? "Dark" : "Light");
+    $("#theme").setAttribute("aria-label", "Theme is " + t + ". Switch to " + (t === "dark" ? "light" : "dark"));
+  }
+  $("#theme").addEventListener("click", () => {
+    root.dataset.theme = currentTheme() === "dark" ? "light" : "dark";
+    try { localStorage.setItem("tattletale-theme", root.dataset.theme); } catch (e) {}
+  });
+  new MutationObserver(themeLabel).observe(root, { attributes: true, attributeFilter: ["data-theme"] });
+  themeLabel();
+
+  // ---- tooltip: a pointer convenience; everything in it is also reachable by click or Enter ----
+  const tip = $("#tip");
+  const canHover = matchMedia("(hover: hover)");
+  function placeTip(x0, y0, x1, y1, title, lines) {
+    tip.replaceChildren(el("b", { text: title }));
+    for (const l of lines) tip.append(el("span", { class: "mono", text: l }));
+    tip.style.display = "block";
+    const pad = 12, w = tip.offsetWidth, h = tip.offsetHeight;
+    let x = x1 + pad, y = y1 + pad;
+    if (x + w > innerWidth - 8) x = x0 - w - pad;
+    if (y + h > innerHeight - 8) y = y0 - h - pad;
+    tip.style.left = Math.max(8, Math.min(x, innerWidth - w - 8)) + "px";
+    tip.style.top = Math.max(8, y) + "px";
+  }
+  function showTip(evt, title, lines) {
+    if (!canHover.matches) return;
+    placeTip(evt.clientX, evt.clientY, evt.clientX, evt.clientY, title, lines);
+  }
+  function showTipFor(node, title, lines) {
+    const r = node.getBoundingClientRect();
+    placeTip(r.left, r.top, r.right, r.top, title, lines);
+  }
+  const hideTip = () => { tip.style.display = "none"; };
+  addEventListener("scroll", hideTip, { passive: true });
+
+  // ---- status marks: a shape per level inside the dot, never colour alone ----
+  function mark(level) {
+    const s = svgEl("svg", { class: "mark m-" + level, viewBox: "0 0 14 14", "aria-hidden": "true", focusable: "false" });
+    s.append(svgEl("circle", { class: "disc", cx: 7, cy: 7, r: level === "neutral" ? 5.6 : 7 }));
+    if (level === "good") s.append(svgEl("path", { class: "gl", d: "M4 7.3 L6.1 9.4 L10.1 5" }));
+    else if (level === "warning") s.append(svgEl("path", { class: "gd", d: "M7 3.4 L10.6 9.9 H3.4 Z" }));
+    else if (level === "serious") s.append(svgEl("path", { class: "gd", d: "M7 3.1 L10.9 7 L7 10.9 L3.1 7 Z" }));
+    else if (level === "critical") s.append(svgEl("path", { class: "gl", d: "M4.6 4.6 L9.4 9.4 M9.4 4.6 L4.6 9.4" }));
+    return s;
+  }
+  function status(level, label) {
+    return el("span", { class: "status s-" + level }, mark(level), label);
+  }
+
+  // ---- details reachable without hover: click or Enter toggles ----
+  function activatable(node, fn) {
+    node.tabIndex = 0;
+    node.setAttribute("aria-expanded", "false");
+    node.addEventListener("click", (e) => { if (e.target.closest("a, button, input, select")) return; fn(); });
+    node.addEventListener("keydown", (e) => {
+      if (e.target !== node) return;
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fn(); }
+    });
+  }
+  function kvList(pairs) {
+    const dl = el("dl", { class: "kv" });
+    for (const [k, v] of pairs) dl.append(el("dt", { text: k }), el("dd", { text: v == null || v === "" ? "-" : String(v) }));
+    return dl;
+  }
+  function detailRow(tr, colspan, pairs) {
+    activatable(tr, () => {
+      const next = tr.nextElementSibling;
+      if (next && next.classList.contains("detail")) { next.remove(); tr.setAttribute("aria-expanded", "false"); return; }
+      tr.after(el("tr", { class: "detail" }, el("td", { colspan: String(colspan) }, kvList(pairs()))));
+      tr.setAttribute("aria-expanded", "true");
+    });
+    tr.classList.add("clickable");
+  }
+
+  // ---- data helpers ----
+  function signerClass(v) {
+    const s = v.signer || "";
+    if (!("signer" in v) || v.signer == null) return "Not checked yet";
+    if (/^unsigned|unreadable/i.test(s)) return "Unsigned or unreadable";
+    if (s === "adhoc") return "Ad-hoc (no identity)";
+    if (/Software Signing|^Apple /.test(s) && !/^Apple Development:/.test(s)) return "Apple";
+    const m = s.match(/^Developer ID Application: (.*?)(?: \([A-Z0-9]+\))?$/);
+    if (m) return m[1];
+    const d = s.match(/^Apple Development: (.*)$/);
+    if (d) return "Developer build: " + d[1];
+    return s || "Unknown";
+  }
+  const isRisky = (cls) => cls === "Unsigned or unreadable" || cls === "Ad-hoc (no identity)";
+  const isPresent = (v) => v.present !== false;
+  const parseLog = (lines) => lines.map((l) => {
+    const m = String(l).match(/^(\S+)\s+(\S+)\s+(.*)$/);
+    return m ? { t: m[1], kind: m[2], msg: m[3] } : null;
+  }).filter(Boolean);
+  function ago(iso) {
+    const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
+    if (s < 90) return Math.round(s) + " s ago";
+    if (s < 5400) return Math.round(s / 60) + " min ago";
+    if (s < 172800) return Math.round(s / 3600) + " h ago";
+    return Math.round(s / 86400) + " days ago";
+  }
+  const local = (iso) => iso ? new Date(iso).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "";
+  // Today's entries show only the time; older ones get the date.
+  function when(iso) {
+    if (!iso) return "";
+    const d = new Date(iso);
+    if (isNaN(d)) return String(iso);
+    if (d.toDateString() === new Date().toDateString()) return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    return local(iso);
+  }
+  // The app or bundle a path lives in, e.g. "Example.app".
+  function bundleOf(path) {
+    const m = String(path || "").match(/([^/]+\.(?:app|appex|xpc|framework|bundle))\//);
+    return m ? m[1] : null;
+  }
+
+  // The baseline is the first program sweep; programs first seen in it are not "new".
+  function baselineTime(progs, events) {
+    const b = events.find((e) => e.kind === "BASELINE" && /^programs:/.test(e.msg));
+    if (b) return Date.parse(b.t) + 5000;
+    const counts = {};
+    for (const v of Object.values(progs)) counts[v.firstSeen] = (counts[v.firstSeen] || 0) + 1;
+    const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+    return top ? Date.parse(top[0]) + 5000 : 0;
+  }
+
+  const KIND_LEVEL = { CREDENTIAL: "warning", "CRED-LOG": "warning", "CRED-NET": "warning", PASSWORD: "warning",
+    "LISTEN!": "warning", "STARTUP+": "warning", "STARTUP~": "warning", "STARTUP-": "warning",
+    STOP: "warning", UNLISTEN: "neutral", UNSIGNED: "serious", ERROR: "critical" };
+  const LOG_CRED_KINDS = ["CRED-NET", "PASSWORD", "CRED-LOG"];
+
+  // ---- render ----
+  let sortKey = "firstSeen", sortDir = -1, activeKinds = null, knownKinds = new Set();
+  let lastGenerated = null, baseT = 0, otherSigners = new Set(), lastNewRows = [], lastEvents = [];
+
+  function render(D) {
+    const map = D.map || {}, progs = map.programs || {}, listeners = map.listeners || {};
+    const creds = map.credentials || [], startup = map.startup || {};
+    const events = parseLog(D.log || []);
+    lastEvents = events;
+    baseT = baselineTime(progs, events);
+    const rows = Object.entries(progs).map(([exe, v]) => ({ exe, ...v, signerClass: signerClass(v) }));
+    for (const r of rows) r.isNew = Date.parse(r.firstSeen) > baseT;
+    const newRows = rows.filter((r) => r.isNew);
+    const lst = Object.entries(listeners).map(([key, v]) => ({ key, ...v, present: isPresent(v) }));
+    const present = lst.filter((l) => l.present);
+    const exposed = present.filter((l) => l.exposed);
+    const startupEvents = events.filter((e) => e.kind.startsWith("STARTUP"));
+    const risky = rows.filter((r) => isRisky(r.signerClass));
+    const adhoc = risky.filter((r) => r.signerClass === "Ad-hoc (no identity)").length;
+    const unchecked = rows.filter((r) => r.signerClass === "Not checked yet").length;
+    const logCreds = events.filter((e) => LOG_CRED_KINDS.includes(e.kind));
+    const stops = events.filter((e) => e.kind === "STOP");
+    const starts = events.filter((e) => e.kind === "START");
+
+    lastGenerated = D.generatedAt;
+    $("#ver").textContent = D.version ? " " + D.version : "";
+    $("#updated").textContent = "updated " + local(D.generatedAt);
+    tick();
+
+    renderAttention({ exposed, risky, newRows, creds, logCreds, startupEvents, stops, starts });
+
+    // tiles: attention tiles keep full ink; good or zero tiles are muted
+    const tile = (label, value, notes, quiet) => el("div", { class: "tile" + (quiet ? " quiet" : "") },
+      el("div", { class: "label", text: label }), el("div", { class: "value", text: value }),
+      ...notes.map((n) => typeof n === "string" ? el("div", { class: "note", text: n }) : el("div", { class: "note" }, n)));
+    $("#tiles").replaceChildren(
+      tile("Programs tracked", rows.length.toLocaleString(), ["since " + local(new Date(baseT - 5000).toISOString())], true),
+      tile("New since baseline", newRows.length.toLocaleString(),
+        [newRows.length ? "latest " + ago(newRows.map((r) => r.firstSeen).sort().pop()) : "none yet"], !newRows.length),
+      tile("Exposed ports", exposed.length.toLocaleString(),
+        ["of " + present.length + " listening", exposed.length ? status("warning", "reachable from the network") : status("good", "none exposed")], !exposed.length),
+      tile("Unsigned or ad-hoc", risky.length.toLocaleString(),
+        [adhoc + " ad-hoc, " + (risky.length - adhoc) + " unsigned",
+         risky.length ? status("serious", "review these") : status("good", "all signed")].concat(
+         unchecked ? [el("span", { class: "muted", text: unchecked + " not checked yet" })] : []), !risky.length),
+      tile("Credential prompts", creds.length.toLocaleString(),
+        [creds.length ? status("warning", "last " + ago(creds[creds.length - 1].time)) : status("good", "none seen")], !creds.length),
+      tile("Startup changes", startupEvents.length.toLocaleString(),
+        [startupEvents.length ? status("warning", "last " + ago(startupEvents[startupEvents.length - 1].t)) : status("good", "no changes")], !startupEvents.length),
+    );
+
+    renderListeners(lst);
+    renderCreds(creds);
+    lastNewRows = newRows;
+    renderTimeline();
+    renderSigners(rows);
+    renderStartup(startup, startupEvents);
+    renderFeed(events);
+    renderPrograms(rows);
+  }
+
+  // header chip: live or stale, refreshed between data loads
+  function tick() {
+    if (!lastGenerated) return;
+    const age = (Date.now() - Date.parse(lastGenerated)) / 1000;
+    const stale = age > 180;
+    $("#live").replaceChildren(stale ? status("serious", "Stale, " + ago(lastGenerated)) : status("good", "Live, " + ago(lastGenerated)));
+    const banner = $("#banner");
+    if (stale) {
+      banner.replaceChildren(status("serious", "Stale"),
+        el("span", { text: "The watcher has not written data for " + ago(lastGenerated).replace(" ago", "") +
+          ". It may be stopped: start it with python3 tattletale.py in this folder." }));
+      banner.classList.add("show");
+    } else banner.classList.remove("show");
+  }
+  setInterval(tick, 15000);
+
+  function jump(id, before) {
+    return (e) => { e.preventDefault(); if (before) before(); const t = document.getElementById(id); if (t) t.scrollIntoView({ behavior: "smooth", block: "start" }); };
+  }
+  function showKinds(kinds) {
+    return () => { activeKinds = new Set(kinds.filter((k) => knownKinds.has(k))); feedLimit = 0; renderFeed(lastEvents); };
+  }
+  function setProgFilter(v) {
+    return () => { $("#q").value = ""; progLimit = 0; ensureOption(v); $("#sigFilter").value = v; renderPrograms(lastRows); };
+  }
+
+  function renderAttention(f) {
+    const items = [];
+    const add = (level, label, count, names, target, linkText, before) => {
+      if (count) items.push({ level, label, count, names, target, linkText, before });
+    };
+    add("warning", "Exposed listening ports", f.exposed.length,
+      f.exposed.map((l) => (l.command || base(l.key)) + " " + l.key.slice(l.key.lastIndexOf(" ") + 1)), "sec-listeners", "Listening ports");
+    add("serious", "Unsigned or ad-hoc programs", f.risky.length, f.risky.map((r) => base(r.exe)),
+      "sec-programs", "Show in table", setProgFilter("__risky"));
+    add("neutral", "New programs since baseline", f.newRows.length,
+      f.newRows.slice().sort((a, b) => String(b.firstSeen).localeCompare(String(a.firstSeen))).map((r) => base(r.exe)),
+      "sec-programs", "Show in table", setProgFilter("__new"));
+    add("warning", "Credential helpers run", f.creds.length, f.creds.slice().reverse().map((c) => base(c.exe)), "sec-creds", "Credential prompts");
+    add("warning", "Password dialogs and git network calls (log)", f.logCreds.length,
+      LOG_CRED_KINDS.map((k) => [k, f.logCreds.filter((e) => e.kind === k).length]).filter((x) => x[1]).map((x) => x[1] + " " + x[0]), "sec-events", "Show events", showKinds(LOG_CRED_KINDS));
+    add("warning", "Startup item changes", f.startupEvents.length,
+      // Lines read "added: PATH | copy: ..." (or changed:/removed:); PATH may hold a space ("crontab -l").
+      f.startupEvents.slice().reverse().map((e) =>
+        base(e.msg.replace(/^(added|changed|removed):\s*/, "").split(" | ")[0]) || e.msg.slice(0, 60)), "sec-startup", "Startup items");
+    const restarts = Math.max(f.stops.length, f.starts.length - 1);
+    add("warning", "Watcher stopped or restarted", restarts,
+      f.stops.slice().reverse().map((e) => "stopped " + when(e.t)), "sec-events", "Show events", showKinds(["START", "STOP"]));
+
+    const box = $("#att-list");
+    if (!items.length) { box.replaceChildren(el("div", { class: "att-ok" }, status("good", "Nothing needs attention"))); return; }
+    box.replaceChildren(...items.map((it) => {
+      const uniq = [...new Set(it.names)];
+      const shown = uniq.slice(0, 3).join(", ") + (uniq.length > 3 ? ", ..." : "");
+      const a = el("a", { href: "#" + it.target, text: it.linkText + " →" });
+      a.addEventListener("click", jump(it.target, it.before));
+      return el("div", { class: "att-row" },
+        el("span", { class: "mk" }, mark(it.level)),
+        el("span", { class: "lbl", text: it.label }),
+        el("span", { class: "cnt", text: it.count.toLocaleString() }),
+        el("span", { class: "names", text: shown }),
+        a);
+    }));
+  }
+
+  // ---- time chart, sized in real pixels so labels stay 11px on any screen ----
+  function renderTimeline() {
+    const box = $("#timeline"), newRows = lastNewRows;
+    const W = Math.max(240, Math.floor(box.clientWidth || 600));
+    box.dataset.w = W;
+    const hour = (t) => { const d = new Date(t); d.setMinutes(0, 0, 0); return d.getTime(); };
+    const HR = 3600000, nowH = hour(Date.now());
+    const buckets = new Map();
+    for (const r of newRows) {
+      const h = hour(r.firstSeen);
+      if (!buckets.has(h)) buckets.set(h, []);
+      buckets.get(h).push(r);
+    }
+    const firstH = buckets.size ? Math.min(...buckets.keys()) : nowH;
+    const span = Math.min(72, Math.max(24, Math.round((nowH - firstH) / HR) + 1));
+    const hours = [];
+    for (let i = span - 1; i >= 0; i--) hours.push(nowH - i * HR);
+    const older = newRows.filter((r) => hour(r.firstSeen) < hours[0]).length;
+    $("#chart-desc").textContent = "Programs seen for the first time, per hour, after the baseline, over the last " + span +
+      " hours" + (older ? " (" + older + " older not shown)" : "") + ". Hover or focus a bar for the list.";
+
+    const H = W < 500 ? 180 : 210, L = 30, R = 6, T = 10, B = 36;
+    const plotW = W - L - R, slot = plotW / hours.length;
+    const max = Math.max(1, ...hours.map((h) => (buckets.get(h) || []).length));
+    const step = Math.max(1, Math.ceil(max / 4));
+    const top = step * Math.ceil(max / step);
+    const y = (v) => T + (H - T - B) * (1 - v / top);
+    const svg = svgEl("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "group", "aria-label": "New programs per hour, last " + span + " hours" });
+    for (let v = 0; v <= top; v += step) {
+      svg.append(svgEl("line", { class: v ? "gridline" : "baseline", x1: L, x2: W - R, y1: y(v), y2: y(v) }));
+      const t = svgEl("text", { class: "axis-label", x: L - 6, y: y(v) + 4, "text-anchor": "end" }); t.textContent = v; svg.append(t);
+    }
+    // ticks: the smallest hour step that keeps labels about 56px apart
+    const every = [1, 2, 3, 4, 6, 12, 24].find((k) => k * slot >= 56) || 24;
+    const bw = Math.min(28, Math.max(2, slot * 0.72));
+    let firstTick = true;
+    hours.forEach((h, i) => {
+      const list = buckets.get(h) || [];
+      const x0 = L + i * slot;
+      const d = new Date(h);
+      if (d.getHours() % every === 0) {
+        const anchor = x0 - L < 22 ? "start" : (W - R - x0 < 22 ? "end" : "middle");
+        svg.append(svgEl("line", { class: "tick", x1: x0, x2: x0, y1: y(0), y2: y(0) + 4 }));
+        const t = svgEl("text", { class: "axis-label", x: x0, y: H - B + 18, "text-anchor": anchor });
+        t.textContent = d.toLocaleTimeString([], { hour: "numeric" });
+        svg.append(t);
+        if (firstTick || d.getHours() === 0) {
+          const dt = svgEl("text", { class: "axis-date", x: x0, y: H - B + 32, "text-anchor": anchor });
+          dt.textContent = d.toLocaleDateString([], { month: "short", day: "numeric" });
+          svg.append(dt);
+        }
+        firstTick = false;
+      }
+      if (list.length) {
+        const bx = x0 + (slot - bw) / 2;
+        const label = d.toLocaleString([], { month: "short", day: "numeric", hour: "numeric" }) + ": " + plural(list.length, "new program");
+        const lines = list.slice(0, 12).map((r) => base(r.exe) + "  (" + r.signerClass + ")")
+          .concat(list.length > 12 ? ["... and " + (list.length - 12) + " more"] : []);
+        const hit = svgEl("rect", { class: "bar-hit", x: x0, y: T, width: slot, height: H - T - B, tabindex: "0", role: "img", "aria-label": label });
+        const bar = svgEl("path", { class: "bar", d: roundedTop(bx, y(list.length), bw, y(0) - y(list.length), Math.min(4, bw / 3)) });
+        hit.addEventListener("mousemove", (e) => showTip(e, label, lines));
+        hit.addEventListener("mouseleave", hideTip);
+        hit.addEventListener("focus", () => showTipFor(hit, label, lines));
+        hit.addEventListener("blur", hideTip);
+        svg.append(hit, bar);
+      }
+    });
+    box.replaceChildren(svg);
+  }
+  function roundedTop(x, y, w, h, r) {
+    r = Math.max(0, Math.min(r, h, w / 2));
+    return `M${x},${y + h} V${y + r} Q${x},${y} ${x + r},${y} H${x + w - r} Q${x + w},${y} ${x + w},${y + r} V${y + h} Z`;
+  }
+  if ("ResizeObserver" in window) {
+    new ResizeObserver(() => {
+      const box = $("#timeline");
+      if (lastGenerated && String(Math.max(240, Math.floor(box.clientWidth))) !== box.dataset.w) renderTimeline();
+    }).observe($("#timeline"));
+  }
+
+  // ---- signers: Apple as text, bars scaled over the rest so the tail is readable ----
+  function renderSigners(rows) {
+    const counts = {};
+    for (const r of rows) counts[r.signerClass] = (counts[r.signerClass] || 0) + 1;
+    const apple = counts.Apple || 0;
+    delete counts.Apple;
+    let list = Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([name, n]) => ({ name, n, match: (r) => r.signerClass === name }));
+    otherSigners = new Set();
+    if (list.length > 10) {
+      const keep = list.slice(0, 9), rest = list.slice(9);
+      for (const x of rest) otherSigners.add(x.name);
+      keep.push({ name: "Other developers (" + rest.length + ")", n: rest.reduce((s, x) => s + x.n, 0), match: (r) => otherSigners.has(r.signerClass), filter: "__other" });
+      list = keep;
+    }
+    const max = Math.max(1, ...list.map((x) => x.n));
+    const box = $("#signers");
+    const appleBtn = el("button", { type: "button", class: "small", text: "Show" });
+    appleBtn.addEventListener("click", jump("sec-programs", setProgFilter("Apple")));
+    const kids = [el("div", { class: "apple-line" },
+      el("span", { text: "Apple: " + apple.toLocaleString() + ", not drawn to scale" }), el("span", { class: "grow" }), appleBtn)];
+    for (const x of list) {
+      const fill = el("div", { class: "hbar-fill" }); fill.style.width = (100 * x.n / max) + "%";
+      if (isRisky(x.name)) fill.style.background = "var(--serious)";
+      else if (x.name === "Not checked yet") fill.style.background = "var(--muted)";
+      const row = el("div", { class: "hbar-row", role: "button", "aria-label": x.name + ": " + plural(x.n, "program") },
+        el("div", { class: "name", title: x.name }, isRisky(x.name) ? status("serious", x.name) : x.name),
+        el("div", { class: "hbar-track" }, fill), el("div", { class: "n", text: x.n }));
+      const members = rows.filter(x.match);
+      row.addEventListener("mousemove", (e) => showTip(e, x.name + ": " + plural(x.n, "program"), members.slice(0, 10).map((r) => r.exe)));
+      row.addEventListener("mouseleave", hideTip);
+      activatable(row, () => {
+        hideTip();
+        const next = row.nextElementSibling;
+        if (next && next.classList.contains("hbar-detail")) { next.remove(); row.setAttribute("aria-expanded", "false"); return; }
+        const btn = el("button", { type: "button", class: "small", text: "Show all " + x.n + " in the table" });
+        btn.addEventListener("click", jump("sec-programs", setProgFilter(x.filter || x.name)));
+        row.after(el("div", { class: "hbar-detail" },
+          el("ul", null, ...members.slice(0, 8).map((r) => el("li", { text: r.exe }))),
+          members.length > 8 ? el("div", { class: "muted", text: "and " + (members.length - 8) + " more" }) : null, btn));
+        row.setAttribute("aria-expanded", "true");
+      });
+      kids.push(row);
+    }
+    box.replaceChildren(...kids);
+  }
+
+  // ---- listeners: present first, exposed first; gone ones folded away ----
+  function listenerTable(items) {
+    const tbl = el("table", null, el("thead", null, el("tr", null,
+      el("th", { text: "Program" }), el("th", { text: "Address" }), el("th", { text: "Reach" }))));
+    const body = el("tbody");
+    for (const v of items) {
+      const sp = v.key.lastIndexOf(" ");
+      const path = sp > 0 ? v.key.slice(0, sp) : v.key, addr = sp > 0 ? v.key.slice(sp + 1) : "";
+      const bundle = bundleOf(path);
+      const tr = el("tr", { title: path },
+        el("td", null, el("div", { text: v.command || base(path) }),
+          el("div", { class: "muted small", text: bundle ? "in " + bundle : dirOf(path) || path })),
+        el("td", { class: "mono nowrap", text: addr }),
+        el("td", null, !v.present ? status("neutral", "Gone, last seen " + ago(v.lastSeen))
+          : v.exposed ? status("warning", "Exposed") : el("span", { class: "muted", text: "This Mac only" })));
+      tr.addEventListener("mousemove", (e) => showTip(e, (v.command || "") + " on " + addr,
+        [path, "user " + (v.user || "?"), "chain: " + (v.chain || "?")]));
+      tr.addEventListener("mouseleave", hideTip);
+      detailRow(tr, 3, () => [["path", path], ["address", addr], ["user", v.user], ["pid", v.pid],
+        ["command line", v.args], ["chain", v.chain], ["first seen", local(v.firstSeen)], ["last seen", local(v.lastSeen)]]);
+      body.append(tr);
+    }
+    tbl.append(body);
+    return tbl;
+  }
+  function renderListeners(lst) {
+    const box = $("#listeners");
+    if (!lst.length) { box.replaceChildren(el("div", { class: "empty", text: "No listeners recorded." })); return; }
+    const present = lst.filter((v) => v.present).sort((a, b) => (b.exposed - a.exposed) || a.key.localeCompare(b.key));
+    const gone = lst.filter((v) => !v.present).sort((a, b) => String(b.lastSeen).localeCompare(String(a.lastSeen)));
+    const exposed = present.filter((v) => v.exposed), localOnly = present.filter((v) => !v.exposed);
+    const kids = [];
+    if (exposed.length) kids.push(listenerTable(exposed));
+    else kids.push(el("div", { class: "empty" }, status("good", present.length ? "Nothing exposed to the network" : "Nothing is listening right now")));
+    if (localOnly.length) kids.push(el("details", exposed.length ? null : { open: "" },
+      el("summary", { text: localOnly.length + " listening on this Mac only" }), listenerTable(localOnly)));
+    if (gone.length) kids.push(el("details", null, el("summary", { text: gone.length + " no longer listening" }), listenerTable(gone)));
+    box.replaceChildren(...kids);
+  }
+
+  function renderCreds(creds) {
+    const box = $("#creds");
+    if (!creds.length) { box.replaceChildren(el("div", { class: "empty" }, status("good", "None seen"), " since the watcher started.")); return; }
+    box.replaceChildren(el("div", { class: "scroll" }, ...creds.slice().reverse().map((c) => el("div", { class: "cred" },
+      el("div", { class: "top" }, status("warning", when(c.time)), el("span", { class: "muted small", text: ago(c.time) }),
+        el("b", { class: "mono", text: base(c.exe) }),
+        el("span", { class: "muted small", text: (c.source === "log" ? "from the macOS log" : "from the process list") + (c.user ? ", user " + c.user : "") })),
+      el("div", { class: "mono", text: c.args || c.exe || "" }),
+      el("div", { class: "mono muted", text: "started by " + (c.chain || "?") })))));
+  }
+
+  function renderFeed(events) {
+    const kinds = [...new Set(events.map((e) => e.kind))].sort();
+    if (!activeKinds) activeKinds = new Set();
+    for (const k of kinds) if (!knownKinds.has(k)) { knownKinds.add(k); if (k !== "IDENTITY") activeKinds.add(k); }
+    const chips = $("#chips");
+    chips.replaceChildren(...kinds.map((k) => {
+      const on = activeKinds.has(k);
+      const b = el("button", { class: "chip", type: "button", "aria-pressed": String(on) },
+        KIND_LEVEL[k] ? mark(KIND_LEVEL[k]) : null, k, el("span", { class: "c", text: events.filter((e) => e.kind === k).length }));
+      b.addEventListener("click", () => { activeKinds.has(k) ? activeKinds.delete(k) : activeKinds.add(k); feedLimit = 0; renderFeed(events); });
+      return b;
+    }));
+    const all = events.filter((e) => activeKinds.has(e.kind)).reverse().slice(0, 500);
+    if (!feedLimit) feedLimit = PAGE();
+    const rows = all.slice(0, feedLimit);
+    moreButton($("#feedMore"), all.length - rows.length, () => { feedLimit += PAGE(); renderFeed(events); });
+    const feed = $("#feed");
+    if (!rows.length) { feed.replaceChildren(el("div", { class: "empty", text: "No events match the selected kinds." })); return; }
+    feed.replaceChildren(...rows.map((e) => el("div", { class: "row" },
+      el("span", { class: "muted", text: when(e.t) }),
+      el("span", { class: "kind" }, KIND_LEVEL[e.kind] ? status(KIND_LEVEL[e.kind], e.kind) : e.kind),
+      el("span", { class: "msg", text: e.msg }))));
+  }
+
+  // A page of rows at a time keeps the phone layout (no scroll box) a sane height.
+  const PAGE = () => (innerWidth < 640 ? 30 : 200);
+  let feedLimit = 0, progLimit = 0;
+  function moreButton(box, left, onMore) {
+    if (left <= 0) { box.replaceChildren(); return; }
+    const b = el("button", { type: "button", class: "more", text: "Show " + Math.min(left, PAGE()) + " more (" + left + " not shown)" });
+    b.addEventListener("click", onMore);
+    box.replaceChildren(b);
+  }
+
+  // ---- all programs ----
+  let lastRows = [];
+  const SPECIAL = { __risky: "Unsigned or ad-hoc", __new: "New since baseline", __other: "Other developers" };
+  function ensureOption(v) {
+    const sel = $("#sigFilter");
+    if (v && ![...sel.options].some((o) => o.value === v)) sel.append(el("option", { value: v, text: SPECIAL[v] || v }));
+  }
+  const SPECIAL_MATCH = { __risky: (r) => isRisky(r.signerClass), __new: (r) => r.isNew, __other: (r) => otherSigners.has(r.signerClass) };
+  function renderPrograms(rows) {
+    lastRows = rows;
+    const sel = $("#sigFilter"), current = sel.value;
+    const classes = [...new Set(rows.map((r) => r.signerClass))].sort();
+    const specials = Object.keys(SPECIAL).filter((k) => k !== "__other" || otherSigners.size);
+    sel.replaceChildren(el("option", { value: "", text: "All signers" }),
+      el("optgroup", { label: "Groups" }, ...specials.map((k) => el("option", { value: k, text: SPECIAL[k] }))),
+      el("optgroup", { label: "Signers" }, ...classes.map((c) => el("option", { value: c, text: c }))));
+    sel.value = classes.includes(current) || specials.includes(current) ? current : "";
+    const f = sel.value, q = $("#q").value.trim().toLowerCase();
+    const match = SPECIAL_MATCH[f] || ((r) => !f || r.signerClass === f);
+    let list = rows.filter((r) => match(r) &&
+      (!q || (r.exe + " " + r.signerClass + " " + (r.user || "") + " " + (r.firstArgs || "")).toLowerCase().includes(q)));
+    list.sort((a, b) => String(a[sortKey] || "").localeCompare(String(b[sortKey] || "")) * sortDir);
+    $("#progCount").textContent = list.length + " of " + rows.length;
+    const body = $("#progs tbody");
+    if (!progLimit) progLimit = PAGE();
+    moreButton($("#progMore"), list.length - Math.min(list.length, progLimit), () => { progLimit += PAGE(); renderPrograms(lastRows); });
+    body.replaceChildren(...list.slice(0, progLimit).map((r) => {
+      const tr = el("tr", null,
+        el("td", null, el("div", { class: "mono", title: r.exe }, el("b", { class: "pname", text: base(r.exe) }),
+            r.isNew ? el("span", { class: "newtag", text: "new", title: "First seen after the baseline" }) : null),
+          el("div", { class: "mono muted small pdir", text: dirOf(r.exe) || "path not recorded" })),
+        el("td", null, isRisky(r.signerClass) ? status("serious", r.signerClass) : r.signerClass),
+        el("td", { class: "col-user", text: r.user || "" }),
+        el("td", { class: "nowrap", text: when(r.firstSeen), title: local(r.firstSeen) }),
+        el("td", { class: "nowrap col-last", text: when(r.lastSeen), title: local(r.lastSeen) }));
+      tr.addEventListener("mousemove", (e) => showTip(e, base(r.exe), [
+        "signer: " + (r.signer || "not checked yet"), "team: " + (r.team || "-"),
+        "sha256: " + (r.sha256 || "-"), "parent: " + (r.parent || "-")]));
+      tr.addEventListener("mouseleave", hideTip);
+      detailRow(tr, 5, () => { hideTip(); return [["path", r.exe], ["sha256", r.sha256], ["signer", r.signer || "not checked yet"],
+        ["team", r.team], ["signing id", r.signingId], ["size", r.size != null ? Number(r.size).toLocaleString() + " bytes" : ""],
+        ["user", r.user], ["first pid", r.firstPid], ["parent", r.parent], ["first command line", r.firstArgs],
+        ["first seen", local(r.firstSeen)], ["last seen", local(r.lastSeen)]]; });
+      return tr;
+    }));
+    document.querySelectorAll("#progs th").forEach((th) => {
+      const on = th.dataset.k === sortKey;
+      if (on) th.setAttribute("aria-sort", sortDir > 0 ? "ascending" : "descending"); else th.removeAttribute("aria-sort");
+      th.querySelector(".arrow").textContent = on ? (sortDir > 0 ? "▲" : "▼") : "↕";
+    });
+  }
+  document.querySelectorAll("#progs th").forEach((th) => {
+    const label = th.textContent;
+    const b = el("button", { type: "button", class: "sort" }, label, el("span", { class: "arrow", "aria-hidden": "true" }));
+    th.replaceChildren(b);
+    b.addEventListener("click", () => {
+      const k = th.dataset.k; sortDir = sortKey === k ? -sortDir : (k === "firstSeen" || k === "lastSeen" ? -1 : 1); sortKey = k;
+      renderPrograms(lastRows);
+    });
+  });
+  $("#q").addEventListener("input", () => { progLimit = 0; renderPrograms(lastRows); });
+  $("#sigFilter").addEventListener("change", () => { progLimit = 0; renderPrograms(lastRows); });
+
+  function renderStartup(startup, startupEvents) {
+    const box = $("#startup");
+    const items = Object.entries(startup).sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([p, h]) => ({ p, h, changes: startupEvents.filter((e) => e.msg.includes(p)) }));
+    if (!items.length) { box.replaceChildren(el("div", { class: "empty", text: "No startup items recorded." })); return; }
+    const table = (list) => {
+      const tbl = el("table", null, el("thead", null, el("tr", null, el("th", { text: "Item" }), el("th", { text: "Changes" }))));
+      tbl.append(el("tbody", null, ...list.map((it) => {
+        const tr = el("tr", null,
+          el("td", null, el("div", { class: "mono", text: base(it.p) }), el("div", { class: "muted small mono", text: dirOf(it.p) })),
+          el("td", null, it.changes.length ? status("warning", plural(it.changes.length, "change") + ", last " + ago(it.changes[it.changes.length - 1].t))
+            : el("span", { class: "muted", text: "unchanged" })));
+        detailRow(tr, 2, () => [["path", it.p], ["sha256", it.h]].concat(it.changes.map((e) => [e.kind + " " + local(e.t), e.msg])));
+        return tr;
+      })));
+      return tbl;
+    };
+    const changed = items.filter((it) => it.changes.length), same = items.filter((it) => !it.changes.length);
+    const kids = [];
+    if (changed.length) kids.push(table(changed));
+    if (same.length) kids.push(el("details", null,
+      el("summary", { text: changed.length ? plural(same.length, "other item") + ", unchanged" : plural(same.length, "item") + ", all unchanged" }),
+      table(same)));
+    box.replaceChildren(...kids);
+  }
+
+  // ---- loading: a script tag works from a file:// page, where fetch of JSON does not ----
+  function load() {
+    const s = document.createElement("script");
+    s.src = "tattletale-data.js?t=" + Date.now();
+    s.onload = () => { s.remove(); if (window.TATTLETALE) render(window.TATTLETALE); };
+    s.onerror = () => {
+      s.remove();
+      $("#updated").textContent = "";
+      $("#live").replaceChildren(status("critical", "No data"));
+      const banner = $("#banner");
+      banner.replaceChildren(status("critical", "No data"),
+        el("span", { text: "tattletale-data.js was not found next to this page. Start the watcher: python3 tattletale.py" }));
+      banner.classList.add("show");
+    };
+    document.head.append(s);
+  }
+  $("#refresh").addEventListener("click", load);
+  load();
+  setInterval(load, 60000);
+})();
+</script>
+</body>
+</html>
