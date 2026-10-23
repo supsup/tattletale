@@ -163,7 +163,18 @@ listeners and startup items are kept. The full contract, column by column, is
 
 0.0.1 kept its data next to `tattletale.py` at the repository root. On the first start with
 default paths, either version moves that data into `data/` once (database, log, startup
-copies) and says so; it refuses while a 0.0.1 watcher is still running against it. Also fixed
+copies) and says so; it refuses while a 0.0.1 watcher is still running against it.
+
+**If you installed the 0.0.1 login agent, re-install it after upgrading.** The 0.0.1 agent runs
+`tattletale.py` at the repository root, which 0.0.2 moved into `python/`, so it would keep
+restarting a missing script and record nothing. Install the new one; it has the same label,
+so the installer stops the old agent and replaces it:
+
+```sh
+sh python/install-login-agent.sh        # or java/install-login-agent.sh
+```
+
+Also fixed
 in 0.0.2: `tattletale.env` was refused line by line in 0.0.1 (flags and environment variables
 always worked), and the Python watcher left its `log stream` helper running after it stopped.
 

@@ -1106,7 +1106,7 @@ final class Watch {
     /** What a live watcher's command line looks like, for either version. */
     static boolean isTattletaleCommand(String command) {
         if (command.contains("tattletale.py") || command.contains("tattletale.jar")
-                || command.contains("dev.tattletale.Main") || command.contains("/java/build/tattletale")) return true;
+                || command.contains("dev.tattletale.Main") || command.contains("java/build/tattletale")) return true;
         List<String> w = Py.split(command);
         return !w.isEmpty() && Py.basename(w.get(0)).equals("tattletale");
     }

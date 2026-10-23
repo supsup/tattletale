@@ -160,9 +160,8 @@ public final class Main {
 
     /**
      * Effective settings and where each came from. Config-file keys are checked as
-     * TATTLETALE_<NAME> with NAME = the key after the 11-character prefix "TATTLETALE_". (The
-     * Python version slices k[9:], two characters short, so it refuses every TATTLETALE_* key in
-     * a config file; this version accepts the documented names and refuses everything else.)
+     * TATTLETALE_<NAME> with NAME = the key after the 11-character prefix "TATTLETALE_", the
+     * same rule as the Python version since 0.0.2.
      */
     static Resolved resolveSettings(Args a) {
         String cfgPath = a.config != null ? a.config

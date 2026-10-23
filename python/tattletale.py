@@ -102,8 +102,12 @@ def pid_path(pid):
 def is_tattletale(command):
     """True when a ps command line is a Tattletale watcher: the Python script, the Java jar,
     or the Java native binary (java/build/tattletale)."""
-    return ("tattletale.py" in command or "tattletale.jar" in command
-            or "/java/build/tattletale" in command)
+    # Kept identical to the Java version's isTattletaleCommand.
+    if ("tattletale.py" in command or "tattletale.jar" in command
+            or "dev.tattletale.Main" in command or "java/build/tattletale" in command):
+        return True
+    first = command.split(None, 1)[0] if command.split() else ""
+    return os.path.basename(first) == "tattletale"
 
 
 def now():
@@ -417,9 +421,9 @@ class Watch:
         args= is the command line, read separately so a helper started through a shell
         (argv: /bin/sh .../git-credential-x) is still recognised by name."""
         out = subprocess.run(["ps", "-axo", "pid=,ppid=,user=,comm="], capture_output=True,
-                             text=True, timeout=20).stdout
+                             text=True, errors="replace", timeout=20).stdout
         argv = subprocess.run(["ps", "-axo", "pid=,args="], capture_output=True,
-                              text=True, timeout=20).stdout
+                              text=True, errors="replace", timeout=20).stdout
         args = {}
         for line in argv.splitlines():
             parts = line.split(None, 1)
@@ -753,7 +757,8 @@ class Watch:
         cmd = ["log", "stream", "--style", "ndjson", "--predicate", pred]
         while not self.stop.is_set():
             try:
-                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                                     errors="replace")
                 self.stream_proc = p  # stopped in run() on exit, so it never outlives the watcher
             except OSError as e:
                 self.log("NOTE", f"log stream unavailable ({e}); credential checks use the process list only")
@@ -861,40 +866,46 @@ class Watch:
         # first startup scan by up to its interval instead of running it on the first pass.
         last = {"listeners": float("-inf"), "startup": float("-inf")}
         last_retention = time.monotonic()
-        while not self.stop.is_set():
-            t0 = time.monotonic()
-            for name, fn in (("processes", self.check_processes),):
-                self._safe(name, fn)
-            if t0 - last["listeners"] >= self.listen_every:
-                self._safe("listeners", self.check_listeners)
-                last["listeners"] = t0
-            if t0 - last["startup"] >= self.startup_every:
-                self._safe("startup", self.check_startup)
-                last["startup"] = t0
-                self._safe("save", self.save)
-            if t0 - last_retention >= 3600:
-                self._safe("retention", self.retain)
-                last_retention = t0
-            if int(t0) % 60 < 3:
-                self._safe("save", self.save)
-            self.stop.wait(self.process_every)
-        self._safe("save", self.save)
-        p = getattr(self, "stream_proc", None)
-        if p is not None and p.poll() is None:
-            p.terminate()
-            try:
-                p.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                p.kill()
-        self.log("STOP", "tattletale stopped")
-        with lock:
-            self.db.close()
-        self.release_pid_file()
+        try:
+            while not self.stop.is_set():
+                t0 = time.monotonic()
+                for name, fn in (("processes", self.check_processes),):
+                    self._safe(name, fn)
+                if t0 - last["listeners"] >= self.listen_every:
+                    self._safe("listeners", self.check_listeners)
+                    last["listeners"] = t0
+                if t0 - last["startup"] >= self.startup_every:
+                    self._safe("startup", self.check_startup)
+                    last["startup"] = t0
+                    self._safe("save", self.save)
+                if t0 - last_retention >= 3600:
+                    self._safe("retention", self.retain)
+                    last_retention = t0
+                if int(t0) % 60 < 3:
+                    self._safe("save", self.save)
+                self.stop.wait(self.process_every)
+        finally:
+            # Runs even when the loop raises, so the log stream child is stopped and the
+            # pid file released instead of being left behind by a crash.
+            self._safe("save", self.save)
+            p = getattr(self, "stream_proc", None)
+            if p is not None and p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+            self.log("STOP", "tattletale stopped")
+            with lock:
+                self.db.close()
+            self.release_pid_file()
 
     def _safe(self, name, fn):
         try:
             fn()
-        except (subprocess.SubprocessError, OSError, sqlite3.Error) as e:
+        except (subprocess.SubprocessError, OSError, sqlite3.Error, ValueError) as e:
+            # ValueError covers a decode error from odd process data: one bad process must
+            # never stop the watcher.
             self.log("ERROR", f"{name} check failed: {e}")
 
 

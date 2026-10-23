@@ -146,10 +146,13 @@ final class Db implements AutoCloseable {
      * transaction() context manager does.
      */
     synchronized void transaction(List<String> statements) throws DbException {
-        StringBuilder sb = new StringBuilder("BEGIN;\n");
-        for (String s : statements) sb.append(s).append('\n');
+        // One round trip per statement, so the FIRST error stops the batch. Sending the whole
+        // batch at once let the shell keep executing after an error; if SQLite had rolled the
+        // transaction back itself (SQLITE_FULL, IOERR, BUSY) the rest then ran in autocommit
+        // and was kept. Stopping here means no later statement runs outside the transaction.
+        exec("BEGIN;");
         try {
-            exec(sb.toString());
+            for (String s : statements) exec(s);
         } catch (DbException e) {
             try {
                 exec("ROLLBACK;");

@@ -76,15 +76,13 @@ parent if it is `java/`, else the working directory as is.
   400 random cases.
 - **Signals**: SIGINT and SIGTERM set the stop flag. The loop then saves, logs STOP, closes the
   database, removes the pid file and exits 0, as Python does.
-- **`log stream`** is stopped when the watcher stops. The Python version leaves its `log stream`
-  child running after it exits (reparented to launchd).
-- **Config file keys** are checked against the documented names. The Python version slices the
-  key with `k[9:]` instead of `k[11:]`, so it refuses every `TATTLETALE_*` line in
-  `tattletale.env`; this version accepts the documented names and refuses everything else.
-- **Pid file**: this version treats a pid as a live tattletale when its command line has
-  `tattletale.py`, `tattletale.jar`, `dev.tattletale.Main`, `/java/build/tattletale`, or a first
-  word named `tattletale`. The Python version checks for `tattletale.py` only, so it takes over a
-  pid file held by a running Java version.
+- **`log stream`** is stopped when the watcher stops, in both versions (the Python 0.0.1 left it
+  running; fixed in 0.0.2).
+- **Config file keys** are checked against the documented names, in both versions (Python 0.0.1
+  refused every `TATTLETALE_*` line in `tattletale.env`; fixed in 0.0.2).
+- **Pid file**: both versions treat a pid as a live tattletale when its command line has
+  `tattletale.py`, `tattletale.jar`, `dev.tattletale.Main`, `java/build/tattletale`, or a first
+  word named `tattletale`, so neither takes over a database the other is watching.
 - **Small things**: the usage line says `tattletale`, not `tattletale.py`. `~user` in a path is
   expanded only for the current user. Map-import JSON errors are worded by this reader, not by
   Python's `json` module.
