@@ -99,6 +99,13 @@ def pid_path(pid):
     return buf.value.decode("utf-8", "replace") if n > 0 else None
 
 
+def is_tattletale(command):
+    """True when a ps command line is a Tattletale watcher: the Python script, the Java jar,
+    or the Java native binary (java/build/tattletale)."""
+    return ("tattletale.py" in command or "tattletale.jar" in command
+            or "/java/build/tattletale" in command)
+
+
 def now():
     return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -747,6 +754,7 @@ class Watch:
         while not self.stop.is_set():
             try:
                 p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                self.stream_proc = p  # stopped in run() on exit, so it never outlives the watcher
             except OSError as e:
                 self.log("NOTE", f"log stream unavailable ({e}); credential checks use the process list only")
                 return
@@ -804,7 +812,7 @@ class Watch:
         if other and other != os.getpid():
             r = subprocess.run(["ps", "-p", str(other), "-o", "command="],
                                capture_output=True, text=True)
-            if r.returncode == 0 and "tattletale.py" in r.stdout:
+            if r.returncode == 0 and is_tattletale(r.stdout):
                 raise SystemExit(f"tattletale: already running as pid {other} for this database "
                                  f"({path}); stop it first: kill {other}")
         with open(path, "w") as f:
@@ -871,6 +879,13 @@ class Watch:
                 self._safe("save", self.save)
             self.stop.wait(self.process_every)
         self._safe("save", self.save)
+        p = getattr(self, "stream_proc", None)
+        if p is not None and p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
         self.log("STOP", "tattletale stopped")
         with lock:
             self.db.close()
@@ -947,7 +962,7 @@ def resolve_settings(args):
     if os.path.exists(os.path.expanduser(cfg_path)):
         file_vals = parse_env_file(os.path.expanduser(cfg_path))
         unknown = sorted(k for k in file_vals if k != "TATTLETALE_CONFIG"
-                         and not (k.startswith("TATTLETALE_") and k[9:].lower() in SETTINGS))
+                         and not (k.startswith("TATTLETALE_") and k[len("TATTLETALE_"):].lower() in SETTINGS))
         if unknown:
             sys.exit(f"tattletale: {cfg_path}: unknown setting(s): {', '.join(unknown)}")
     elif args.config:

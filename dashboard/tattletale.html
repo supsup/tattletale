@@ -292,7 +292,7 @@
     <div id="progMore"></div>
   </div>
 
-  <p class="sub">Data: tattletale-data.js, written by tattletale.py<span id="ver"></span> next to this page. The page reloads it every 60 seconds.</p>
+  <p class="sub">Data: tattletale-data.js, written by the Tattletale watcher<span id="ver"></span> next to this page. The page reloads it every 60 seconds.</p>
 </div>
 <div class="tip" id="tip"></div>
 
@@ -533,7 +533,7 @@
     if (stale) {
       banner.replaceChildren(status("serious", "Stale"),
         el("span", { text: "The watcher has not written data for " + ago(lastGenerated).replace(" ago", "") +
-          ". It may be stopped: start it with python3 tattletale.py in this folder." }));
+          ". It may be stopped: start it from the repository with python3 python/tattletale.py or java -jar java/build/tattletale.jar." }));
       banner.classList.add("show");
     } else banner.classList.remove("show");
   }
@@ -899,7 +899,7 @@
       $("#live").replaceChildren(status("critical", "No data"));
       const banner = $("#banner");
       banner.replaceChildren(status("critical", "No data"),
-        el("span", { text: "tattletale-data.js was not found next to this page. Start the watcher: python3 tattletale.py" }));
+        el("span", { text: "tattletale-data.js was not found next to this page. Start the watcher from the repository: python3 python/tattletale.py or java -jar java/build/tattletale.jar" }));
       banner.classList.add("show");
     };
     document.head.append(s);
