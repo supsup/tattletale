@@ -153,3 +153,12 @@ Apache License 2.0. See [LICENSE](LICENSE).
 The recording uses demo data: real macOS system programs, with the user renamed and a few
 invented events (an unsigned download, an exposed dev server, a password dialog, a startup
 change) so that every section has something in it.
+
+Recorded with [BrewShot](https://github.com/supsup/BrewShot), a zero-dependency Java
+screenshot tool that drives headless Chrome and brews a GIF straight from a page:
+
+```sh
+java -jar brewshot.jar tattletale.html -o tattletale-demo.gif --size 1000x640 --gif 70 --gif-delay 200
+```
+
+Thanks, BrewShot. ☕
