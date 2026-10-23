@@ -5,7 +5,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 import static dev.tattletale.CollectionHealthTest.*;
 
-/** Frozen v2 inputs drive production classification, collectors, transactions and page replacement. */
+/** Frozen inputs drive production classification, collectors, transactions and page replacement. */
 final class RepairParityTest {
  static final class Logical extends Fake implements StartupEntry.Fs {
   Map<String,Map<String,Object>> entries=new LinkedHashMap<>();String sourceFailure;
@@ -33,8 +33,8 @@ final class RepairParityTest {
  }
  static Proc.Result command(Map<?,?> m){return new Proc.Result(((Number)m.get("code")).intValue(),(String)m.get("out"),(String)m.get("err"));}
  @SuppressWarnings("unchecked") static void run(Map<String,Object> shared)throws Exception {
-  check(((Number)shared.get("fixtureVersion")).intValue()==2,"repair producer requires frozen fixtureVersion2");
-  List<Object> results=new ArrayList<>();List<?> cases=(List<?>)shared.get("repairCases");check(cases!=null && cases.size()==9,"required repair families");
+  check(((Number)shared.get("fixtureVersion")).intValue()==3,"repair producer requires frozen fixtureVersion3");
+  List<Object> results=new ArrayList<>();List<?> cases=(List<?>)shared.get("repairCases");check(cases!=null && cases.size()==11,"required repair families");
   for(Object object:cases){Map<String,Object> spec=(Map<String,Object>)object;String name=(String)spec.get("name"),kind=(String)spec.get("kind");List<Object> states=new ArrayList<>();
    test("v2-repair-family-"+name,()->{
     if(kind.equals("pid")) {

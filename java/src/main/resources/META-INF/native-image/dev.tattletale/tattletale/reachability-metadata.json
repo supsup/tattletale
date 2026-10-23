@@ -41,6 +41,16 @@
         "parameterTypes": [
           "jint"
         ]
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": [
+          "void*",
+          "void*"
+        ],
+        "options": {
+          "captureCallState": true
+        }
       }
     ]
   }

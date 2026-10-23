@@ -115,7 +115,9 @@ Final directories, nonregular entries, symlink loops and regular files larger th
 are explicit unreadable markers; inaccessible ancestors reject the filesystem partition.
 Accepted regular files are fully hashed up to 16 MiB, while copies retain at most 4 MiB.
 Readability flaps alone emit no content-change event: restored A is unchanged, while B is
-compared with the last readable A version.
+compared with the last readable A version. If an item has never had readable content,
+its first readable version emits one `STARTUP~` with `before: None` and the saved after-copy.
+This applies both to an unreadable baseline item and one added later while unreadable.
 
 The page names degraded/unknown checks alongside either Live or Stale. A failed page
 refresh retains the last fully accepted inventory, health and update time under an explicit
@@ -238,12 +240,19 @@ unrelated privacy, locking, platform or identity-refresh changes.
 The gate runs both fixture producers into fresh files, requires their successful exits
 and fresh timestamped per-case JUnit (with skips counted), then compares the complete
 23 scope cases, 13 command cases, ten original snapshots and eight startup transitions,
-plus nine ordered repair families with 59 states from shared test-fixture version 2.
+plus eleven ordered repair families with 76 states from shared test-fixture version 3.
 These cover special entries/ancestor failures, readability history, warning-note dedup,
 automatic rollback, publication failure/recovery and PID framing. Actual filesystem adapter
-and default-collector wiring controls remain in each language's fixture suite. The 59
-states are data observations, not a claim of 59 distinct executed tests. SQLite schema 1,
-generated-data format 2 and producer version 0.0.2 remain unchanged.
+and default-collector wiring controls remain in each language's fixture suite. The two
+first-readable histories add 17 states checked independently against input bytes, exact
+events, saved copies, version rows and degraded/recovered health. An additional 37 ordered
+observations cover process identity (16), real filesystem entry dispositions (9), listener
+identity (6) and actual PID-file publication (6). Filesystem results compare selected semantic
+dispositions, with listed-child metadata denial explicitly injected; they do not equate raw
+platform exception text. Expected values, JSON scalar types and array order are checked
+before comparison. A pair agreeing on incorrect V3 observations or first-readable histories
+is refused. These are data observations, not
+counts of distinct executed tests. SQLite schema 1, generated-data format 2 and producer version 0.0.2 remain unchanged.
 It retains failed outputs and refuses missing, stale, malformed or incomplete evidence.
 `tests/test_health_parity_gate.py` uses explicitly synthetic validation data and mocked
 producers; it is not a substitute for this actual two-producer gate.
@@ -253,7 +262,8 @@ checks strict shape, scalar types and ordered arrays, without sorting away event
 Its success means equal fixture data, **not** proof that either producer ran or passed.
 Standalone fixture XML is not a Gradle `TEST-*.xml` task report; an outer native execution
 receipt supplies command/custody provenance. The gate is not a process supervisor or a
-live-watcher/release certification.
+live-watcher/release certification. Jar fixtures do not establish native-image or Intel
+hardware behavior.
 
 ## Upgrading from 0.0.1
 

@@ -40,12 +40,14 @@ def synthetic():
                 'events': [], 'startupMirror': {},
                 'baselines': {} if case['name'] == 'publicationNoCache' else {k: True for k in ('programs', 'listeners', 'startup', 'crontab')},
                 'dirtyPrograms': {}, 'dirtyListeners': {}, 'startupVersions': [], 'copies': [], 'published': None}
-    return {'fixtureVersion': 2,
+    return {'fixtureVersion': 3,
             'scopes': [{'host': r['host'], 'actual': r['expected']} for r in fixture['scopeCases']],
             'commands': [{**{k: r[k] for k in ('tool', 'code', 'out', 'err')}, 'actual': r['expected']} for r in fixture['commandCases']],
             'snapshots': [row(name) for name in parity.SNAPSHOTS],
             'startupTransitions': [row(name, True) for name in parity.TRANSITIONS],
-            'repairResults': [{'name': c['name'], 'kind': c['kind'], 'states': [repair_state(c, s) for s in c['steps']]} for c in fixture['repairCases']]}
+            'repairResults': [{'name': c['name'], 'kind': c['kind'], 'states': parity.first_readable_expected(c, fixture['clock']) if c['name'] in ('firstReadableBaseline', 'firstReadableAdded') else [repair_state(c, s) for s in c['steps']]} for c in fixture['repairCases']],
+            'review44': {family: [{'name': row[0], **dict(zip(parity.REVIEW44_FIELDS[family], row[1:]))} for row in specs]
+                         for family, specs in parity.REVIEW44_EXPECTATIONS.items()}}
 
 
 class ParityDataTests(unittest.TestCase):
@@ -64,7 +66,7 @@ class ParityDataTests(unittest.TestCase):
     def test_equal_nonempty_data_explicitly_does_not_certify_producers(self):
         result = self.compare(self.data)
         self.assertEqual((result['scopes'], result['commands'], result['snapshots'], result['startupTransitions']), (23, 13, 10, 8))
-        self.assertEqual((result['repairFamilies'], result['repairStates']), (9, 59))
+        self.assertEqual((result['repairFamilies'], result['repairStates']), (11, 76))
         self.assertFalse(result['producerExecutionCertified'])
 
     def test_dictionary_key_order_is_not_whole_file_byte_identity(self):
@@ -104,7 +106,7 @@ class ParityDataTests(unittest.TestCase):
         with self.assertRaises(OSError): parity.compare_files(self.left, self.right)
 
     def test_no_cache_state_preserves_actual_empty_baseline_only_at_the_exact_exception(self):
-        self.assertEqual(self.compare(self.data)['repairStates'], 59)
+        self.assertEqual(self.compare(self.data)['repairStates'], 76)
         value = copy.deepcopy(self.data)
         value['repairResults'][7]['states'][0]['baselines'] = {k: False for k in parity.CHECKS}
         self.left.write_text(json.dumps(value))
@@ -202,7 +204,7 @@ for name, mutate in {
     'wrong_projection_type': lambda d: d['repairResults'][0]['states'][0].update(inventoryAsOf=False),
     'missing_pending_map': lambda d: d['repairResults'][0]['states'][0].pop('dirtyPrograms'),
     'old_fixture_version': lambda d: d.update(fixtureVersion=1),
-    'pid_classification_drift': lambda d: d['repairResults'][-1]['states'][0].update(classification='unknown'),
+    'pid_classification_drift': lambda d: d['repairResults'][8]['states'][0].update(classification='unknown'),
 }.items():
     setattr(ParityDataTests, 'test_refuses_' + name, mutation_test(mutate))
 
@@ -217,6 +219,179 @@ def raw_test(raw):
 for name, raw in {'empty': b'', 'malformed': b'{', 'duplicate': b'{"fixtureVersion":1,"fixtureVersion":1}',
                   'nan': b'{"x":NaN}', 'infinity': b'{"x":1e999}', 'invalid_utf8': b'\xff'}.items():
     setattr(ParityDataTests, 'test_refuses_raw_' + name, raw_test(raw))
+
+
+class Review44DataTests(unittest.TestCase):
+    setUp = ParityDataTests.setUp
+    # Synthetic validator controls only. None launches or certifies a producer.
+    def identical_pair(self, value, fixture=None):
+        self.left.write_text(json.dumps(value))
+        self.right.write_text(json.dumps(value))
+        return parity.compare_files(self.left, self.right, fixture)
+
+    def test_v3_census_and_semantic_scope_are_reported(self):
+        result = self.identical_pair(self.data)
+        self.assertEqual((result['review44Observations'], result['firstReadableSemanticStates']), (37, 17))
+        self.assertFalse(result['producerExecutionCertified'])
+
+    def test_each_family_refuses_missing_extra_duplicate_reordered_rows_and_fields(self):
+        for family in parity.REVIEW44_EXPECTATIONS:
+            for mutation in ('missing-row', 'extra-row', 'duplicate-row', 'reorder', 'missing-field', 'extra-field'):
+                with self.subTest(family=family, mutation=mutation):
+                    value = copy.deepcopy(self.data); rows = value['review44'][family]
+                    if mutation == 'missing-row': rows.pop()
+                    elif mutation == 'extra-row': rows.append(copy.deepcopy(rows[0]))
+                    elif mutation == 'duplicate-row': rows[1] = copy.deepcopy(rows[0])
+                    elif mutation == 'reorder': rows.reverse()
+                    elif mutation == 'missing-field': rows[0].pop(parity.REVIEW44_FIELDS[family][0])
+                    else: rows[0]['extra'] = True
+                    with self.assertRaises(parity.ParityError): self.identical_pair(value)
+
+    def test_review44_envelope_refuses_missing_extra_and_wrong_types(self):
+        for family in parity.REVIEW44_EXPECTATIONS:
+            for bad in (None, {}, True, 37):
+                value = copy.deepcopy(self.data); value['review44'][family] = bad
+                with self.assertRaises(parity.ParityError): self.identical_pair(value)
+            value = copy.deepcopy(self.data); value['review44'].pop(family)
+            with self.assertRaises(parity.ParityError): self.identical_pair(value)
+        value = copy.deepcopy(self.data); value['review44']['extra'] = []
+        with self.assertRaises(parity.ParityError): self.identical_pair(value)
+        value = copy.deepcopy(self.data); value.pop('review44')
+        with self.assertRaises(parity.ParityError): self.identical_pair(value)
+
+    def test_each_result_scalar_has_exact_json_type_even_in_identical_pairs(self):
+        for family, rows in self.data['review44'].items():
+            for index, row in enumerate(rows):
+                for key, correct in row.items():
+                    # Explicit bool/int distinction, no coercion or null filling.
+                    bad = 1 if type(correct) is bool else True if type(correct) is int else 0
+                    value = copy.deepcopy(self.data); value['review44'][family][index][key] = bad
+                    with self.subTest(family=family, case=row['name'], field=key):
+                        with self.assertRaises(parity.ParityError): self.identical_pair(value)
+
+    def test_integer_counter_values_cannot_drift_in_identical_pairs(self):
+        for family, counter in (('processIdentities', 'bridgeCalls'), ('listenerIdentities', 'commCalls'), ('pidFiles', 'noteCount')):
+            for index, row in enumerate(self.data['review44'][family]):
+                value = copy.deepcopy(self.data)
+                value['review44'][family][index][counter] += 1
+                with self.subTest(family=family, case=row['name'], field=counter):
+                    with self.assertRaises(parity.ParityError): self.identical_pair(value)
+
+    def test_altered_declared_expectation_cannot_make_two_wrong_producers_pass(self):
+        fixture = parity.load(pathlib.Path(__file__).with_name('fixtures') / 'collection-health.json')
+        for family in parity.REVIEW44_EXPECTATIONS:
+            value = copy.deepcopy(self.data); changed = copy.deepcopy(fixture)
+            row, declaration = value['review44'][family][0], changed['review44Cases'][family][0]
+            if family == 'entryDispositions':
+                row['result'] = declaration['expectedResult'] = 'rejected'
+            else:
+                row['accepted'] = declaration['expected']['accepted'] = not row['accepted']
+            custom = self.root / (family + '-bad-fixture.json'); custom.write_text(json.dumps(changed))
+            with self.assertRaises(parity.ParityError): self.identical_pair(value, custom)
+
+    def test_each_declared_expectation_is_checked_independently_of_producer_data(self):
+        fixture = parity.load(pathlib.Path(__file__).with_name('fixtures') / 'collection-health.json')
+        for family, rows in fixture['review44Cases'].items():
+            for index, row in enumerate(rows):
+                fields = ('expectedResult',) if family == 'entryDispositions' else tuple(row['expected'])
+                for field in fields:
+                    changed = copy.deepcopy(fixture['review44Cases'])
+                    target = changed[family][index] if family == 'entryDispositions' else changed[family][index]['expected']
+                    correct = target[field]
+                    target[field] = not correct if type(correct) is bool else correct + 1 if type(correct) is int else 'wrong expectation'
+                    with self.subTest(family=family, case=row['name'], field=field):
+                        with self.assertRaises(parity.ParityError): parity.review44_spec(changed)
+
+    def test_fixture_row_census_order_and_scalar_mutants_are_refused(self):
+        fixture = parity.load(pathlib.Path(__file__).with_name('fixtures') / 'collection-health.json')
+        for family in parity.REVIEW44_EXPECTATIONS:
+            for mutation in ('missing-row', 'extra-row', 'duplicate-row', 'reorder', 'missing-field', 'extra-field', 'wrong-type'):
+                changed = copy.deepcopy(fixture); rows = changed['review44Cases'][family]
+                if mutation == 'missing-row': rows.pop()
+                elif mutation == 'extra-row': rows.append(copy.deepcopy(rows[0]))
+                elif mutation == 'duplicate-row': rows[1] = copy.deepcopy(rows[0])
+                elif mutation == 'reorder': rows.reverse()
+                elif mutation == 'missing-field': rows[0].pop('name')
+                elif mutation == 'extra-field': rows[0]['extra'] = True
+                else: rows[0]['name'] = 1
+                custom = self.root / (family + '-' + mutation + '.json'); custom.write_text(json.dumps(changed))
+                with self.subTest(family=family, mutation=mutation):
+                    with self.assertRaises(parity.ParityError): self.identical_pair(self.data, custom)
+
+    def test_changed_frozen_setup_cannot_reuse_old_expectations_and_outputs(self):
+        fixture = parity.load(pathlib.Path(__file__).with_name('fixtures') / 'collection-health.json')
+        for family, fields in parity.REVIEW44_INPUT_FIELDS.items():
+            for field in fields:
+                changed = copy.deepcopy(fixture); row = changed['review44Cases'][family][0]
+                correct = row[field]
+                row[field] = not correct if type(correct) is bool else '/fixture/changed' if type(correct) is str else '/fixture/changed'
+                custom = self.root / (family + '-' + field + '.json'); custom.write_text(json.dumps(changed))
+                with self.subTest(family=family, field=field):
+                    with self.assertRaises(parity.ParityError): self.identical_pair(self.data, custom)
+
+    def test_first_readability_delivers_exactly_one_before_none_event_for_both_histories(self):
+        for family, first_index in ((9, 2), (10, 3)):
+            states = self.data['repairResults'][family]['states']
+            initial_events = [e for e in states[first_index]['events'] if e['kind'] == 'STARTUP~']
+            self.assertEqual(len(initial_events), 1)
+            self.assertIn('before: None | after: /fixture/copies/fixture_entry/', initial_events[0]['message'])
+            for mutation in ('drop', 'duplicate', 'wrong-before', 'wrong-after', 'wrong-kind', 'wrong-time', 'fake-diff'):
+                value = copy.deepcopy(self.data); events = value['repairResults'][family]['states'][first_index]['events']
+                if mutation == 'drop': events.pop()
+                elif mutation == 'duplicate': events.append(copy.deepcopy(events[-1]))
+                elif mutation == 'wrong-before': events[-1]['message'] = events[-1]['message'].replace('before: None', 'before: /fixture/fake')
+                elif mutation == 'wrong-after': events[-1]['message'] = events[-1]['message'].replace('after: /fixture/copies/', 'after: /fixture/fake/')
+                elif mutation == 'wrong-kind': events[-1]['kind'] = 'STARTUP+'
+                elif mutation == 'wrong-time': events[-1]['time'] = '2000-01-01T00:00:00Z'
+                else: events[-1]['message'] += '\n-A\n+A'
+                with self.subTest(family=family, mutation=mutation):
+                    with self.assertRaises(parity.ParityError): self.identical_pair(value)
+
+    def test_first_readability_copy_and_version_evidence_cannot_be_absent_or_invented(self):
+        for family, first_index in ((9, 2), (10, 3)):
+            for mutation in ('drop-copy', 'wrong-bytes', 'fake-copy', 'drop-version', 'null-version-copy', 'wrong-hash', 'wrong-seen-time'):
+                value = copy.deepcopy(self.data); state = value['repairResults'][family]['states'][first_index]
+                copies = state['copies']; index = next(i for i, c in enumerate(copies) if '/fixture_entry/' in c['path'])
+                if mutation == 'drop-copy': copies.pop(index)
+                elif mutation == 'wrong-bytes': copies[index]['hex'] = '420a'
+                elif mutation == 'fake-copy': copies[index]['path'] += 'fake'
+                elif mutation == 'drop-version': state['startupVersions'].pop()
+                elif mutation == 'null-version-copy': state['startupVersions'][-1]['copyPath'] = None
+                elif mutation == 'wrong-hash': state['startupVersions'][-1]['hash'] = 'b' * 64
+                else: state['startupVersions'][-1]['seenAt'] = '2000-01-01T00:00:00Z'
+                with self.subTest(family=family, mutation=mutation):
+                    with self.assertRaises(parity.ParityError): self.identical_pair(value)
+
+    def test_first_readability_health_baseline_and_retained_history_are_semantic(self):
+        for family, unreadable, first in ((9, 1, 2), (10, 2, 3)):
+            for mutation in ('false-ok', 'lost-success', 'false-success', 'wrong-error', 'baseline', 'map-loss', 'duplicate-repeat', 'resurrection', 'wrong-diff', 'published-fiction'):
+                value = copy.deepcopy(self.data); states = value['repairResults'][family]['states']
+                if mutation == 'false-ok': states[unreadable]['collectionHealth']['startup'].update(status='ok', error=None, lastSuccess=states[unreadable]['collectionHealth']['startup']['lastAttempt'])
+                elif mutation == 'lost-success': states[first]['collectionHealth']['startup']['lastSuccess'] = '2000-01-01T00:00:00Z'
+                elif mutation == 'false-success': states[-3]['collectionHealth']['startup']['lastSuccess'] = states[-3]['collectionHealth']['startup']['lastAttempt']
+                elif mutation == 'wrong-error': states[unreadable]['collectionHealth']['startup']['error'] = 'collection-io'
+                elif mutation == 'baseline': states[first]['baselines']['startup'] = True
+                elif mutation == 'map-loss': states[first]['map']['startup'].pop('/fixture/entry'); states[first]['startupMirror'].pop('/fixture/entry')
+                elif mutation == 'duplicate-repeat': states[first + 1]['events'].append(copy.deepcopy(states[first]['events'][-1]))
+                elif mutation == 'resurrection': states[-2]['events'].append(copy.deepcopy(states[first]['events'][-1]))
+                elif mutation == 'wrong-diff': states[-1]['events'][-1]['message'] = states[-1]['events'][-1]['message'].replace('-B', '-A')
+                else: states[first]['inventoryAsOf'] = '2000-01-02T23:59:59Z'
+                with self.subTest(family=family, mutation=mutation):
+                    with self.assertRaises(parity.ParityError): self.identical_pair(value)
+
+
+def identical_review44_mutant(family, index):
+    def test(self):
+        value = copy.deepcopy(self.data); row = value['review44'][family][index]
+        key = 'result' if family == 'entryDispositions' else 'accepted'
+        row[key] = 'wrong disposition' if family == 'entryDispositions' else not row[key]
+        with self.assertRaises(parity.ParityError): self.identical_pair(value)
+    return test
+
+
+for family, specs in parity.REVIEW44_EXPECTATIONS.items():
+    for index, spec in enumerate(specs):
+        setattr(Review44DataTests, 'test_identical_wrong_' + family + '_' + spec[0].replace('-', '_'), identical_review44_mutant(family, index))
 
 
 class ProducerGateTests(unittest.TestCase):

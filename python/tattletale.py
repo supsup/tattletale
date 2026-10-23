@@ -154,6 +154,16 @@ def ascii_split(value, maxsplit=0):
     return re.split(r"[ \t\r\n\v\f]+", value.strip(ASCII_WS), maxsplit=maxsplit)
 
 
+def ps_display_escaped(value):
+    """BSD ps/vis display escapes are ambiguous executable spellings, not paths.
+
+    A literal filename matching vis notation is also ambiguous here; resolve it
+    through the kernel bridge. A caret followed by a non-control byte (app^2)
+    remains a stable literal spelling.
+    """
+    return re.search(r"\\[0-7]{3}|M-[!-~]|\^[@-_?]", value) is not None
+
+
 def bind_scope(host):
     """Classify a literal bind address, without DNS or reachability claims."""
     if not isinstance(host, str) or not host or host != host.strip():
@@ -654,9 +664,13 @@ class Watch:
             if pid in procs:
                 raise CollectionError("ps-parse")
             exe = parts[3].strip(ASCII_WS)
-            kernel_exe = pid_path(pid)
-            if isinstance(kernel_exe, str) and kernel_exe.startswith("/") and kernel_exe != "/":
-                exe = kernel_exe
+            escaped = ps_display_escaped(exe)
+            if not exe.startswith("/") or exe == "/" or escaped:
+                kernel_exe = pid_path(pid)
+                if isinstance(kernel_exe, str) and kernel_exe.startswith("/") and kernel_exe != "/":
+                    exe = kernel_exe
+                elif escaped:
+                    raise CollectionError("ps-parse")
             if exe == "/":
                 raise CollectionError("ps-parse")
             procs[pid] = (ppid, parts[2], exe)
@@ -868,7 +882,7 @@ class Watch:
             for pid, cmd, addr, host, port in records:
                 p = procs.get(pid)
                 exe = p[2] if p else pid_path(pid)
-                if not exe or not exe.startswith("/"):
+                if not exe or not exe.startswith("/") or exe == "/":
                     code, comm, err = command_result(["ps", "-o", "comm=", "-p", str(pid)], 20)
                     rows = comm.split("\n")
                     if rows and rows[-1] == "":
@@ -876,7 +890,9 @@ class Watch:
                     if code != 0 or err or len(rows) != 1 or not rows[0].strip(ASCII_WS):
                         raise CollectionError("lsof-parse")
                     exe = rows[0].strip(ASCII_WS)
-                if (not exe.startswith("/") or exe == "<defunct>"
+                    if ps_display_escaped(exe):
+                        raise CollectionError("lsof-parse")
+                if (not exe.startswith("/") or exe == "/" or exe == "<defunct>"
                         or (exe.startswith("(") and exe.endswith(")"))):
                     raise CollectionError("lsof-parse")
                 key = f"{exe} {addr}"
@@ -1222,16 +1238,17 @@ class Watch:
                         if path not in old:
                             events.append(("STARTUP+", f"added: {path} | copy: {copy}"))
                         elif not proposed[path].startswith("unreadable: "):
-                            with lock:
-                                readable = self.db.execute(
-                                    "SELECT hash,copy_path FROM startup_versions WHERE path=? "
-                                    "AND hash NOT LIKE 'unreadable: %' ORDER BY id DESC LIMIT 1",
-                                    (path,)).fetchone()
-                            if readable is None and not old[path].startswith("unreadable: "):
+                            if old[path].startswith("unreadable: "):
+                                with lock:
+                                    readable = self.db.execute(
+                                        "SELECT hash,copy_path FROM startup_versions WHERE path=? "
+                                        "AND hash NOT LIKE 'unreadable: %' AND copy_path IS NOT NULL "
+                                        "ORDER BY id DESC LIMIT 1", (path,)).fetchone()
+                            else:
                                 readable = (old[path], os.path.join(
                                     self.snap_dir, self.safe_name(path), old[path][:16]))
-                            if readable is not None and readable[0] != proposed[path]:
-                                before = readable[1]
+                            if readable is None or readable[0] != proposed[path]:
+                                before = readable[1] if readable is not None else None
                                 events.append(("STARTUP~", f"changed: {path} | before: {before} | after: {copy}\n"
                                                + self.diff(before, copy)))
             if "startup" in eligible and baselines["startup"]:
@@ -1401,8 +1418,6 @@ class Watch:
             if observed and is_tattletale(rows[0]):
                 raise SystemExit(f"tattletale: already running as pid {other} for this database "
                                  f"({path}); stop it first: kill {other}")
-        if invalid:
-            self.log("NOTE", "pid file contained invalid stale content; replacing")
         fd, pending = tempfile.mkstemp(prefix=".tattletale-pid.", dir=self.data_dir)
         try:
             with os.fdopen(fd, "w", encoding="ascii") as f:
@@ -1414,6 +1429,8 @@ class Watch:
             if os.path.exists(pending):
                 os.unlink(pending)
         self.pid_file = path
+        if invalid:
+            self.log("NOTE", "pid file contained invalid stale content; replacing")
 
     def release_pid_file(self):
         path = getattr(self, "pid_file", None)

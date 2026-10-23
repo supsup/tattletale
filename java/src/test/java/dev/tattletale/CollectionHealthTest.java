@@ -101,7 +101,7 @@ public final class CollectionHealthTest {
             test("command-policy-"+commands.size(),()->check(actual.equals(c.get("expected")),"command policy "+actual));
             commands.add(Map.of("tool",tool,"code",r.code(),"out",r.out(),"err",r.err(),"actual",actual));
         }
-        parity.put("fixtureVersion",2);parity.put("scopes",scopes);parity.put("commands",commands);
+        parity.put("fixtureVersion",3);parity.put("scopes",scopes);parity.put("commands",commands);
         test("initial-epoch-health",()->{try(Fixture f=new Fixture()) {for(String k:CollectionHealth.KEYS) {status(f.w,k,"unknown");check(health(f.w,k).get("lastAttempt")==null,"initial attempt");}}});
         test("listener-failure-partial-recovery",()->{try(Fixture f=new Fixture()) {
             f.seed();f.fake.lsof=new Proc.Result(0,"p42\ncfixture\nn127.0.0.1:12345\n","");f.w.checkListeners();status(f.w,"listeners","ok");
@@ -183,7 +183,9 @@ public final class CollectionHealthTest {
         }});
         RepairHealthTest.run();
         RoundThreeTest.run();
+        RoundFourTest.run();
         RepairParityTest.run(shared);
+        Review44ParityTest.run(shared);
         if(parityPath!=null) Files.writeString(parityPath,Json.write(parity)+"\n");
         StringBuilder x=new StringBuilder("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuite name=\"CollectionHealthTest\" timestamp=\"").append(Instant.now()).append("\" tests=\"").append(results.size()).append("\" failures=\"").append(results.stream().filter(r->r.get("status").equals("failure")).count()).append("\" errors=\"").append(results.stream().filter(r->r.get("status").equals("error")).count()).append("\" skipped=\"0\">\n");
         for(Map<String,Object> r:results) {x.append("<testcase classname=\"dev.tattletale.CollectionHealthTest\" name=\"").append(escape(r.get("name"))).append("\" timestamp=\"").append(r.get("timestamp")).append("\" time=\"").append(r.get("seconds")).append("\">");if(!r.get("status").equals("pass"))x.append('<').append(r.get("status")).append('>').append(escape(r.get("detail"))).append("</").append(r.get("status")).append('>');x.append("</testcase>\n");}x.append("</testsuite>\n");Files.writeString(xml,x);

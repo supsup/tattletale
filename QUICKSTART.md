@@ -82,7 +82,9 @@ entry markers allow readable peers to be observed, but keep startup health degra
 Known nonregular entries and regular files over 16 MiB are marked rather than read as
 content; accepted files are hashed completely and saved copies keep at most 4 MiB.
 Becoming unreadable and readable again is not a content change by itself; a new readable
-version is compared with the last readable copy. Crontab must decode as UTF-8; another
+version is compared with the last readable copy. If an item has never been readable, its
+first readable content emits one `STARTUP~` with `before: None` and its saved after-copy.
+Repeating that same readable content adds no change. Crontab must decode as UTF-8; another
 encoding degrades that partition and retains its last-known values.
 The four health checks follow the existing polling schedule; no automatic retry is added.
 They do not cover every watcher component. More detail, including startup/crontab rejection

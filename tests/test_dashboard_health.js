@@ -423,3 +423,27 @@ test("late render failure and failed refresh preserve the exact prior publicatio
   p.load(); p.head.children.at(-1).onerror(); p.tickInterval();
   assert.match(p.text("collection-health"), /Database publication: degraded/);
 });
+
+for (const legacy of [false, true]) test((legacy ? "legacy" : "format-2") + " first readable content is one safe-rendered STARTUP~ observation", () => {
+  const p = page(), d = data();
+  if (legacy) { delete d.formatVersion; delete d.collectionHealth; }
+  const item = "/fixture/<img src=x onerror=fixture>.plist";
+  const after = "/fixture/copies/fixture_entry/06f961b802bc46ee";
+  d.map.startup[item] = "06f961b802bc46ee168555f066d28f4f0e9afdf3f88174c1ee6f9de004fc30a0";
+  d.log = [clock + "  STARTUP~  changed: " + item + " | before: None | after: " + after];
+  p.render(d);
+  assert.match(p.text("startup"), /1 change/);
+  assert.match(p.text("att-list"), /Startup item changes1/);
+  assert.match(p.text("feed"), /STARTUP~/);
+  assert.ok(p.text("feed").includes("before: None | after: " + after));
+  assert.ok(p.text("feed").includes(item));
+  for (const id of ["startup", "att-list", "feed"]) {
+    assert.equal(p.ids.get(id).querySelectorAll("img").length, 0);
+    assert.equal(p.ids.get(id).querySelectorAll("script").length, 0);
+  }
+  if (legacy) assert.match(p.text("collection-health"), /Startup items: unknown/);
+  // Re-rendering the same accepted event history must not duplicate the observation.
+  p.render(d);
+  assert.equal((p.text("feed").match(/STARTUP~/g) || []).length, 1);
+  assert.match(p.text("startup"), /1 change/);
+});

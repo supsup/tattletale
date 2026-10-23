@@ -40,8 +40,11 @@ when absent together; malformed present fields are shown as incomplete.
 Final startup directories/nonregular entries/loops and regular files over 16 MiB have
 explicit unreadable markers. Accepted regular files are fully hashed through 16 MiB;
 saved copies remain capped at 4 MiB. Readability flaps alone are not content changes;
-recovery to changed bytes compares with the last readable copy. Strict UTF-8 crontab output
-is deliberate: undecodable bytes degrade that partition with `collection-parse` and retain
+recovery to changed bytes compares with the last readable copy. An item without any retained
+readable copy emits one `STARTUP~` when first readable, with `before: None` and its actual
+after-copy. Confirmed target-ancestor loops are marked; `ENOTDIR` rejects the partition,
+and only positively established `ENOENT` permits optional absence or a dangling-link marker.
+Strict UTF-8 crontab output is deliberate: undecodable bytes degrade that partition with `collection-parse` and retain
 its prior inventory. Sound connections recover after proven automatic SQLite rollback;
 unknown disposition remains fatal.
 
@@ -65,8 +68,9 @@ synthetic fixtures rather than live collectors or host inventory.
   `java -jar`).
 - If `$GRAALVM_HOME/bin/native-image` exists, it builds `java/build/tattletale`, a native binary
   of about 20 MB. Its reachability metadata ships in the jar under
-  `META-INF/native-image/dev.tattletale/tattletale/`: one foreign downcall
-  (`proc_pidpath`). Nothing reflective is needed.
+  `META-INF/native-image/dev.tattletale/tattletale/`, including the foreign downcalls used
+  for process identity and bounded startup-file reads. Nothing reflective is needed.
+  The jar fixture gate does not establish native-image or Intel hardware behavior.
 
 javac prints three warnings that cannot be suppressed: `sun.misc.Signal` "is internal
 proprietary API". It is the JDK's own `jdk.unsupported` module and the only way to handle
@@ -112,11 +116,11 @@ parent if it is `java/`, else the working directory as is.
   sometimes with different text: `WITH q AS (SELECT 1) DELETE FROM events` says "attempt to
   write a readonly database" where Python says "not authorized". Rows are byte-identical to
   Python's for text, integers, NULL and floats. BLOBs print raw, not as Python's `b'...'`.
-- **Executable paths** come from libproc's `proc_pidpath`, the call Python makes through ctypes,
-  made here through the JDK's Foreign Function API. `ProcessHandle.info().command()` is only a
-  fallback: on macOS it returns nothing for root processes and keeps doubled slashes
-  (`.../Support//cloudphotod`), so programs would be keyed differently from the Python version
-  that shares the database.
+- **Executable paths** preserve a stable absolute, escape-free `ps comm` path. Relative or
+  display-escaped names use libproc's `proc_pidpath` through the JDK Foreign Function API,
+  with `ProcessHandle.info().command()` only a bridge fallback. An escaped display value
+  without a valid raw path is rejected. This avoids replacing a stable program key with a
+  versioned or per-launch clone path. See the shared [identity policy](../docs/DATA_FORMAT.md#accepted-observations).
 - **Startup diffs** use a port of Python's `difflib.unified_diff` (context 1, `before`/`after`),
   not `/usr/bin/diff -u`, so the STARTUP~ text is the same. Checked against Python's difflib on
   400 random cases.
@@ -128,7 +132,9 @@ parent if it is `java/`, else the working directory as is.
   refused every `TATTLETALE_*` line in `tattletale.env`; fixed in 0.0.2).
 - **Pid file**: both versions treat a pid as a live tattletale when its command line has
   `tattletale.py`, `tattletale.jar`, `dev.tattletale.Main`, `java/build/tattletale`, or a first
-  word named `tattletale`, so neither takes over a database the other is watching.
+  word named `tattletale`, so neither takes over a database the other is watching. Invalid
+  UTF-8 regular-file bytes are stale; unknown identity still refuses takeover. The stale-file
+  replacement note follows successful atomic replacement, never a failed write.
 - **Small things**: the usage line says `tattletale`, not `tattletale.py`. `~user` in a path is
   expanded only for the current user. Map-import JSON errors are worded by this reader, not by
   Python's `json` module.

@@ -46,6 +46,7 @@ final class Watch {
     Projection projection=this::pageMap;
     interface PageReplace {void move(Path from,Path to)throws IOException;}
     PageReplace pageReplace=(from,to)->Files.move(from,to,StandardCopyOption.REPLACE_EXISTING,StandardCopyOption.ATOMIC_MOVE);
+    PageReplace pidReplace=(from,to)->Files.move(from,to,StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING);
     java.util.function.Supplier<String> clock = Watch::now;
     interface Sources {
         Proc.Result run(List<String> command, long timeout) throws IOException, Proc.Timeout;
@@ -61,9 +62,14 @@ final class Watch {
         }
         default boolean optionalMissing(String name) {
             Path path=Path.of(name).toAbsolutePath();
-            // A broken link, including an ancestor link, is failed observation, not absence.
-            for(Path p=path;p!=null;p=p.getParent()) if(Files.isSymbolicLink(p) && !Files.exists(p)) return false;
-            return !Files.exists(path,java.nio.file.LinkOption.NOFOLLOW_LINKS);
+            // NIO NoSuchFile can mean ENOTDIR on Darwin. Only stable native ENOENT is optional.
+            try {
+                List<StartupEntry.Observed> links=StartupEntry.REAL.ancestorLinks(path);
+                try{StartupEntry.REAL.metadata(path);return false;}catch(java.nio.file.NoSuchFileException absent){
+                    StartupEntry.stable(StartupEntry.REAL,links);
+                    try{StartupEntry.REAL.metadata(path);return false;}catch(java.nio.file.NoSuchFileException stillAbsent){return true;}
+                }
+            }catch(IOException unknown){return false;}
         }
         default String copyRoot(String actual) { return actual; }
         default void copy(String destination, byte[] value) throws IOException {
@@ -361,7 +367,7 @@ final class Watch {
         baseline.put("listeners", listeners.isEmpty());
         baseline.put("startup", startup.keySet().stream().noneMatch(p->!p.equals("crontab -l")));
         baseline.put("crontab", !startup.containsKey("crontab -l"));
-        cachedInventory=null;inventoryAsOf=null;
+        synchronized(LOCK){cachedInventory=null;inventoryAsOf=null;}
         try {synchronized(LOCK){cacheInventory(projection.read(),clock.get());}}
         catch(DbException seedFailure) {db.proveRecoveredIdle(seedFailure); /* valid load, no partial projection */ }
     }
@@ -482,6 +488,10 @@ final class Watch {
         return value; // the projection contains only immutable scalar values
     }
     void cacheInventory(Map<String,Object> complete,String time) {cachedInventory=detached(complete);inventoryAsOf=time;}
+    record InventorySnapshot(Map<String,Object> map,String asOf) {}
+    InventorySnapshot inventorySnapshot() {
+        synchronized(LOCK) {return new InventorySnapshot(cachedInventory==null?null:detached(cachedInventory),inventoryAsOf);}
+    }
     void save() throws DbException, IOException {
         publicationHealth.attempt(clock.get());
         try {
@@ -497,12 +507,14 @@ final class Watch {
         } catch(DbException original) {
             db.proveRecoveredIdle(original);
             publicationHealth.fail("collection-db");
-            if(cachedInventory!=null)try {writePageData(dataDir,detached(cachedInventory),publicationHealth.snapshot(),inventoryAsOf);}
+            InventorySnapshot held=inventorySnapshot();
+            if(held.map()!=null)try {writePageData(dataDir,held.map(),publicationHealth.snapshot(),held.asOf());}
             catch(IOException writeFailure) {publicationHealth.fail("collection-io");original.addSuppressed(writeFailure);}
             throw original;
         }
         Map<String,Object> tentative=publicationHealth.success(clock.get());
-        try {writePageData(dataDir,detached(cachedInventory),tentative,inventoryAsOf);}
+        InventorySnapshot held=inventorySnapshot();
+        try {writePageData(dataDir,held.map(),tentative,held.asOf());}
         catch(IOException e){publicationHealth.fail("collection-io");throw e;}
         publicationHealth.adopt(tentative);
     }
@@ -687,6 +699,9 @@ final class Watch {
         return n;
     }
     static boolean absoluteExe(String value) { return value.startsWith("/") && value.length()>1; }
+    // C-locale ps uses vis-style escapes. A real name with the same spelling is ambiguous too.
+    static final Pattern PS_DISPLAY_ESCAPE=Pattern.compile("\\\\[0-7]{3}|M-[!-~]|\\^[@-_?]");
+    static boolean escapedExe(String value) {return PS_DISPLAY_ESCAPE.matcher(value).find();}
 
     Map<Long, P> processes() throws IOException, Proc.Timeout {
         Proc.Result comm = sources.run(List.of("ps","-axo","pid=,ppid=,user=,comm="),20);
@@ -717,8 +732,11 @@ final class Watch {
         Map<Long,P> procs=new LinkedHashMap<>();
         for(Map.Entry<Long,P> e:primary.entrySet()) {
             long pid=e.getKey(); P p=e.getValue(); String exe=p.exe();
-            String pp=sources.pidPath(pid);
-            if(pp!=null && absoluteExe(pp)) exe=pp;
+            if(!absoluteExe(exe) || escapedExe(exe)) {
+                String pp=sources.pidPath(pid);
+                if(pp!=null && absoluteExe(pp)) exe=pp;
+                else if(escapedExe(exe))throw new CollectionHealth.Rejected("ps-parse");
+            }
             if(exe.equals("/"))throw new CollectionHealth.Rejected("ps-parse");
             // The two commands race normally: a missing argv row is not a missing process.
             procs.put(pid,new P(p.ppid(),p.user(),exe,args.getOrDefault(pid,"")));
@@ -975,7 +993,7 @@ final class Watch {
                 if(lookup.code()!=0 || !lookup.err().isEmpty() || lines.size()!=1)
                     throw new CollectionHealth.Rejected("lsof-parse");
                 exe=asciiStrip(lines.getFirst());
-                if(!absoluteExe(exe)) throw new CollectionHealth.Rejected("lsof-parse");
+                if(!absoluteExe(exe) || escapedExe(exe)) throw new CollectionHealth.Rejected("lsof-parse");
                 // comm= is the full executable path on macOS, including spaces. Never split it.
 
             }
@@ -1147,7 +1165,7 @@ final class Watch {
                                 List<Map<String,Object>> history=db.query(Db.bind("SELECT hash,copy_path FROM startup_versions WHERE path=? AND copy_path IS NOT NULL AND hash NOT LIKE 'unreadable: %' ORDER BY id DESC LIMIT 1;",file));
                                 beforeHash=history.isEmpty()?null:Db.asStr(history.getFirst().get("hash"));before=history.isEmpty()?null:Db.asStr(history.getFirst().get("copy_path"));
                             }
-                            if(beforeHash!=null && !beforeHash.equals(digest))events.add(new PendingEvent("STARTUP~","changed: "+file+" | before: "+before+" | after: "+dest+"\n"+diff(before,dest,40)));
+                            if(beforeHash==null || !beforeHash.equals(digest))events.add(new PendingEvent("STARTUP~","changed: "+file+" | before: "+(before==null?"None":before)+" | after: "+dest+"\n"+diff(before,dest,40)));
                         }
                     }
                 }
@@ -1300,7 +1318,10 @@ final class Watch {
         try {
             if(!Files.readAttributes(Path.of(path),java.nio.file.attribute.BasicFileAttributes.class,java.nio.file.LinkOption.NOFOLLOW_LINKS).isRegularFile())
                 throw new Exit("tattletale: existing pid identity is unknown");
-            String value=asciiStrip(Files.readString(Path.of(path)));
+            // Non-UTF8 bytes are invalid stale content, never a partially parsed PID.
+            String value;
+            try {value=asciiStrip(Files.readString(Path.of(path)));}
+            catch(java.nio.charset.CharacterCodingException invalid){value="";}
             try {other=pidValue(value,false,"pid-identity");}
             catch(CollectionHealth.Rejected e) {stale=true;}
         } catch(java.nio.file.NoSuchFileException e) {
@@ -1320,7 +1341,7 @@ final class Watch {
             try(java.nio.channels.FileChannel file=java.nio.channels.FileChannel.open(tmp,StandardOpenOption.WRITE)) {
                 java.nio.ByteBuffer data=StandardCharsets.UTF_8.encode(me+"\n");while(data.hasRemaining())file.write(data);file.force(true);
             }
-            Files.move(tmp,destination,StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING);
+            pidReplace.move(tmp,destination);
         } catch(IOException e) {try{Files.deleteIfExists(tmp);}catch(IOException cleanup){e.addSuppressed(cleanup);}throw e;}
         pidFile=path;
         if(stale)log("NOTE","pid file contained invalid stale content; replacing");

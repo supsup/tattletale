@@ -2,6 +2,7 @@
 import contextlib
 import copy
 import ctypes
+import errno
 import importlib.util
 import io
 import json
@@ -1227,6 +1228,275 @@ class CollectionHealthTests(unittest.TestCase):
         self.assertEqual(path.read_text(), '43\n'); self.assertEqual(len(owned), 1)
         with self.assertRaises(OSError): os.fstat(owned[0])
 
+    def test_r4_stable_absolute_comm_preserves_identity_without_bridge(self):
+        with self.commands(self.ps_responses()), mock.patch.object(
+                TT, 'pid_path', return_value='/fixture/versioned-clone') as bridge:
+            self.assertTrue(self.w.check_processes())
+        self.assertEqual(self.w.known_progs, {'/fixture/service'})
+        bridge.assert_not_called()
+
+    def test_r4_literal_nonvis_caret_remains_stable_absolute(self):
+        responses = self.ps_responses(); responses[PS_COMM] = (0, '42 1 fixture /fixture/app^2\n', '')
+        with self.commands(responses), mock.patch.object(TT, 'pid_path', return_value='/fixture/clone') as bridge:
+            self.assertEqual(TT.Watch.processes()[42][2], '/fixture/app^2')
+        bridge.assert_not_called()
+
+    def test_r4_literal_nonvis_meta_prefix_and_backslash_remain_stable(self):
+        for display in ['/fixture/literalM-', '/fixture/literal\\q']:
+            responses = self.ps_responses(); responses[PS_COMM] = (0, '42 1 fixture ' + display + '\n', '')
+            with self.commands(responses), mock.patch.object(TT, 'pid_path', return_value='/fixture/clone') as bridge:
+                self.assertEqual(TT.Watch.processes()[42][2], display)
+            bridge.assert_not_called()
+
+    def test_r4_relative_and_display_escaped_comm_use_valid_bridge(self):
+        displays = ['service', '/fixture/M-CM-)xecutable', '/fixture/with\\040space', '/fixture/control^G']
+        for display in displays:
+            with self.subTest(display=display):
+                responses = self.ps_responses(); responses[PS_COMM] = (0, '42 1 fixture ' + display + '\n', '')
+                with self.commands(responses), mock.patch.object(TT, 'pid_path', return_value='/fixture/stable') as bridge:
+                    sample = TT.Watch.processes()
+                self.assertEqual(sample[42][2], '/fixture/stable'); bridge.assert_called_once_with(42)
+
+    def test_r4_raw_kernel_path_is_not_reparsed_as_ps_display(self):
+        kernel = '/fixture/literalM-x^G\\040'; responses = self.ps_responses()
+        responses[PS_COMM] = (0, '42 1 fixture service\n', '')
+        with self.commands(responses), mock.patch.object(TT, 'pid_path', return_value=kernel):
+            self.assertEqual(TT.Watch.processes()[42][2], kernel)
+        with self.commands({LSOF: (0, LISTENER, '')}), mock.patch.object(
+                self.w, 'processes', return_value={}), mock.patch.object(TT, 'pid_path', return_value=kernel):
+            self.assertTrue(self.w.check_listeners())
+        self.assertIn(kernel + ' 127.0.0.1:12345', self.w.listeners)
+
+    def test_r4_escaped_comm_never_becomes_identity_without_valid_bridge(self):
+        before = self.inventory()
+        for display in ['/fixture/M-CM-)xecutable', '/fixture/with\\040space', '/fixture/control^G']:
+            for bridge in [None, '', '/', 'relative']:
+                with self.subTest(display=display, bridge=bridge):
+                    responses = self.ps_responses(); responses[PS_COMM] = (0, '42 1 fixture ' + display + '\n', '')
+                    with self.commands(responses), mock.patch.object(TT, 'pid_path', return_value=bridge):
+                        self.assertFalse(self.w.check_processes())
+                    self.assertEqual(self.inventory(), before)
+        self.assertEqual(self.w.collection_health['processes']['error'], 'ps-parse')
+
+    def test_r4_plain_relative_without_bridge_retains_admitted_semantics(self):
+        responses = self.ps_responses(); responses[PS_COMM] = (0, '42 1 fixture service\n', '')
+        for bridge in [None, '', '/', 'relative']:
+            with self.subTest(bridge=bridge), self.commands(responses), mock.patch.object(TT, 'pid_path', return_value=bridge):
+                self.assertEqual(TT.Watch.processes()[42][2], 'service')
+
+    def test_r4_raw_slash_can_use_valid_bridge_but_effective_slash_rejects(self):
+        responses = self.ps_responses(); responses[PS_COMM] = (0, '42 1 fixture /\n', '')
+        with self.commands(responses), mock.patch.object(TT, 'pid_path', return_value='/fixture/service'):
+            self.assertEqual(TT.Watch.processes()[42][2], '/fixture/service')
+        before = self.inventory()
+        for bridge in [None, '/', 'relative']:
+            with self.commands(responses), mock.patch.object(TT, 'pid_path', return_value=bridge):
+                self.assertFalse(self.w.check_processes())
+            self.assertEqual(self.inventory(), before)
+
+    def test_r4_listener_slash_comm_is_rejected_with_inventory_retained(self):
+        self.seed_listener(); before = self.inventory()
+        responses = {LSOF: (0, LISTENER, ''), ('ps', '-o', 'comm=', '-p', '42'): (0, '/\n', '')}
+        with self.commands(responses), mock.patch.object(self.w, 'processes', return_value={}):
+            self.assertFalse(self.w.check_listeners())
+        self.assertEqual(self.inventory(), before)
+        self.assertEqual(self.w.collection_health['listeners']['error'], 'lsof-parse')
+
+    def test_r4_listener_valid_comm_and_bridge_still_work(self):
+        responses = {LSOF: (0, LISTENER, ''), ('ps', '-o', 'comm=', '-p', '42'): (0, '/fixture/service\n', '')}
+        with self.commands(responses), mock.patch.object(self.w, 'processes', return_value={}):
+            self.assertTrue(self.w.check_listeners())
+        self.assertIn(KEY, self.w.listeners)
+        with self.commands({LSOF: (0, LISTENER, '')}), mock.patch.object(
+                self.w, 'processes', return_value={}), mock.patch.object(TT, 'pid_path', return_value='/fixture/bridge'):
+            self.assertTrue(self.w.check_listeners())
+        self.assertIn('/fixture/bridge 127.0.0.1:12345', self.w.listeners)
+
+    def test_r4_listener_invalid_root_bridge_uses_valid_comm(self):
+        responses = {LSOF: (0, LISTENER, ''), ('ps', '-o', 'comm=', '-p', '42'): (0, '/fixture/service\n', '')}
+        with self.commands(responses) as commands, mock.patch.object(
+                self.w, 'processes', return_value={}), mock.patch.object(TT, 'pid_path', return_value='/'):
+            self.assertTrue(self.w.check_listeners())
+        self.assertIn(KEY, self.w.listeners); self.assertNotIn('/ 127.0.0.1:12345', self.w.listeners)
+        self.assertEqual([tuple(c.args[0]) for c in commands.call_args_list], [LSOF, ('ps', '-o', 'comm=', '-p', '42')])
+
+    def test_r4_listener_escaped_comm_without_bridge_rejects(self):
+        self.seed_listener(); before = self.inventory()
+        for display in ['/fixture/M-CM-)xecutable', '/fixture/with\\040space', '/fixture/control^G']:
+            responses = {LSOF: (0, LISTENER, ''), ('ps', '-o', 'comm=', '-p', '42'): (0, display + '\n', '')}
+            with self.commands(responses), mock.patch.object(self.w, 'processes', return_value={}):
+                self.assertFalse(self.w.check_listeners())
+            self.assertEqual(self.inventory(), before)
+
+    def test_r4_real_looping_target_ancestor_retains_readable_peer(self):
+        directory = self.root / 'launch'; directory.mkdir()
+        peer = directory / 'peer'; peer.write_bytes(b'public peer')
+        cycle = self.root / 'cycle'; cycle.symlink_to('cycle')
+        link = directory / 'link'; link.symlink_to('../cycle/item')
+        with mock.patch.object(TT, 'STARTUP_DIRS', [str(directory)]), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+            self.assertFalse(self.w.check_startup())
+        self.assertEqual(self.w.startup[str(link)], 'unreadable: symlink-loop')
+        self.assertEqual(self.w.startup[str(peer)], TT.hashlib.sha256(b'public peer').hexdigest())
+        self.assertEqual(self.w.collection_health['startup']['error'], 'startup-unreadable')
+        self.assertEqual(self.w.collection_health['crontab']['status'], 'ok')
+
+    def test_r4_real_enotdir_link_rejects_partition(self):
+        regular = self.root / 'regular'; regular.write_bytes(b'public regular')
+        link = self.root / 'link'; link.symlink_to('regular/child')
+        self.seed_startup(); old = dict(self.w.startup)
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(link)]), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+            self.assertFalse(self.w.check_startup())
+        self.assertEqual(self.w.startup, old)
+        self.assertEqual(self.w.collection_health['startup']['error'], 'startup-read')
+        self.assertEqual(self.w.collection_health['crontab']['status'], 'ok')
+
+    def test_r4_real_enotdir_optional_extra_rejects_partition(self):
+        regular = self.root / 'regular'; regular.write_bytes(b'public regular')
+        self.w.extra_startup = [str(regular / 'child')]
+        self.seed_startup(); old = dict(self.w.startup)
+        with self.commands({CRON: (1, '', 'no crontab for fixture\n')}): self.assertFalse(self.w.check_startup())
+        self.assertEqual(self.w.startup, old)
+        self.assertEqual(self.w.collection_health['startup']['error'], 'startup-read')
+        self.assertEqual(self.w.collection_health['crontab']['status'], 'ok')
+
+    def test_r4_configured_directory_enotdir_retains_fs_while_cron_adopts(self):
+        regular = self.root / 'regular'; regular.write_bytes(b'public regular')
+        self.seed_startup(); old_fs = {path: value for path, value in self.w.startup.items() if path != 'crontab -l'}
+        cron = 'fixture independent cron\n'
+        with mock.patch.object(TT, 'STARTUP_DIRS', [str(regular / 'child')]), self.commands({CRON: (0, cron, '')}):
+            self.assertFalse(self.w.check_startup())
+        self.assertEqual({path: value for path, value in self.w.startup.items() if path != 'crontab -l'}, old_fs)
+        self.assertEqual(self.w.startup['crontab -l'], TT.hashlib.sha256(cron.encode()).hexdigest())
+        self.assertEqual(self.w.crontab_text, cron)
+        self.assertEqual(self.w.collection_health['startup']['error'], 'startup-read')
+        self.assertEqual(self.w.collection_health['crontab']['status'], 'ok')
+
+    def test_r4_true_missing_configured_directory_is_optional(self):
+        with mock.patch.object(TT, 'STARTUP_DIRS', [str(self.root / 'missing/child')]), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+            self.assertTrue(self.w.check_startup())
+        self.assertEqual(self.w.startup, {'crontab -l': 'none'})
+        self.assertEqual(self.w.collection_health['startup']['status'], 'ok')
+
+    def test_r4_real_configured_readable_directory_adopts_child(self):
+        directory = self.root / 'readable-directory'; directory.mkdir()
+        child = directory / 'child'; child.write_bytes(b'A\n')
+        with mock.patch.object(TT, 'STARTUP_DIRS', [str(directory)]), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+            self.assertTrue(self.w.check_startup())
+        self.assertEqual(self.w.startup[str(child)], TT.hashlib.sha256(b'A\n').hexdigest())
+        self.assertEqual(self.w.collection_health['startup']['status'], 'ok')
+
+    def test_r4_real_missing_optional_and_dangling_are_distinct(self):
+        link = self.root / 'link'; link.symlink_to('missing/child')
+        self.w.extra_startup = [str(self.root / 'optional/child')]
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(link)]), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+            self.assertFalse(self.w.check_startup())
+        self.assertEqual(self.w.startup, {str(link): 'unreadable: dangling-link', 'crontab -l': 'none'})
+        self.assertEqual(self.w.collection_health['startup']['error'], 'startup-unreadable')
+        self.w.extra_startup = [str(self.root / 'optional/child')]
+        with self.commands({CRON: (1, '', 'no crontab for fixture\n')}): self.assertTrue(self.w.check_startup())
+        self.assertEqual(self.w.startup, {'crontab -l': 'none'})
+
+    def test_r4_listed_child_lstat_eacces_rejects_partition(self):
+        directory = self.root / 'listed'; directory.mkdir()
+        source = directory / 'child'; source.write_bytes(b'public child')
+        self.seed_startup(); old = dict(self.w.startup); original = TT.os.lstat
+        def denied(path, *args, **kwargs):
+            if str(path) == str(source): raise PermissionError(errno.EACCES, 'synthetic listed-child metadata denial')
+            return original(path, *args, **kwargs)
+        with mock.patch.object(TT, 'STARTUP_DIRS', [str(directory)]), mock.patch.object(TT.os, 'lstat', side_effect=denied), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+            self.assertFalse(self.w.check_startup())
+        self.assertEqual(self.w.startup, old)
+        self.assertEqual(self.w.collection_health['startup']['error'], 'startup-read')
+        self.assertEqual(self.w.collection_health['crontab']['status'], 'ok')
+
+    def _r4_first_readable_content(self, newly_added):
+        source = self.root / 'first-readable'; source.write_bytes(b'first public content\n')
+        original = TT.os.open
+        def denied(path, *args, **kwargs):
+            if str(path) == str(source): raise PermissionError(errno.EACCES, 'synthetic known-file unreadability')
+            return original(path, *args, **kwargs)
+        cron = {CRON: (1, '', 'no crontab for fixture\n')}
+        if newly_added:
+            with self.commands(cron): self.assertTrue(self.w.check_startup())
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(source)]), self.commands(cron):
+            with mock.patch.object(TT.os, 'open', side_effect=denied):
+                self.assertFalse(self.w.check_startup()); self.assertFalse(self.w.check_startup())
+            self.assertEqual(self.w.db.execute("SELECT count(*) FROM events WHERE kind='STARTUP~'").fetchone()[0], 0)
+            self.assertTrue(self.w.check_startup())
+            rows = self.w.db.execute("SELECT message FROM events WHERE kind='STARTUP~' ORDER BY id").fetchall()
+            self.assertEqual(len(rows), 1)
+            after = self.w.db.execute('SELECT copy_path FROM startup_versions WHERE path=? AND copy_path IS NOT NULL', (str(source),)).fetchone()[0]
+            self.assertIn('before: None | after: ' + after, rows[0][0])
+            self.assertEqual(pathlib.Path(after).read_bytes(), b'first public content\n')
+            self.assertTrue(self.w.check_startup())
+            self.assertEqual(self.w.db.execute("SELECT count(*) FROM events WHERE kind='STARTUP~'").fetchone()[0], 1)
+            source.write_bytes(b'second public content\n'); self.assertTrue(self.w.check_startup())
+            rows = self.w.db.execute("SELECT message FROM events WHERE kind='STARTUP~' ORDER BY id").fetchall()
+            self.assertEqual(len(rows), 2); self.assertIn('before: ' + after, rows[1][0])
+            self.assertIn('-first public content', rows[1][0]); self.assertIn('+second public content', rows[1][0])
+        plus = self.w.db.execute("SELECT message FROM events WHERE kind='STARTUP+'").fetchall()
+        self.assertEqual(len(plus), 1 if newly_added else 0)
+        if plus: self.assertIn('copy: None', plus[0][0])
+
+    def test_r4_baseline_unreadable_first_content_is_delivered_once(self):
+        self._r4_first_readable_content(False)
+
+    def test_r4_added_unreadable_first_content_is_delivered_once(self):
+        self._r4_first_readable_content(True)
+
+    def test_r4_recovery_ignores_null_copy_history_and_diffs_retained_content(self):
+        source = self.root / 'history'; source.write_bytes(b'alpha\n'); original = TT.os.open
+        def denied(path, *args, **kwargs):
+            if str(path) == str(source): raise PermissionError(errno.EACCES, 'synthetic known-file unreadability')
+            return original(path, *args, **kwargs)
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(source)]), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+            self.assertTrue(self.w.check_startup())
+            first = self.w.db.execute('SELECT copy_path FROM startup_versions WHERE path=?', (str(source),)).fetchone()[0]
+            self.w.db.execute('INSERT INTO startup_versions(path,hash,copy_path,seen_at) VALUES(?,?,?,?)', (str(source), 'f' * 64, None, T0))
+            with mock.patch.object(TT.os, 'open', side_effect=denied): self.assertFalse(self.w.check_startup())
+            queries = []; self.w.db.set_trace_callback(queries.append)
+            self.addCleanup(self.w.db.set_trace_callback, None)
+            source.write_bytes(b'beta\n'); self.assertTrue(self.w.check_startup())
+        rows = self.w.db.execute("SELECT message FROM events WHERE kind='STARTUP~'").fetchall()
+        self.assertEqual(len(rows), 1); self.assertIn('before: ' + first, rows[0][0])
+        self.assertIn('-alpha', rows[0][0]); self.assertIn('+beta', rows[0][0])
+        history = [query for query in queries if query.startswith('SELECT hash,copy_path FROM startup_versions')]
+        self.assertEqual(len(history), 1); self.assertIn('copy_path IS NOT NULL', history[0])
+
+    def test_r4_readable_previous_version_needs_no_history_query(self):
+        source = self.root / 'readable'; source.write_bytes(b'alpha\n')
+        with mock.patch.object(TT, 'STARTUP_FILES', [str(source)]), self.commands({CRON: (1, '', 'no crontab for fixture\n')}):
+            self.assertTrue(self.w.check_startup())
+            queries = []; self.w.db.set_trace_callback(queries.append)
+            self.addCleanup(self.w.db.set_trace_callback, None)
+            source.write_bytes(b'beta\n'); self.assertTrue(self.w.check_startup())
+        self.assertEqual([query for query in queries if query.startswith('SELECT hash,copy_path FROM startup_versions')], [])
+        row = self.w.db.execute("SELECT message FROM events WHERE kind='STARTUP~'").fetchone()[0]
+        self.assertIn('-alpha', row); self.assertIn('+beta', row)
+
+    def test_r4_nonutf8_pid_bytes_are_stale_and_note_after_replace(self):
+        path = self.root / 'tattletale.pid'; original = TT.os.replace
+        notes = []
+        def replace(source, target):
+            self.assertEqual(notes, [])
+            original(source, target)
+        def log(kind, message):
+            self.assertEqual(path.read_bytes(), b'4242\n'); self.assertEqual(self.w.pid_file, str(path))
+            notes.append((kind, message))
+        for value in [b'\xff', b'42\xc3']:
+            path.write_bytes(value); notes.clear()
+            with mock.patch.object(TT.os, 'replace', side_effect=replace), mock.patch.object(TT.os, 'getpid', return_value=4242), mock.patch.object(self.w, 'log', side_effect=log):
+                self.w.claim_pid_file()
+            self.assertEqual(notes, [('NOTE', 'pid file contained invalid stale content; replacing')])
+
+    def test_r4_failed_pid_replace_has_no_note_or_false_pid_file(self):
+        path = self.root / 'tattletale.pid'; path.write_bytes(b'42\xc3')
+        with mock.patch.object(TT.os, 'replace', side_effect=OSError('synthetic replacement failure')), mock.patch.object(self.w, 'log') as logged:
+            with self.assertRaises(OSError): self.w.claim_pid_file()
+        logged.assert_not_called(); self.assertEqual(path.read_bytes(), b'42\xc3')
+        self.assertIsNone(getattr(self.w, 'pid_file', None))
+        self.assertEqual(list(self.root.glob('.tattletale-pid.*')), [])
+
 
 def scope_case(case):
     def test(self):
@@ -1364,7 +1634,8 @@ def parity_snapshots():
                 'scopes': [{'host': c['host'], 'actual': TT.bind_scope(c['host'])} for c in FIXTURE['scopeCases']],
                 'commands': command_results, 'snapshots': snapshots,
                 'startupTransitions': startup_transition_snapshots(),
-                'repairResults': repair_snapshots()}
+                'repairResults': repair_snapshots(),
+                'review44': review44_snapshots()}
     finally:
         case.doCleanups()
 
@@ -1509,7 +1780,7 @@ def logical_startup_source(step):
 
 def repair_snapshots(selected=None):
     """Frozen inputs enter real collection/save/PID methods; capture actual state."""
-    assert FIXTURE['fixtureVersion'] == 2 and len(FIXTURE['repairCases']) == 9
+    assert FIXTURE['fixtureVersion'] == 3 and len(FIXTURE['repairCases']) == 11
     results = []
     specs = FIXTURE['repairCases'] if selected is None else [selected]
     for specification in specs:
@@ -1649,8 +1920,153 @@ def repair_case(specification):
             self.assertEqual(states[0]['baselines'], {}); self.assertTrue(states[0]['dirtyPrograms'])
         elif name == 'pidFraming':
             self.assertEqual([s['classification'] for s in states], ['other'] * 8 + ['watcher','absent','unknown','unknown','other','other'])
+        elif name in ('firstReadableBaseline', 'firstReadableAdded'):
+            first = 2 if name == 'firstReadableBaseline' else 3
+            counts = ([0, 0, 1, 1, 2, 2, 2, 3] if first == 2 else [0, 0, 0, 1, 1, 2, 2, 2, 3])
+            for index, state in enumerate(states):
+                changes = [event for event in state['events'] if event['kind'] == 'STARTUP~']
+                self.assertEqual(len(changes), counts[index])
+                self.assertIn('/fixture/peer', state['map']['startup'])
+                entry = next((entry for entry in specification['steps'][index]['entries'] if entry['path'] == '/fixture/entry'), None)
+                if entry is not None:
+                    unreadable = entry['state'] == 'permission-denied'
+                    self.assertEqual(state['collectionHealth']['startup']['error'], 'startup-unreadable' if unreadable else None)
+                    if not unreadable:
+                        digest = TT.hashlib.sha256(entry['text'].encode()).hexdigest()
+                        self.assertEqual(state['map']['startup']['/fixture/entry'], digest)
+                        copy_path = '/fixture/copies/fixture_entry/' + digest[:16]
+                        self.assertEqual(next(copy['hex'] for copy in state['copies'] if copy['path'] == copy_path), entry['text'].encode().hex())
+            changes = [event for event in states[-1]['events'] if event['kind'] == 'STARTUP~']
+            self.assertIn('before: None | after: /fixture/copies/fixture_entry/', changes[0]['message'])
+            self.assertTrue(changes[0]['message'].endswith('(no text diff: binary or missing copy)'))
+            self.assertIn('-A\n+B', changes[1]['message']); self.assertIn('-B\n+C', changes[2]['message'])
+            self.assertEqual(changes[0]['time'], specification['steps'][first]['at'])
+            additions = [event for event in states[-1]['events'] if event['kind'] == 'STARTUP+']
+            self.assertEqual(len(additions), 0 if first == 2 else 1)
+            if additions: self.assertEqual(additions[0]['message'], 'added: /fixture/entry | copy: None')
+            self.assertEqual(len(states[-1]['startupVersions']), 8)
     return test
 
 
 for _i, _specification in enumerate(FIXTURE.get('repairCases', [])):
     setattr(CollectionHealthTests, 'test_repair_family_%02d' % _i, repair_case(_specification))
+
+
+def review44_observation(family, specification):
+    """Frozen inputs exercise real producers; output contains only observations."""
+    case = CollectionHealthTests('test_failed_empty_lsof_preserves_real_inventory'); case.setUp()
+    try:
+        if family == 'processIdentities':
+            responses = {PS_COMM: (0, '42 1 fixture ' + specification['psComm'] + '\n', ''),
+                         PS_ARGS: (0, '42 /fixture/app --synthetic\n', '')}
+            accepted, exe = False, None
+            with case.commands(responses), mock.patch.object(TT, 'pid_path', return_value=specification['bridge']) as bridge:
+                try: sample = TT.Watch.processes()
+                except TT.CollectionError: pass
+                else: accepted, exe = True, sample[42][2]
+            return dict(name=specification['name'], accepted=accepted, exe=exe,
+                        bridgeCalls=sum(call.args == (42,) for call in bridge.call_args_list))
+        if family == 'entryDispositions':
+            state = specification['state']; path = case.root / 'entry'
+            source_files, source_dirs = [str(path)], []
+            patches = contextlib.ExitStack()
+            try:
+                if state == 'regular': path.write_bytes(b'A\n')
+                elif state == 'optional-missing': pass
+                elif state == 'dangling-link': path.symlink_to('missing')
+                elif state == 'target-directory-loop':
+                    (case.root / 'cycle').symlink_to('cycle'); path.symlink_to('cycle/child')
+                elif state in ('link-enotdir', 'extra-enotdir'):
+                    regular = case.root / 'regular'; regular.write_bytes(b'A\n')
+                    if state == 'link-enotdir': path.symlink_to('regular/x')
+                    else:
+                        path = regular / 'x'; source_files = []; case.w.extra_startup = [str(path)]
+                elif state == 'fifo': os.mkfifo(str(path))
+                elif state == 'socket':
+                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); patches.callback(sock.close)
+                    previous = os.getcwd()
+                    try: os.chdir(str(case.root)); sock.bind('entry')
+                    finally: os.chdir(previous)
+                elif state == 'listed-lstat-eacces':
+                    directory = case.root / 'listed'; directory.mkdir(); path = directory / 'child'; path.write_bytes(b'A\n')
+                    source_files, source_dirs = [], [str(directory)]
+                    original = TT.os.lstat
+                    def deny(name, *args, **kwargs):
+                        if str(name) == str(path): raise PermissionError(errno.EACCES, 'synthetic listed-child metadata denial')
+                        return original(name, *args, **kwargs)
+                    patches.enter_context(mock.patch.object(TT.os, 'lstat', side_effect=deny))
+                else: raise AssertionError('unknown frozen filesystem input: ' + state)
+                patches.enter_context(mock.patch.object(TT, 'STARTUP_FILES', source_files))
+                patches.enter_context(mock.patch.object(TT, 'STARTUP_DIRS', source_dirs))
+                try: snapshot, contents = case.w._startup_files()
+                except (OSError, TT.CollectionError): result = 'rejected'
+                else:
+                    result = snapshot.get(str(path))
+                    if str(path) in contents:
+                        case.assertEqual(result, TT.hashlib.sha256(contents[str(path)]).hexdigest())
+                        result = 'readable:' + result
+                return dict(name=specification['name'], result=result)
+            finally: patches.close()
+        if family == 'listenerIdentities':
+            comm_command = ('ps', '-o', 'comm=', '-p', '42')
+            responses = {LSOF: (0, LISTENER, '')}
+            if specification['comm'] is not None: responses[comm_command] = (0, specification['comm'] + '\n', '')
+            with case.commands(responses) as calls, mock.patch.object(
+                    case.w, 'processes', return_value={}), mock.patch.object(TT, 'pid_path', return_value=specification['bridge']):
+                accepted = case.w.check_listeners()
+            rows = case.w.db.execute('SELECT exe FROM listeners').fetchall()
+            case.assertEqual(len(rows), 1 if accepted else 0)
+            return dict(name=specification['name'], accepted=accepted, exe=rows[0][0] if rows else None,
+                        commCalls=sum(tuple(call.args[0]) == comm_command for call in calls.call_args_list))
+        if family == 'pidFiles':
+            path = case.root / 'tattletale.pid'; initial = bytes.fromhex(specification['initialHex']); path.write_bytes(initial)
+            identity = specification['probe']; responses = {}
+            if identity != 'must-not-call':
+                responses[('ps', '-p', '42', '-o', 'command=')] = {
+                    'absent': (1, '', ''), 'unknown': (7, '', ''),
+                    'watcher': (0, 'python /fixture/tattletale.py --synthetic\n', '')}[identity]
+            accepted, error = False, None
+            with contextlib.ExitStack() as patches:
+                patches.enter_context(case.commands(responses))
+                logs = patches.enter_context(mock.patch.object(case.w, 'log'))
+                if specification['replaceFailure']:
+                    def fail_replace(pending, destination):
+                        case.assertEqual(str(destination), str(path))
+                        case.assertEqual(pathlib.Path(pending).read_bytes(), (str(os.getpid()) + '\n').encode('ascii'))
+                        raise OSError('synthetic atomic PID replacement failure')
+                    patches.enter_context(mock.patch.object(TT.os, 'replace', side_effect=fail_replace))
+                try: case.w.claim_pid_file()
+                except (SystemExit, OSError) as observed: error = observed
+                else: accepted = True
+            after = path.read_bytes()
+            notes = [call.args for call in logs.call_args_list if call.args[0] == 'NOTE']
+            diagnostic = dict(name=specification['name'], actualOwnPid=os.getpid(), initialHex=initial.hex(), afterHex=after.hex(),
+                              pidFile=getattr(case.w, 'pid_file', None), notes=notes,
+                              errorType=type(error).__name__ if error is not None else None,
+                              errorText=str(error) if error is not None else None)
+            print(json.dumps({'review44PidDiagnostics': diagnostic}, sort_keys=True), flush=True)
+            return dict(name=specification['name'], accepted=accepted,
+                        pidFileSet=getattr(case.w, 'pid_file', None) is not None,
+                        pidFileMatchesCurrentProcess=after == (str(os.getpid()) + '\n').encode('ascii'),
+                        noteCount=len(notes), originalBytesPreserved=after == initial, errorObserved=error is not None)
+        raise AssertionError('unknown frozen review family: ' + family)
+    finally: case.doCleanups()
+
+
+def review44_snapshots():
+    return {family: [review44_observation(family, specification) for specification in FIXTURE['review44Cases'][family]]
+            for family in ('processIdentities', 'entryDispositions', 'listenerIdentities', 'pidFiles')}
+
+
+def review44_case(family, specification):
+    def test(self):
+        actual = review44_observation(family, specification)
+        self.assertEqual(actual['name'], specification['name'])
+        if family == 'entryDispositions': self.assertEqual(actual['result'], specification['expectedResult'])
+        else: self.assertEqual({key: value for key, value in actual.items() if key != 'name'}, specification['expected'])
+    return test
+
+
+for _family, _specifications in FIXTURE['review44Cases'].items():
+    for _index, _specification in enumerate(_specifications):
+        setattr(CollectionHealthTests, 'test_review44_%s_%02d' % (_family, _index), review44_case(_family, _specification))

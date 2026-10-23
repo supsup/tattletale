@@ -215,7 +215,21 @@ collection health. Polling intervals are unchanged; there is no added automatic 
 
 Process collection requires both `ps` commands to succeed and their output to decode and
 parse. An empty all-system process sample is degraded. Normal PID churn between the two
-commands is allowed; their PID sets need not be identical.
+commands is allowed; their PID sets need not be identical. A valid absolute `ps comm`
+path is kept as the stable process identity. A relative path, `/`, or a possible `ps`
+display escape uses the raw kernel path bridge when available. A display-escaped path
+without a valid bridge rejects the sample; a plain relative name retains the existing
+fallback behavior. `/` is never a final executable identity. A listener missing from
+the process snapshot requires a valid absolute raw bridge or escape-free comm fallback.
+
+This is a source-based display policy, not a live-host measurement. Apple's
+[`ps` source](https://github.com/apple-oss-distributions/adv_cmds/blob/main/ps/print.c)
+uses `VIS_TAB | VIS_NL | VIS_NOSLASH`; its
+[`vis` encoder](https://github.com/apple-oss-distributions/Libc/blob/main/gen/FreeBSD/vis.c)
+can produce octal, meta and caret-control forms. A literal filename matching a possible
+display form is ambiguous, so the raw bridge resolves it. Ordinary `app^2`, a trailing
+`M-` or a literal `\q` is not itself a display escape. Bridge paths are already raw and
+are not reinterpreted as display strings.
 
 Startup filesystem entries and the literal `crontab -l` row are **independent observation
 partitions**, each with its own health and first committed baseline. Both are attempted
@@ -229,10 +243,20 @@ marker while continuing to observe readable peers. Such a commit consumes its fi
 baseline, but health is `degraded` with `startup-unreadable` and does not advance
 `lastSuccess`. Crossing into or out of an unreadable marker is not itself a content-change
 event. A→unreadable→A emits no `STARTUP~`; A→unreadable→B emits one, comparing B with the
-most recent readable A copy. Recovery advances success once the whole partition is readable.
+most recent readable A copy. When there is no retained readable version, the first readable
+content emits exactly one `STARTUP~` with `before: None`, its real saved after-copy and the
+existing missing-copy diff diagnostic. This covers both a baseline unreadable item and an
+item added later while unreadable. Repeating the same readable content adds no event; later
+changed content compares against the retained readable copy. Recovery advances success once
+the whole partition is readable.
 A vanished listed file, broken or inaccessible source ancestor, I/O error or unknown/transient
 read failure rejects that partition; it is not converted to a persistent marker. No
 recursive directory scan is introduced, and an unreadable marker is never an all-clear.
+
+Only positively established `ENOENT` is an optional missing entry or a known dangling
+link. `ENOTDIR`, including `regular/x` and a link to that spelling, rejects the partition.
+A positively established symlink loop in a target ancestor uses the symlink-loop marker;
+a merely inaccessible or otherwise unknown ancestor still rejects the partition.
 
 Final-entry metadata is established before opening. Known directories, including mode-000
 directories, use the directory marker; FIFO, socket, device and other nonregular entries
@@ -369,7 +393,10 @@ Unknown names and malformed values are refused, never ignored. Names, types and 
 `tattletale.pid` sits next to the database and holds the watcher's pid. A start refuses while
 a live Tattletale (either version) holds it, takes over a file whose pid is gone or belongs to
 another program, and removes its own file on a clean stop. Empty or unparseable regular
-PID-file content is stale with a fixed diagnostic. Unreadable content, dangling links and
+PID-file content, including invalid UTF-8 bytes, is stale with a fixed diagnostic.
+Unreadable content, dangling links and
 failed identity observations do not authorize takeover. A complete new PID file is published
-atomically, avoiding a truncate/write gap. This adds no interprocess lock protocol: run only
-one watcher per database.
+atomically, avoiding a truncate/write gap. The invalid-stale replacement `NOTE` is emitted
+only after successful replacement. A failed replacement preserves the prior bytes, leaves
+`pidFile` unset and emits no replacement note. This adds no interprocess lock protocol:
+run only one watcher per database.

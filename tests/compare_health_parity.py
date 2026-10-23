@@ -2,6 +2,8 @@
 """Strict comparison of health fixture DATA. This cannot certify producer execution."""
 import argparse
 import datetime
+import difflib
+import hashlib
 import json
 import math
 import os
@@ -30,6 +32,116 @@ REPAIRS = (
     ('publicationNoCache', 'publication-no-cache', ('failed',)),
     ('pidFraming', 'pid', ('nel', 'lineSeparator', 'paragraphSeparator', 'verticalTab', 'formFeed', 'fileSeparator', 'groupSeparator', 'recordSeparator', 'watcher', 'absent', 'uncertain', 'twoLines', 'crlfTransport', 'crTransport')),
 )
+FIRST_READABLE = (
+    ('firstReadableBaseline', 'startup', ('0-permission-denied', '1-permission-denied', '2-A', '3-A', '4-B', '5-permission-denied', '6-B', '7-C')),
+    ('firstReadableAdded', 'startup', ('0-absent', '1-permission-denied', '2-permission-denied', '3-A', '4-A', '5-B', '6-permission-denied', '7-B', '8-C')),
+)
+REPAIRS += FIRST_READABLE
+
+# Independent expected observations for the frozen V3 cases. These are validation
+# oracles, never producer output. A matching pair of wrong producers still fails.
+REVIEW44_EXPECTATIONS = {
+    'processIdentities': (
+        ('stable-absolute-different-bridge', True, '/fixture/app', 0),
+        ('stable-absolute-no-bridge', True, '/fixture/app', 0),
+        ('relative-valid-bridge', True, '/fixture/app', 1),
+        ('relative-no-bridge', True, 'app', 1),
+        ('escaped-meta-valid-bridge', True, '/fixture/éxecutable', 1),
+        ('escaped-octal-valid-bridge', True, '/fixture/a\u00a0b', 1),
+        ('escaped-control-valid-bridge', True, '/fixture/a\u0001b', 1),
+        ('escaped-meta-no-bridge', False, None, 1),
+        ('escaped-octal-root-bridge', False, None, 1),
+        ('escaped-control-relative-bridge', False, None, 1),
+        ('literal-caret-digit', True, '/fixture/app^2', 0),
+        ('literal-meta-suffix', True, '/fixture/literalM-', 0),
+        ('literal-backslash-q', True, '/fixture/has\\q', 0),
+        ('root-valid-bridge', True, '/fixture/app', 1),
+        ('root-no-bridge', False, None, 1),
+        ('raw-bridge-vis-looking', True, '/fixture/raw^A\\123', 1),
+    ),
+    'entryDispositions': (
+        ('regular', 'readable:' + hashlib.sha256(b'A\n').hexdigest()),
+        ('optional-missing', None),
+        ('dangling-link', 'unreadable: dangling-link'),
+        ('target-directory-loop', 'unreadable: symlink-loop'),
+        ('link-enotdir', 'rejected'),
+        ('extra-enotdir', 'rejected'),
+        ('fifo', 'unreadable: not-a-regular-file'),
+        ('socket', 'unreadable: not-a-regular-file'),
+        ('listed-lstat-eacces', 'rejected'),
+    ),
+    'listenerIdentities': (
+        ('root-comm-rejected', False, None, 1),
+        ('valid-comm', True, '/fixture/listener', 1),
+        ('valid-bridge', True, '/fixture/listener', 0),
+        ('root-bridge-valid-comm', True, '/fixture/listener', 1),
+        ('escaped-comm-rejected', False, None, 1),
+        ('raw-bridge-vis-looking', True, '/fixture/raw^A\\123', 0),
+    ),
+    'pidFiles': (
+        ('invalid-ff', True, True, True, 1, False, False),
+        ('invalid-42-c3', True, True, True, 1, False, False),
+        ('invalid-replace-failure', False, False, False, 0, True, True),
+        ('valid-absent', True, True, True, 0, False, False),
+        ('unknown-identity', False, False, False, 0, True, True),
+        ('watcher-identity', False, False, False, 0, True, True),
+    ),
+}
+# Frozen setup identities are checked too; output expectations cannot outlive changed inputs.
+REVIEW44_INPUT_FIELDS = {'processIdentities': ('psComm', 'bridge'), 'entryDispositions': ('state',), 'listenerIdentities': ('bridge', 'comm'), 'pidFiles': ('initialHex', 'probe', 'replaceFailure')}
+REVIEW44_INPUTS = {
+    'processIdentities': (
+        ('/fixture/app', '/private/clone/app'),
+        ('/fixture/app', None),
+        ('app', '/fixture/app'),
+        ('app', None),
+        ('/fixture/M-CM-)xecutable', '/fixture/éxecutable'),
+        ('/fixture/a\\240b', '/fixture/a\xa0b'),
+        ('/fixture/a^Ab', '/fixture/a\x01b'),
+        ('/fixture/M-CM-)xecutable', None),
+        ('/fixture/a\\240b', '/'),
+        ('/fixture/a^Ab', 'app'),
+        ('/fixture/app^2', '/private/clone/app'),
+        ('/fixture/literalM-', '/private/clone/app'),
+        ('/fixture/has\\q', '/private/clone/app'),
+        ('/', '/fixture/app'),
+        ('/', None),
+        ('app', '/fixture/raw^A\\123'),
+    ),
+    'entryDispositions': (
+        ('regular',),
+        ('optional-missing',),
+        ('dangling-link',),
+        ('target-directory-loop',),
+        ('link-enotdir',),
+        ('extra-enotdir',),
+        ('fifo',),
+        ('socket',),
+        ('listed-lstat-eacces',),
+    ),
+    'listenerIdentities': (
+        (None, '/'),
+        (None, '/fixture/listener'),
+        ('/fixture/listener', None),
+        ('/', '/fixture/listener'),
+        (None, '/fixture/M-CM-)listener'),
+        ('/fixture/raw^A\\123', None),
+    ),
+    'pidFiles': (
+        ('ff', 'must-not-call', False),
+        ('3432c3', 'must-not-call', False),
+        ('ff', 'must-not-call', True),
+        ('3432', 'absent', False),
+        ('3432', 'unknown', False),
+        ('3432', 'watcher', False),
+    ),
+}
+REVIEW44_FIELDS = {
+    'processIdentities': ('accepted', 'exe', 'bridgeCalls'),
+    'entryDispositions': ('result',),
+    'listenerIdentities': ('accepted', 'exe', 'commCalls'),
+    'pidFiles': ('accepted', 'pidFileSet', 'pidFileMatchesCurrentProcess', 'noteCount', 'originalBytesPreserved', 'errorObserved'),
+}
 CHECKS = ('processes', 'listeners', 'startup', 'crontab')
 SCOPES = ('loopback', 'wildcard', 'non-loopback', 'unknown')
 LIMIT = 16 * 1024 * 1024
@@ -246,6 +358,110 @@ def repair_results(rows, cases):
             require(state['name'] == step['name'], at + ': missing/duplicate/reordered state')
 
 
+def review44_spec(cases):
+    keys(cases, REVIEW44_EXPECTATIONS, 'review44 input')
+    inputs = {'processIdentities': ('psComm', 'bridge'),
+              'entryDispositions': ('state',),
+              'listenerIdentities': ('bridge', 'comm'),
+              'pidFiles': ('initialHex', 'probe', 'replaceFailure')}
+    for family, expectations in REVIEW44_EXPECTATIONS.items():
+        rows = cases[family]
+        require(type(rows) is list and len(rows) == len(expectations), family + ': input census mismatch')
+        for row, spec, setup in zip(rows, expectations, REVIEW44_INPUTS[family]):
+            name, *values = spec
+            at = family + '.' + name
+            expected_key = 'expectedResult' if family == 'entryDispositions' else 'expected'
+            keys(row, ('name',) + inputs[family] + (expected_key,), at)
+            require(type(row['name']) is str and row['name'] == name, at + ': input identity/order mismatch')
+            equal({key: row[key] for key in inputs[family]}, dict(zip(REVIEW44_INPUT_FIELDS[family], setup)), at + '.frozen setup')
+            if family == 'entryDispositions':
+                require(type(row['state']) is str and row['state'] == name, at + ': wrong filesystem setup')
+                equal(row[expected_key], values[0], at + '.declared expectation')
+            else:
+                declared = dict(zip(REVIEW44_FIELDS[family], values))
+                equal(row[expected_key], declared, at + '.declared expectation')
+            if family == 'processIdentities':
+                require(type(row['psComm']) is str and row['psComm'] and nullable(row['bridge'], str), at + ': wrong identity input')
+            elif family == 'listenerIdentities':
+                require(nullable(row['comm'], str) and nullable(row['bridge'], str), at + ': wrong listener input')
+            elif family == 'pidFiles':
+                require(type(row['initialHex']) is str and re.fullmatch(r'(?:[0-9a-f]{2})+', row['initialHex']) and
+                        type(row['replaceFailure']) is bool and row['probe'] in ('must-not-call', 'absent', 'unknown', 'watcher'), at + ': wrong PID setup')
+
+
+def review44_results(rows, cases):
+    keys(rows, REVIEW44_EXPECTATIONS, 'review44 results')
+    for family, expectations in REVIEW44_EXPECTATIONS.items():
+        actual = rows[family]
+        require(type(actual) is list and len(actual) == len(expectations), family + ': result census mismatch')
+        for row, spec, case in zip(actual, expectations, cases[family]):
+            name, *values = spec
+            fields = REVIEW44_FIELDS[family]
+            keys(row, ('name',) + fields, family + '.' + name)
+            equal(row, {'name': name, **dict(zip(fields, values))}, family + '.' + name)
+            # Validate against the independently checked fixture declaration too.
+            expected = {'result': case['expectedResult']} if family == 'entryDispositions' else case['expected']
+            equal({key: row[key] for key in fields}, expected, family + '.' + name + '.fixture')
+
+
+def first_readable_expected(case, clock):
+    """Small contract oracle for the two frozen first-content histories.
+
+    Derives hashes/copies/events/versions/health from input bytes and transitions;
+    never reads either producer's output and never launches a collector.
+    """
+    previous, retained, copies, versions, events, states = {}, {}, {}, [], [], []
+    last_success = None
+    unknown = {'lastAttempt': None, 'lastSuccess': None, 'status': 'unknown', 'error': None}
+    for index, step in enumerate(case['steps']):
+        at = step['at']
+        entries = [(e['path'], e['text'], e['state'] == 'regular') for e in step['entries']]
+        entries.append(('crontab -l', step['cron']['out'], True))
+        current = {}
+        for path, text, readable in entries:
+            digest = hashlib.sha256(text.encode('utf-8')).hexdigest() if readable else 'unreadable: permission-denied'
+            copy_path = '/fixture/copies/' + path.strip('/').replace('/', '_').replace(' ', '_') + '/' + digest[:16] if readable else None
+            current[path] = digest
+            if previous.get(path) == digest:
+                continue
+            if readable:
+                copies[copy_path] = text.encode('utf-8').hex()
+            versions.append({'path': path, 'hash': digest, 'copyPath': copy_path, 'seenAt': at})
+            if index and path not in previous:
+                events.append({'time': at, 'kind': 'STARTUP+', 'message': 'added: ' + path + ' | copy: ' + (copy_path or 'None')})
+            elif index and readable and (path not in retained or retained[path][0] != digest):
+                before = retained.get(path)
+                diff = ('\n'.join(difflib.unified_diff(before[2].splitlines(), text.splitlines(), fromfile='before', tofile='after', lineterm=''))
+                        if before else '(no text diff: binary or missing copy)')
+                events.append({'time': at, 'kind': 'STARTUP~', 'message': 'changed: ' + path + ' | before: ' +
+                               (before[1] if before else 'None') + ' | after: ' + copy_path + '\n' + diff})
+            if readable:
+                retained[path] = (digest, copy_path, text)
+        if index == 0:
+            events.extend([{'time': at, 'kind': 'BASELINE', 'message': 'startup items: ' + str(len(step['entries'])) + ' recorded, copies in /fixture/copies'},
+                           {'time': at, 'kind': 'BASELINE', 'message': 'crontab: 1 recorded, copies in /fixture/copies'}])
+        degraded = any(e['state'] != 'regular' for e in step['entries'])
+        if not degraded:
+            last_success = at
+        healths = {key: dict(unknown) for key in CHECKS}
+        healths['startup'] = {'lastAttempt': at, 'lastSuccess': last_success, 'status': 'degraded' if degraded else 'ok',
+                              'error': 'startup-unreadable' if degraded else None}
+        healths['crontab'] = {'lastAttempt': at, 'lastSuccess': at, 'status': 'ok', 'error': None}
+        states.append({'name': step['name'], 'collectionHealth': healths, 'publicationHealth': dict(unknown), 'inventoryAsOf': clock,
+                       'map': {'programs': {}, 'listeners': {}, 'credentials': [], 'startup': dict(sorted(current.items()))},
+                       'events': [dict(row) for row in events], 'startupMirror': dict(sorted(current.items())),
+                       'baselines': {'programs': True, 'listeners': True, 'startup': False, 'crontab': False},
+                       'dirtyPrograms': {}, 'dirtyListeners': {}, 'startupVersions': [dict(row) for row in versions],
+                       'copies': [{'path': path, 'hex': copies[path]} for path in sorted(copies)], 'published': None})
+        previous = current
+    return states
+
+
+def first_readable_semantics(rows, fixture):
+    for result, case in zip(rows[-2:], fixture['repairCases'][-2:]):
+        equal(result['states'], first_readable_expected(case, fixture['clock']), case['name'] + '.semantic contract')
+
+
 def nullable(value, kind):
     return value is None or type(value) is kind
 
@@ -298,8 +514,8 @@ def snapshots(rows, names, transition=False):
 
 
 def validate(value, fixture):
-    keys(value, ('fixtureVersion', 'scopes', 'commands', 'snapshots', 'startupTransitions', 'repairResults'), 'parity')
-    require(type(value['fixtureVersion']) is int and value['fixtureVersion'] == fixture['fixtureVersion'] == 2, 'unsupported fixture version')
+    keys(value, ('fixtureVersion', 'scopes', 'commands', 'snapshots', 'startupTransitions', 'repairResults', 'review44'), 'parity')
+    require(type(value['fixtureVersion']) is int and value['fixtureVersion'] == fixture['fixtureVersion'] == 3, 'unsupported fixture version')
     require(type(value['scopes']) is list and len(value['scopes']) == len(fixture['scopeCases']) == 23, 'scope census mismatch')
     for actual, expected in zip(value['scopes'], fixture['scopeCases']):
         keys(actual, ('host', 'actual'), 'scope')
@@ -313,6 +529,8 @@ def validate(value, fixture):
     snapshots(value['snapshots'], SNAPSHOTS)
     snapshots(value['startupTransitions'], TRANSITIONS, transition=True)
     repair_results(value['repairResults'], fixture['repairCases'])
+    first_readable_semantics(value['repairResults'], fixture)
+    review44_results(value['review44'], fixture['review44Cases'])
 
 
 def equal(left, right, where='$'):
@@ -331,8 +549,8 @@ def equal(left, right, where='$'):
 
 def compare_files(python_path, java_path, fixture_path=None):
     fixture = load(fixture_path or pathlib.Path(__file__).with_name('fixtures') / 'collection-health.json')
-    keys(fixture, ('fixtureVersion', 'clock', 'scopeCases', 'commandCases', 'repairCases'), 'shared fixture')
-    require(type(fixture['fixtureVersion']) is int and fixture['fixtureVersion'] == 2 and
+    keys(fixture, ('fixtureVersion', 'clock', 'scopeCases', 'commandCases', 'repairCases', 'review44Cases'), 'shared fixture')
+    require(type(fixture['fixtureVersion']) is int and fixture['fixtureVersion'] == 3 and
             type(fixture['clock']) is str and utc_second(fixture['clock']), 'unsupported shared fixture version/clock')
     require(type(fixture['scopeCases']) is list and type(fixture['commandCases']) is list, 'invalid shared fixture census')
     for row in fixture['scopeCases']:
@@ -342,6 +560,7 @@ def compare_files(python_path, java_path, fixture_path=None):
         keys(row, ('tool', 'code', 'out', 'err', 'expected'), 'command fixture')
         require(type(row['code']) is int and all(type(row[k]) is str for k in ('tool', 'out', 'err', 'expected')), 'invalid command fixture')
     repair_spec(fixture['repairCases'])
+    review44_spec(fixture['review44Cases'])
     left, right = load(python_path), load(java_path)
     validate(left, fixture)
     validate(right, fixture)
@@ -349,7 +568,9 @@ def compare_files(python_path, java_path, fixture_path=None):
     return {'dataComparison': 'equal', 'producerExecutionCertified': False,
             'scopes': len(left['scopes']), 'commands': len(left['commands']),
             'snapshots': len(left['snapshots']), 'startupTransitions': len(left['startupTransitions']),
-            'repairFamilies': len(left['repairResults']), 'repairStates': sum(len(r['states']) for r in left['repairResults'])}
+            'repairFamilies': len(left['repairResults']), 'repairStates': sum(len(r['states']) for r in left['repairResults']),
+            'review44Observations': sum(len(rows) for rows in left['review44'].values()),
+            'firstReadableSemanticStates': sum(len(r['states']) for r in left['repairResults'][-2:])}
 
 
 def main():

@@ -6,7 +6,6 @@ import java.lang.foreign.*;
 import java.lang.invoke.MethodHandle;
 import java.nio.ByteOrder;
 import java.nio.file.*;
-import java.nio.file.attribute.FileTime;
 import java.util.*;
 import static java.lang.foreign.ValueLayout.*;
 
@@ -23,11 +22,15 @@ final class StartupEntry {
         default List<Observed> ancestorLinks(Path path)throws IOException{return List.of();}
     }
     record Observed(Path path,Meta metadata) {}
+    static final class AncestorLoop extends IOException {
+        private static final long serialVersionUID=1L;
+        final List<Observed> observed;
+        AncestorLoop(List<Observed> observed){super("startup-read");this.observed=List.copyOf(observed);}
+    }
     static final Fs REAL=new Fs() {
         public Meta metadata(Path path)throws IOException {
-            Map<String,Object> m=Files.readAttributes(path,"unix:dev,ino,mode,size,lastModifiedTime,ctime",LinkOption.NOFOLLOW_LINKS);
-            java.time.Instant mt=((FileTime)m.get("lastModifiedTime")).toInstant(),ct=((FileTime)m.get("ctime")).toInstant();
-            return new Meta(((Number)m.get("dev")).longValue(),((Number)m.get("ino")).longValue(),((Number)m.get("mode")).intValue(),((Number)m.get("size")).longValue(),mt.getEpochSecond(),mt.getNano(),ct.getEpochSecond(),ct.getNano());
+            // NIO on Darwin conflates ENOTDIR with ENOENT. Preserve the actual native errno.
+            return Darwin.metadata(path,false);
         }
         public Path target(Path path)throws IOException{return Files.readSymbolicLink(path);}
         public byte[] regular(Path path,Meta expected)throws IOException{return Darwin.read(path,expected,()->{},()->{});}
@@ -36,18 +39,29 @@ final class StartupEntry {
             return true;
         }
         public List<Observed> ancestorLinks(Path path)throws IOException {
-            List<Observed> links=new ArrayList<>();Path prefix=path.getRoot();
-            for(int i=0;i<path.getNameCount()-1;i++) {
-                prefix=prefix.resolve(path.getName(i));Meta m;
-                try{m=metadata(prefix);}catch(NoSuchFileException absent){break;}
-                if((m.mode()&TYPE)==LINK) {
-                    links.add(new Observed(prefix,m));
-                    prefix.toRealPath(); // A broken or looping ancestor invalidates the sample.
-                }
-            }
+            List<Observed> links=new ArrayList<>();
+            if(path.getParent()!=null)directoryChain(this,path.getParent(),links,new HashSet<>(),new int[]{0},true);
             return links;
         }
     };
+    /** Observe every link in ancestor targets too, retaining raw symlink/.. kernel spelling. */
+    static void directoryChain(Fs fs,Path directory,List<Observed> chain,Set<Path> active,int[] hops,boolean optional)throws IOException {
+        Path prefix=directory.getRoot();
+        for(int i=0;i<directory.getNameCount();i++) {
+            prefix=prefix.resolve(directory.getName(i));Meta m;
+            try{m=fs.metadata(prefix);}catch(NoSuchFileException absent){if(optional)return;throw absent;}
+            int type=m.mode()&TYPE;
+            if(type==LINK) {
+                chain.add(new Observed(prefix,m));
+                if(!active.add(prefix) || ++hops[0]>MAX_LINKS)throw new AncestorLoop(chain);
+                Path target=fs.target(prefix);stable(fs,chain);
+                directoryChain(fs,target.isAbsolute()?target:prefix.getParent().resolve(target),chain,active,hops,false);
+                active.remove(prefix);
+                // Confirm the completely observed target is still a directory with native errno fidelity.
+                if((Darwin.metadata(prefix,true).mode()&TYPE)!=DIRECTORY)throw new NotDirectoryException(prefix.toString());
+            }else if(type!=DIRECTORY)throw new NotDirectoryException(prefix.toString());
+        }
+    }
     static void stable(Fs fs,List<Observed> chain)throws IOException {
         for(Observed entry:chain)if(!entry.metadata().equals(fs.metadata(entry.path())))throw new IOException("startup-read");
     }
@@ -59,7 +73,8 @@ final class StartupEntry {
         // Preserve spelling: normalizing a symlink/.. path changes the kernel's target.
         Path path=Path.of(file).toAbsolutePath();boolean followed=false;Set<Path> seen=new HashSet<>();List<Observed> chain=new ArrayList<>();
         for(int hops=0;hops<=MAX_LINKS;hops++) {
-            chain.addAll(fs.ancestorLinks(path));
+            try{chain.addAll(fs.ancestorLinks(path));}
+            catch(AncestorLoop loop){chain.addAll(loop.observed);throw marker(fs,chain,"symlink-loop");}
             if(!seen.add(path))throw marker(fs,chain,"symlink-loop");
             Meta m;
             try {m=fs.metadata(path);}
@@ -94,7 +109,7 @@ final class StartupEntry {
         static final MemoryLayout STAT=MemoryLayout.structLayout(JAVA_INT.withName("dev"),JAVA_SHORT.withName("mode"),JAVA_SHORT,
                 JAVA_LONG.withName("ino"),JAVA_INT,JAVA_INT,JAVA_INT,MemoryLayout.paddingLayout(4),TS,
                 TS.withName("mtime"),TS.withName("ctime"),TS,JAVA_LONG.withName("size"),JAVA_LONG,JAVA_INT,JAVA_INT,JAVA_INT,JAVA_INT,MemoryLayout.sequenceLayout(2,JAVA_LONG));
-        record Calls(MethodHandle open,MethodHandle stat,MethodHandle read,MethodHandle close) {}
+        record Calls(MethodHandle open,MethodHandle stat,MethodHandle read,MethodHandle close,MethodHandle lstat,MethodHandle pathStat) {}
         static final class Holder {static final Calls CALLS=load();}
         static boolean supported() {return System.getProperty("os.name").equals("Mac OS X") && List.of("aarch64","x86_64").contains(System.getProperty("os.arch"))
                 && ADDRESS.byteSize()==8 && JAVA_LONG.byteSize()==8 && ByteOrder.nativeOrder()==ByteOrder.LITTLE_ENDIAN;}
@@ -107,10 +122,28 @@ final class StartupEntry {
                 return new Calls(l.downcallHandle(lib.find("open").orElseThrow(),FunctionDescriptor.of(JAVA_INT,ADDRESS,JAVA_INT,JAVA_INT),Linker.Option.firstVariadicArg(2),Linker.Option.captureCallState("errno")),
                         l.downcallHandle(lib.find(System.getProperty("os.arch").equals("aarch64")?"fstat":"fstat$INODE64").orElseThrow(),FunctionDescriptor.of(JAVA_INT,JAVA_INT,ADDRESS)),
                         l.downcallHandle(lib.find("read").orElseThrow(),FunctionDescriptor.of(JAVA_LONG,JAVA_INT,ADDRESS,JAVA_LONG)),
-                        l.downcallHandle(lib.find("close").orElseThrow(),FunctionDescriptor.of(JAVA_INT,JAVA_INT)));
+                        l.downcallHandle(lib.find("close").orElseThrow(),FunctionDescriptor.of(JAVA_INT,JAVA_INT)),
+                        l.downcallHandle(lib.find(System.getProperty("os.arch").equals("aarch64")?"lstat":"lstat$INODE64").orElseThrow(),FunctionDescriptor.of(JAVA_INT,ADDRESS,ADDRESS),Linker.Option.captureCallState("errno")),
+                        l.downcallHandle(lib.find(System.getProperty("os.arch").equals("aarch64")?"stat":"stat$INODE64").orElseThrow(),FunctionDescriptor.of(JAVA_INT,ADDRESS,ADDRESS),Linker.Option.captureCallState("errno")));
             }catch(RuntimeException | LinkageError e){return null;}
         }
         static Meta stat(MemorySegment s) {return new Meta(s.get(JAVA_INT,offset("dev")),s.get(JAVA_LONG,offset("ino")),Short.toUnsignedInt(s.get(JAVA_SHORT,offset("mode"))),s.get(JAVA_LONG,offset("size")),s.get(JAVA_LONG,offset("mtime")),s.get(JAVA_LONG,offset("mtime")+8),s.get(JAVA_LONG,offset("ctime")),s.get(JAVA_LONG,offset("ctime")+8));}
+        static Meta metadata(Path path,boolean follow)throws IOException {
+            if(!supported() || STAT.byteSize()!=144 || offset("mode")!=4 || offset("ino")!=8 || offset("size")!=96 || Holder.CALLS==null)throw new IOException("startup-read");
+            try(Arena a=Arena.ofConfined()) {
+                MemorySegment capture=a.allocate(Linker.Option.captureStateLayout()),name=a.allocateFrom(path.toString()),s=a.allocate(STAT);
+                MethodHandle call=follow?Holder.CALLS.pathStat():Holder.CALLS.lstat();
+                if((int)call.invokeExact(capture,name,s)==0)return stat(s);
+                int errno=capture.get(JAVA_INT,Linker.Option.captureStateLayout().byteOffset(MemoryLayout.PathElement.groupElement("errno")));
+                // Installed Darwin SDK sys/errno.h: no exception-message or existence heuristics.
+                if(errno==2)throw new NoSuchFileException(path.toString());
+                if(errno==20)throw new NotDirectoryException(path.toString());
+                if(errno==62)throw new FileSystemLoopException(path.toString());
+                if(permissionErrno(errno))throw new AccessDeniedException(path.toString());
+                throw new IOException("startup-read");
+            }catch(IOException e){throw e;}
+            catch(Throwable e){if(e instanceof Error err)throw err;throw new IOException("startup-read",e);}
+        }
         static byte[] read(Path path,Meta expected,Boundary beforeOpen,Boundary afterRead)throws IOException {
             if(!supported() || STAT.byteSize()!=144 || offset("mode")!=4 || offset("ino")!=8 || offset("size")!=96 || Holder.CALLS==null)throw new IOException("startup-read");
             Calls c=Holder.CALLS;

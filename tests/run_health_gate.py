@@ -128,7 +128,7 @@ def main():
         print('HEALTH GATE REFUSED before producers: ' + str(error), file=sys.stderr)
         return 1
     report = {'status': 'INCOMPLETE', 'producerExecutionCertified': False,
-              'qualification': 'synthetic fixture execution only; no live collector/release claim', 'producers': {}, 'issues': []}
+              'qualification': 'synthetic fixture execution only; review44 filesystem results are selected dispositions, with injected listed-child metadata denial; no live collector/release claim', 'producers': {}, 'issues': []}
     try:
         before = source_pins()
         report['sourcePinsBefore'] = before

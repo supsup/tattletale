@@ -1,5 +1,5 @@
 {
-  "fixtureVersion": 2,
+  "fixtureVersion": 3,
   "clock": "2000-01-01T00:00:00Z",
   "scopeCases": [
     {
@@ -908,7 +908,7 @@
           "op": "pid",
           "command": {
             "code": 0,
-            "out": "/fixture/other --arg=a\u0085b\n",
+            "out": "/fixture/other --arg=ab\n",
             "err": ""
           }
         },
@@ -918,7 +918,7 @@
           "op": "pid",
           "command": {
             "code": 0,
-            "out": "/fixture/other --arg=a\u2028b\n",
+            "out": "/fixture/other --arg=a b\n",
             "err": ""
           }
         },
@@ -928,7 +928,7 @@
           "op": "pid",
           "command": {
             "code": 0,
-            "out": "/fixture/other --arg=a\u2029b\n",
+            "out": "/fixture/other --arg=a b\n",
             "err": ""
           }
         },
@@ -1043,6 +1043,763 @@
           }
         }
       ]
+    },
+    {
+      "name": "firstReadableBaseline",
+      "kind": "startup",
+      "steps": [
+        {
+          "name": "0-permission-denied",
+          "at": "2000-01-02T00:00:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "permission-denied",
+              "text": null
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "1-permission-denied",
+          "at": "2000-01-02T00:01:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "permission-denied",
+              "text": null
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "2-A",
+          "at": "2000-01-02T00:02:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "regular",
+              "text": "A\n"
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "3-A",
+          "at": "2000-01-02T00:03:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "regular",
+              "text": "A\n"
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "4-B",
+          "at": "2000-01-02T00:04:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "regular",
+              "text": "B\n"
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "5-permission-denied",
+          "at": "2000-01-02T00:05:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "permission-denied",
+              "text": null
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "6-B",
+          "at": "2000-01-02T00:06:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "regular",
+              "text": "B\n"
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "7-C",
+          "at": "2000-01-02T00:07:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "regular",
+              "text": "C\n"
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "firstReadableAdded",
+      "kind": "startup",
+      "steps": [
+        {
+          "name": "0-absent",
+          "at": "2000-01-02T01:00:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "1-permission-denied",
+          "at": "2000-01-02T01:01:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "permission-denied",
+              "text": null
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "2-permission-denied",
+          "at": "2000-01-02T01:02:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "permission-denied",
+              "text": null
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "3-A",
+          "at": "2000-01-02T01:03:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "regular",
+              "text": "A\n"
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "4-A",
+          "at": "2000-01-02T01:04:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "regular",
+              "text": "A\n"
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "5-B",
+          "at": "2000-01-02T01:05:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "regular",
+              "text": "B\n"
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "6-permission-denied",
+          "at": "2000-01-02T01:06:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "permission-denied",
+              "text": null
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "7-B",
+          "at": "2000-01-02T01:07:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "regular",
+              "text": "B\n"
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        },
+        {
+          "name": "8-C",
+          "at": "2000-01-02T01:08:00Z",
+          "op": "startup",
+          "entries": [
+            {
+              "path": "/fixture/entry",
+              "state": "regular",
+              "text": "C\n"
+            },
+            {
+              "path": "/fixture/peer",
+              "state": "regular",
+              "text": "peer\n"
+            }
+          ],
+          "sourceFailure": null,
+          "cron": {
+            "code": 0,
+            "out": "fixture cron\n",
+            "err": ""
+          }
+        }
+      ]
     }
-  ]
+  ],
+  "review44Cases": {
+    "processIdentities": [
+      {
+        "name": "stable-absolute-different-bridge",
+        "psComm": "/fixture/app",
+        "bridge": "/private/clone/app",
+        "expected": {
+          "accepted": true,
+          "exe": "/fixture/app",
+          "bridgeCalls": 0
+        }
+      },
+      {
+        "name": "stable-absolute-no-bridge",
+        "psComm": "/fixture/app",
+        "bridge": null,
+        "expected": {
+          "accepted": true,
+          "exe": "/fixture/app",
+          "bridgeCalls": 0
+        }
+      },
+      {
+        "name": "relative-valid-bridge",
+        "psComm": "app",
+        "bridge": "/fixture/app",
+        "expected": {
+          "accepted": true,
+          "exe": "/fixture/app",
+          "bridgeCalls": 1
+        }
+      },
+      {
+        "name": "relative-no-bridge",
+        "psComm": "app",
+        "bridge": null,
+        "expected": {
+          "accepted": true,
+          "exe": "app",
+          "bridgeCalls": 1
+        }
+      },
+      {
+        "name": "escaped-meta-valid-bridge",
+        "psComm": "/fixture/M-CM-)xecutable",
+        "bridge": "/fixture/éxecutable",
+        "expected": {
+          "accepted": true,
+          "exe": "/fixture/éxecutable",
+          "bridgeCalls": 1
+        }
+      },
+      {
+        "name": "escaped-octal-valid-bridge",
+        "psComm": "/fixture/a\\240b",
+        "bridge": "/fixture/a b",
+        "expected": {
+          "accepted": true,
+          "exe": "/fixture/a b",
+          "bridgeCalls": 1
+        }
+      },
+      {
+        "name": "escaped-control-valid-bridge",
+        "psComm": "/fixture/a^Ab",
+        "bridge": "/fixture/a\u0001b",
+        "expected": {
+          "accepted": true,
+          "exe": "/fixture/a\u0001b",
+          "bridgeCalls": 1
+        }
+      },
+      {
+        "name": "escaped-meta-no-bridge",
+        "psComm": "/fixture/M-CM-)xecutable",
+        "bridge": null,
+        "expected": {
+          "accepted": false,
+          "exe": null,
+          "bridgeCalls": 1
+        }
+      },
+      {
+        "name": "escaped-octal-root-bridge",
+        "psComm": "/fixture/a\\240b",
+        "bridge": "/",
+        "expected": {
+          "accepted": false,
+          "exe": null,
+          "bridgeCalls": 1
+        }
+      },
+      {
+        "name": "escaped-control-relative-bridge",
+        "psComm": "/fixture/a^Ab",
+        "bridge": "app",
+        "expected": {
+          "accepted": false,
+          "exe": null,
+          "bridgeCalls": 1
+        }
+      },
+      {
+        "name": "literal-caret-digit",
+        "psComm": "/fixture/app^2",
+        "bridge": "/private/clone/app",
+        "expected": {
+          "accepted": true,
+          "exe": "/fixture/app^2",
+          "bridgeCalls": 0
+        }
+      },
+      {
+        "name": "literal-meta-suffix",
+        "psComm": "/fixture/literalM-",
+        "bridge": "/private/clone/app",
+        "expected": {
+          "accepted": true,
+          "exe": "/fixture/literalM-",
+          "bridgeCalls": 0
+        }
+      },
+      {
+        "name": "literal-backslash-q",
+        "psComm": "/fixture/has\\q",
+        "bridge": "/private/clone/app",
+        "expected": {
+          "accepted": true,
+          "exe": "/fixture/has\\q",
+          "bridgeCalls": 0
+        }
+      },
+      {
+        "name": "root-valid-bridge",
+        "psComm": "/",
+        "bridge": "/fixture/app",
+        "expected": {
+          "accepted": true,
+          "exe": "/fixture/app",
+          "bridgeCalls": 1
+        }
+      },
+      {
+        "name": "root-no-bridge",
+        "psComm": "/",
+        "bridge": null,
+        "expected": {
+          "accepted": false,
+          "exe": null,
+          "bridgeCalls": 1
+        }
+      },
+      {
+        "name": "raw-bridge-vis-looking",
+        "psComm": "app",
+        "bridge": "/fixture/raw^A\\123",
+        "expected": {
+          "accepted": true,
+          "exe": "/fixture/raw^A\\123",
+          "bridgeCalls": 1
+        }
+      }
+    ],
+    "entryDispositions": [
+      {
+        "name": "regular",
+        "state": "regular",
+        "expectedResult": "readable:06f961b802bc46ee168555f066d28f4f0e9afdf3f88174c1ee6f9de004fc30a0"
+      },
+      {
+        "name": "optional-missing",
+        "state": "optional-missing",
+        "expectedResult": null
+      },
+      {
+        "name": "dangling-link",
+        "state": "dangling-link",
+        "expectedResult": "unreadable: dangling-link"
+      },
+      {
+        "name": "target-directory-loop",
+        "state": "target-directory-loop",
+        "expectedResult": "unreadable: symlink-loop"
+      },
+      {
+        "name": "link-enotdir",
+        "state": "link-enotdir",
+        "expectedResult": "rejected"
+      },
+      {
+        "name": "extra-enotdir",
+        "state": "extra-enotdir",
+        "expectedResult": "rejected"
+      },
+      {
+        "name": "fifo",
+        "state": "fifo",
+        "expectedResult": "unreadable: not-a-regular-file"
+      },
+      {
+        "name": "socket",
+        "state": "socket",
+        "expectedResult": "unreadable: not-a-regular-file"
+      },
+      {
+        "name": "listed-lstat-eacces",
+        "state": "listed-lstat-eacces",
+        "expectedResult": "rejected"
+      }
+    ],
+    "listenerIdentities": [
+      {
+        "name": "root-comm-rejected",
+        "bridge": null,
+        "comm": "/",
+        "expected": {
+          "accepted": false,
+          "exe": null,
+          "commCalls": 1
+        }
+      },
+      {
+        "name": "valid-comm",
+        "bridge": null,
+        "comm": "/fixture/listener",
+        "expected": {
+          "accepted": true,
+          "exe": "/fixture/listener",
+          "commCalls": 1
+        }
+      },
+      {
+        "name": "valid-bridge",
+        "bridge": "/fixture/listener",
+        "comm": null,
+        "expected": {
+          "accepted": true,
+          "exe": "/fixture/listener",
+          "commCalls": 0
+        }
+      },
+      {
+        "name": "root-bridge-valid-comm",
+        "bridge": "/",
+        "comm": "/fixture/listener",
+        "expected": {
+          "accepted": true,
+          "exe": "/fixture/listener",
+          "commCalls": 1
+        }
+      },
+      {
+        "name": "escaped-comm-rejected",
+        "bridge": null,
+        "comm": "/fixture/M-CM-)listener",
+        "expected": {
+          "accepted": false,
+          "exe": null,
+          "commCalls": 1
+        }
+      },
+      {
+        "name": "raw-bridge-vis-looking",
+        "bridge": "/fixture/raw^A\\123",
+        "comm": null,
+        "expected": {
+          "accepted": true,
+          "exe": "/fixture/raw^A\\123",
+          "commCalls": 0
+        }
+      }
+    ],
+    "pidFiles": [
+      {
+        "name": "invalid-ff",
+        "initialHex": "ff",
+        "probe": "must-not-call",
+        "replaceFailure": false,
+        "expected": {
+          "accepted": true,
+          "pidFileSet": true,
+          "pidFileMatchesCurrentProcess": true,
+          "noteCount": 1,
+          "originalBytesPreserved": false,
+          "errorObserved": false
+        }
+      },
+      {
+        "name": "invalid-42-c3",
+        "initialHex": "3432c3",
+        "probe": "must-not-call",
+        "replaceFailure": false,
+        "expected": {
+          "accepted": true,
+          "pidFileSet": true,
+          "pidFileMatchesCurrentProcess": true,
+          "noteCount": 1,
+          "originalBytesPreserved": false,
+          "errorObserved": false
+        }
+      },
+      {
+        "name": "invalid-replace-failure",
+        "initialHex": "ff",
+        "probe": "must-not-call",
+        "replaceFailure": true,
+        "expected": {
+          "accepted": false,
+          "pidFileSet": false,
+          "pidFileMatchesCurrentProcess": false,
+          "noteCount": 0,
+          "originalBytesPreserved": true,
+          "errorObserved": true
+        }
+      },
+      {
+        "name": "valid-absent",
+        "initialHex": "3432",
+        "probe": "absent",
+        "replaceFailure": false,
+        "expected": {
+          "accepted": true,
+          "pidFileSet": true,
+          "pidFileMatchesCurrentProcess": true,
+          "noteCount": 0,
+          "originalBytesPreserved": false,
+          "errorObserved": false
+        }
+      },
+      {
+        "name": "unknown-identity",
+        "initialHex": "3432",
+        "probe": "unknown",
+        "replaceFailure": false,
+        "expected": {
+          "accepted": false,
+          "pidFileSet": false,
+          "pidFileMatchesCurrentProcess": false,
+          "noteCount": 0,
+          "originalBytesPreserved": true,
+          "errorObserved": true
+        }
+      },
+      {
+        "name": "watcher-identity",
+        "initialHex": "3432",
+        "probe": "watcher",
+        "replaceFailure": false,
+        "expected": {
+          "accepted": false,
+          "pidFileSet": false,
+          "pidFileMatchesCurrentProcess": false,
+          "noteCount": 0,
+          "originalBytesPreserved": true,
+          "errorObserved": true
+        }
+      }
+    ]
+  }
 }

@@ -81,7 +81,9 @@ final class RepairHealthTest {
             fake.files.put("/fixture/b","b".getBytes(StandardCharsets.UTF_8));f.w.checkStartup();check(f.w.startup.containsKey("/fixture/b") && count(f.w,"STARTUP+")==1,"marker concealed new peer");
             Map<String,String> before=new LinkedHashMap<>(f.w.startup);fake.failRead=true;f.w.checkStartup();check(f.w.startup.equals(before) && count(f.w,"STARTUP-")==0,"transient read removed entries");status(f.w,"crontab","ok");
             fake.failRead=false;f.w.sources=new Fake(){public List<String> files(){return new ArrayList<>(fake.files.keySet());}public byte[] read(String file){return fake.files.get(file);}public String textDiff(String a,String b,int l){return "(fixture diff)";}};
-            f.w.clock=()->"2000-01-01T00:01:00Z";f.w.checkStartup();status(f.w,"startup","ok");check(count(f.w,"STARTUP~")==0 && health(f.w,"startup").get("lastSuccess").equals("2000-01-01T00:01:00Z"),"marker recovery duplicated/missed");
+            f.w.clock=()->"2000-01-01T00:01:00Z";f.w.checkStartup();status(f.w,"startup","ok");
+            // Review44 N3 supersedes the old zero-event expectation for never-readable content.
+            check(f.w.db.query("SELECT kind,message FROM events WHERE kind='STARTUP~' ORDER BY id;").equals(List.of(event("STARTUP~","changed: /fixture/denied | before: None | after: "+copy("/fixture/denied",digest("readable"))+"\n(fixture diff)"))) && health(f.w,"startup").get("lastSuccess").equals("2000-01-01T00:01:00Z"),"first readable marker recovery duplicated/missed");
         }});
         test("repair-final-directory-dangling-versus-disappearance",()->{
             Path d=Files.createDirectory(root.resolve("entry-markers"));Path dir=Files.createDirectory(d.resolve("bundle"));Path link=d.resolve("dangling");Files.createSymbolicLink(link,d.resolve("absent"));Watch.Sources source=Proc::collector;
