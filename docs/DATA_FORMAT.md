@@ -104,7 +104,7 @@ JSON on one line:
 window.TATTLETALE = {
   "formatVersion": 2,
   "generatedAt": "2000-01-01T00:00:00Z",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "pid": 4242,
   "collectionHealth": {
     "processes": {"lastAttempt":null,"lastSuccess":null,"status":"unknown","error":null},

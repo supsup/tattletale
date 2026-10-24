@@ -121,7 +121,7 @@ def now():
 
 
 # ---- database ----
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 SCHEMA_VERSION = 1
 FORMAT_VERSION = 2
 CHECKS = ("processes", "listeners", "startup", "crontab")

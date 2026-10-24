@@ -36,7 +36,7 @@ import java.util.regex.Pattern;
 
 /** The watcher: python/tattletale.py's Watch class, check for check. */
 final class Watch {
-    static final String VERSION = "0.0.2";
+    static final String VERSION = "0.0.3";
     static final int SCHEMA_VERSION = 1;
     final CollectionHealth collectionHealth = new CollectionHealth();
     final PublicationHealth publicationHealth=new PublicationHealth();

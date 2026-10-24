@@ -4,7 +4,7 @@ Tattletale tells you what's going on behind your back on macOS: who asked for yo
 passwords, what opened a port, what new program ran, and what changed at login. Read-only,
 no dependencies, with a local dashboard.
 
-> **Beta, version 0.0.2.** It works and is tested on macOS, but expect rough edges and
+> **Beta, version 0.0.3.** It works and is tested on macOS, but expect rough edges and
 > changes to the data format.
 
 ## Two versions, one dashboard
@@ -140,7 +140,7 @@ The same flags work for both versions; replace `python3 python/tattletale.py` wi
 python3 python/tattletale.py                  # run the watcher (Ctrl-C to stop)
 python3 python/tattletale.py --report         # summary of what has been recorded
 python3 python/tattletale.py --show-settings  # every setting, its value and where it came from
-python3 python/tattletale.py --version        # prints the version (this is 0.0.2)
+python3 python/tattletale.py --version        # prints the version (this is 0.0.3)
 python3 python/tattletale.py --query "SELECT exe, signer FROM programs WHERE signer = 'adhoc'"
 ```
 
@@ -252,7 +252,7 @@ dispositions, with listed-child metadata denial explicitly injected; they do not
 platform exception text. Expected values, JSON scalar types and array order are checked
 before comparison. A pair agreeing on incorrect V3 observations or first-readable histories
 is refused. These are data observations, not
-counts of distinct executed tests. SQLite schema 1, generated-data format 2 and producer version 0.0.2 remain unchanged.
+counts of distinct executed tests. SQLite schema 1 and generated-data format 2 are unchanged from 0.0.2; only the producer version moves to 0.0.3.
 It retains failed outputs and refuses missing, stale, malformed or incomplete evidence.
 `tests/test_health_parity_gate.py` uses explicitly synthetic validation data and mocked
 producers; it is not a substitute for this actual two-producer gate.
@@ -264,6 +264,14 @@ Standalone fixture XML is not a Gradle `TEST-*.xml` task report; an outer native
 receipt supplies command/custody provenance. The gate is not a process supervisor or a
 live-watcher/release certification. Jar fixtures do not establish native-image or Intel
 hardware behavior.
+
+## Upgrading from 0.0.2
+
+Nothing moves and nothing is converted: 0.0.3 reads the same `data/` folder, SQLite schema 1
+and generated-data format 2. Stop the watcher, update the checkout, and start it again; the
+log's START line then names 0.0.3. What is new in 0.0.3 is collection health (see [The dashboard](#the-dashboard)): the page
+shows each collector's last attempt and last accepted success, and values kept after a failed
+check are labelled last-known.
 
 ## Upgrading from 0.0.1
 

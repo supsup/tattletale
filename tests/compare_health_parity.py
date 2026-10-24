@@ -350,7 +350,7 @@ def repair_results(rows, cases):
                 if payload is not None:
                     keys(payload, ('formatVersion', 'generatedAt', 'version', 'collectionHealth', 'publicationHealth', 'inventoryAsOf', 'map'), at + '.published')
                     require(type(payload['formatVersion']) is int and payload['formatVersion'] == 2 and
-                            type(payload['version']) is str and payload['version'] == '0.0.2' and
+                            type(payload['version']) is str and payload['version'] == '0.0.3' and
                             type(payload['generatedAt']) is str and utc_second(payload['generatedAt']), at + ': invalid published envelope')
                     health(payload['collectionHealth'], at + '.published')
                     publication_health(payload['publicationHealth'], payload['inventoryAsOf'], at + '.published')

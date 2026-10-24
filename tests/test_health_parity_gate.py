@@ -145,7 +145,7 @@ class ParityDataTests(unittest.TestCase):
 
     def test_selected_real_payload_fields_are_strict_and_not_replaced_by_a_success_boolean(self):
         value = copy.deepcopy(self.data); state = value['repairResults'][6]['states'][1]
-        state['published'] = {'formatVersion': 2, 'generatedAt': '2000-01-01T00:00:00Z', 'version': '0.0.2',
+        state['published'] = {'formatVersion': 2, 'generatedAt': '2000-01-01T00:00:00Z', 'version': '0.0.3',
                               'collectionHealth': copy.deepcopy(state['collectionHealth']),
                               'publicationHealth': copy.deepcopy(state['publicationHealth']),
                               'inventoryAsOf': None, 'map': copy.deepcopy(state['map'])}

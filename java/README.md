@@ -82,7 +82,7 @@ SIGINT and SIGTERM without exiting the JVM (see below).
     java -jar java/build/tattletale.jar --report
     java -jar java/build/tattletale.jar --query "SELECT exe, signer FROM programs WHERE signer LIKE 'unsigned%'"
     java -jar java/build/tattletale.jar --show-settings
-    java -jar java/build/tattletale.jar --version  # tattletale 0.0.2
+    java -jar java/build/tattletale.jar --version  # tattletale 0.0.3
 
 Every flag, environment variable and `tattletale.env` line is the Python version's (see
 `tattletale.env.example`). The precedence is the same: flag > `TATTLETALE_*` environment

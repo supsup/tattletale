@@ -31,7 +31,7 @@ java -jar java/build/tattletale.jar       # Java (or java/build/tattletale for t
 You will see something like:
 
 ```text
-2026-01-15T09:00:00Z  START     tattletale 0.0.2 pid 4242 db /path/to/tattletale/data/tattletale.db
+2026-01-15T09:00:00Z  START     tattletale 0.0.3 pid 4242 db /path/to/tattletale/data/tattletale.db
 2026-01-15T09:00:01Z  BASELINE  programs: 512 recorded
 2026-01-15T09:00:04Z  BASELINE  listeners: 18 recorded, 3 on all interfaces: ...
 2026-01-15T09:00:04Z  BASELINE  startup items: 14 recorded, copies in .../data/startup-snapshots
