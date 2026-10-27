@@ -1682,7 +1682,21 @@ HUD_MIN_INTERVAL = 2
 HUD_BASELINE = os.path.join(REPO, "tattletale.hud-baseline")
 HUD_ALERT_KINDS = ("LISTEN!", "CRED-NET", "CREDENTIAL", "UNSIGNED", "IDENTITY")
 HUD_KEEP_ALERTS = 1000   # alerts remembered since the HUD started (older ones are only counted)
-HUD_FETCH_LIMIT = 2000   # new alert-kind rows read per refresh; the rest arrive next refresh
+HUD_FETCH_LIMIT = 2000   # alert-kind rows read per page (id page and recovery page) per refresh
+HUD_HEALTH_STALE = 180   # seconds after which the health data file is labelled STALE
+# What the alert pane guarantees, and its limits:
+# - Every alert-kind row that arrives after the first READABLE frame is shown once, including
+#   rows that reuse low ids after retention empties the table (see hud_snapshot RECOVERY).
+#   Rows that arrive while the database is missing count as new; rows already present at the
+#   first readable frame, including any that arrived during earlier unreadable frames, do not.
+# - Recovery reads rows timed at or after the cursor row's time. A row written during a reset
+#   with an earlier timestamp (a wall clock stepped back) is not recovered.
+# - Dedup memory is bounded: the last HUD_KEEP_ALERTS shown rows. A reset can repeat a row only
+#   if more than that many rows were shown at or after the time recovery starts from.
+# - Paging is HUD_FETCH_LIMIT rows per refresh for each of the id and recovery pages; a backlog
+#   takes several refreshes, in order, without loss.
+# - Watcher liveness is a command-line name heuristic (is_tattletale on `ps -o command=`), not
+#   process identity: any live process whose command line looks like a watcher counts.
 _HUD_SIGNER = re.compile(r"\| signer: (.*?) team: ")
 
 
@@ -1813,18 +1827,28 @@ def hud_cursor_reset(cursor, cursor_row, max_id):
     return cursor_row is None or hud_fingerprint(cursor_row) != tuple(cursor)
 
 
-def hud_snapshot(db_path, cursor, pid_status=hud_pid_status):
-    """Everything one frame shows, read in one read-only transaction. `cursor` is the alert
-    pane's position, the fingerprint of the newest events row it has taken (None before the
-    first frame: then no alert rows are fetched). Normally the alert rows are those after the
-    cursor's id; if the table no longer continues past the cursor (hud_cursor_reset), they are
-    every alert-kind row timed at or after the cursor's time, and hud_render drops the ones
-    it has already shown."""
+def hud_snapshot(db_path, cursor, recovery=None, pid_status=hud_pid_status):
+    """Everything one frame shows, read in one read-only transaction.
+
+    `cursor` is the alert pane's id position: the fingerprint of the newest events row taken
+    (None before the first readable frame: then no alert rows are fetched). Ordinarily the
+    alert rows are those with id > cursor, in id order ("events").
+
+    If the table no longer continues past the cursor (hud_cursor_reset: ids reused after
+    retention), the HUD enters RECOVERY: {"since": cursor time, "ceiling": max id now,
+    "key": None}. The rows that existed at that moment (id <= ceiling) and are timed at or
+    after `since` are then read in (time, id) order, a page per frame, continuing strictly
+    after `key`, the (time, id) of the last row read ("recoveryRows"). The ordering and the
+    continuation use the same key, so a low-id row timed later than a full page is reached on
+    a later page, never skipped. Rows above the ceiling come through the ordinary id cursor,
+    which restarts at the ceiling row, in the same frames. Recovery ends with a page that is
+    not full; a further reset during recovery restarts it from the earlier `since`."""
     snap = {"db": os.path.abspath(db_path), "state": "ok", "error": None, "pid": None,
             "pidSource": None, "pidStatus": "dead", "startedAt": None, "stopped": False,
             "lastEventAt": None, "maxEventId": 0, "maxRow": None, "counts": [], "exposed": [],
             "newPrograms": [], "credentials": [], "health": None, "healthAt": None,
-            "errorsSinceStart": 0, "events": [], "reset": False, "limitHit": False}
+            "errorsSinceStart": 0, "events": [], "reset": False, "limitHit": False,
+            "recovery": None, "recoveryRows": [], "recoveryFull": False}
     pid_file = os.path.join(os.path.dirname(snap["db"]), "tattletale.pid")
     pid = _hud_pid_from_file(pid_file)
     if pid:
@@ -1869,16 +1893,30 @@ def hud_snapshot(db_path, cursor, pid_status=hud_pid_status):
             snap["maxRow"] = tuple(top_row) if top_row else None
             if cursor is not None:
                 marks = ",".join("?" * len(HUD_ALERT_KINDS))
+                cols = "SELECT id, time, kind, message FROM events WHERE kind IN (" + marks + ") AND "
                 at = one("SELECT id, time, kind, message FROM events WHERE id = ?", cursor[0])
                 snap["reset"] = hud_cursor_reset(cursor, tuple(at) if at else None, snap["maxEventId"])
                 if snap["reset"]:
-                    rows = conn.execute(
-                        f"SELECT id, time, kind, message FROM events WHERE time >= ? AND kind IN ({marks})"
-                        " ORDER BY time, id LIMIT ?", (cursor[1] or "",) + HUD_ALERT_KINDS + (HUD_FETCH_LIMIT,))
-                else:
-                    rows = conn.execute(
-                        f"SELECT id, time, kind, message FROM events WHERE id > ? AND kind IN ({marks})"
-                        " ORDER BY id LIMIT ?", (cursor[0],) + HUD_ALERT_KINDS + (HUD_FETCH_LIMIT,))
+                    since = cursor[1] or ""
+                    if recovery is not None:
+                        since = min(since, recovery["since"])
+                    recovery = {"since": since, "ceiling": snap["maxEventId"], "key": None}
+                if recovery is not None:
+                    snap["recovery"] = dict(recovery)
+                    if recovery["key"] is None:
+                        rows = conn.execute(cols + "id <= ? AND time >= ? ORDER BY time, id LIMIT ?",
+                                            HUD_ALERT_KINDS + (recovery["ceiling"], recovery["since"],
+                                                               HUD_FETCH_LIMIT))
+                    else:
+                        kt, kid = recovery["key"]
+                        rows = conn.execute(cols + "id <= ? AND (time > ? OR (time = ? AND id > ?))"
+                                            " ORDER BY time, id LIMIT ?",
+                                            HUD_ALERT_KINDS + (recovery["ceiling"], kt, kt, kid, HUD_FETCH_LIMIT))
+                    snap["recoveryRows"] = [tuple(r) for r in rows]
+                    snap["recoveryFull"] = len(snap["recoveryRows"]) >= HUD_FETCH_LIMIT
+                after = recovery["ceiling"] if snap["reset"] else cursor[0]
+                rows = conn.execute(cols + "id > ? ORDER BY id LIMIT ?",
+                                    HUD_ALERT_KINDS + (after, HUD_FETCH_LIMIT))
                 snap["events"] = [tuple(r) for r in rows]
                 snap["limitHit"] = len(snap["events"]) >= HUD_FETCH_LIMIT
         except sqlite3.Error as e:
@@ -1910,7 +1948,7 @@ def _hud_health(path):
 
 
 def hud_new_state():
-    return {"cursor": None, "alerts": (), "older": 0}
+    return {"cursor": None, "alerts": (), "older": 0, "recovery": None}
 
 
 _HUD_HIDDEN_CATEGORIES = ("Cc", "Cf", "Zl", "Zp", "Cs")
@@ -1988,18 +2026,27 @@ def hud_render(snap, state, size, now_dt, baseline=(), interval=HUD_DEFAULT_INTE
         # Already-shown rows are known by fingerprint, so a reset (ids reused after retention)
         # neither repeats them nor hides a new row that took a low id.
         shown = {hud_fingerprint(a) for a in alerts}
+
+        def take(row):
+            fp = hud_fingerprint(row)
+            if fp not in shown and hud_is_alert(row[2], row[3]):
+                shown.add(fp)
+                alerts.append(tuple(row))
+        # Recovery first: its rows existed before any row the id cursor reads this frame.
+        recovery = snap["recovery"]
+        for row in snap["recoveryRows"]:
+            take(row)
+        if recovery is not None and snap["recoveryFull"]:
+            last = snap["recoveryRows"][-1]
+            state["recovery"] = dict(recovery, key=(last[1], last[0]))   # next page after (time, id)
+        else:
+            state["recovery"] = None                                     # drained (or never needed)
         last = None
         for row in snap["events"]:
-            fp = hud_fingerprint(row)
-            last = fp
-            if not snap["reset"] and row[0] <= state["cursor"][0]:
-                continue
-            if fp in shown or not hud_is_alert(row[2], row[3]):
-                continue
-            shown.add(fp)
-            alerts.append(tuple(row))
+            last = row
+            take(row)
         if snap["limitHit"] and last is not None:
-            state["cursor"] = last          # more rows wait; continue from the last one read
+            state["cursor"] = hud_fingerprint(last)   # more rows wait; continue after this id
         elif snap["maxRow"] is not None:
             state["cursor"] = hud_fingerprint(snap["maxRow"])
         else:
@@ -2049,16 +2096,25 @@ def hud_render(snap, state, size, now_dt, baseline=(), interval=HUD_DEFAULT_INTE
         rows = [f"  {_hud_short(t, now_dt)}  {tag(f'{e} {ch}')}{src}  {e}  <- {ch}"
                 for t, src, e, ch in snap["credentials"]] or ["  none"]
         sections.append(["recent credential events:"] + rows)
+    # Health comes from the page data file, rewritten about once a minute by a running watcher;
+    # it can be old or left by a watcher that has stopped, so its age is always shown and it
+    # is called stale after HUD_HEALTH_STALE seconds (the dashboard's Live/Stale threshold).
     health = snap["health"]
+    hat = _hud_parse_time(snap["healthAt"])
+    if hat is None:
+        as_of = " (data file time unknown: may be stale)"
+    else:
+        age = (now_dt - hat).total_seconds()
+        as_of = f" (as of {_hud_short(snap['healthAt'], now_dt)}" + (", STALE)" if age > HUD_HEALTH_STALE else ")")
     bad = sorted(k for k, v in (health or {}).items() if v.get("status") == "degraded")
     if bad or snap["errorsSinceStart"]:
         parts = [f"{k} degraded ({health[k].get('error') or '?'})" for k in bad]
         if snap["errorsSinceStart"]:
             parts.append(f"{snap['errorsSinceStart']} collector error/degraded line(s) since start")
-        sections.append(["collection health: " + "; ".join(parts)])
+        sections.append(["collection health: " + "; ".join(parts) + (as_of if health else "")])
     elif health:
         unknown = sorted(k for k, v in health.items() if v.get("status") != "ok")
-        sections.append(["collection health: " + ("all ok" if not unknown else "unknown: " + ", ".join(unknown))])
+        sections.append(["collection health: " + ("all ok" if not unknown else "unknown: " + ", ".join(unknown)) + as_of])
 
     # The alert pane gets what is left, but always at least a header and three rows; middle
     # sections give way (whole rows from their ends) on a short terminal.
@@ -2108,7 +2164,7 @@ def hud_main(db_path, interval, baseline_path, out=None, sleep=time.sleep, clock
         if tty:
             out.write("\x1b[?25l")
         while True:
-            snap = hud_snapshot(db_path, state["cursor"])
+            snap = hud_snapshot(db_path, state["cursor"], state["recovery"])
             size = shutil.get_terminal_size((80, 24))
             lines, state = hud_render(snap, state, (size.columns, size.lines), clock(), baseline, interval)
             out.write(("\x1b[H\x1b[2J" if tty else "") + "\n".join(lines) + ("" if tty else "\n\n"))

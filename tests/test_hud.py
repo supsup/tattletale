@@ -58,7 +58,7 @@ class HudTests(unittest.TestCase):
                       present, '2000-01-01T11:00:00Z', '2000-01-01T11:00:00Z'))
 
     def frame(self, state, size=(100, 40), baseline=()):
-        snap = TT.hud_snapshot(self.db, state['cursor'], pid_status=DEAD)
+        snap = TT.hud_snapshot(self.db, state['cursor'], state['recovery'], pid_status=DEAD)
         return TT.hud_render(snap, state, size, NOW, baseline)
 
     @staticmethod
@@ -267,7 +267,7 @@ class HudTests(unittest.TestCase):
             self.event(w.db, '2000-01-01T10:00:00Z', kind, f'{tag} {i}')
 
     def snap_frame(self, state):
-        snap = TT.hud_snapshot(self.db, state['cursor'], pid_status=DEAD)
+        snap = TT.hud_snapshot(self.db, state['cursor'], state['recovery'], pid_status=DEAD)
         lines, state = TT.hud_render(snap, state, (120, 60), NOW)
         return snap, self.pane(lines), state
 
@@ -330,6 +330,43 @@ class HudTests(unittest.TestCase):
             self.assertLess(pane.index(next(l for l in pane if 'low-id' in l)),
                             pane.index(next(l for l in pane if 'high-id' in l)))
 
+    def test_reset_recovery_pages_in_time_order_without_skipping_low_id(self):
+        # Lattice 80 (HUD-H2): after a reset the producer can insert out of time order. A low-id
+        # alert timed AFTER a full page of higher-id rows must still be delivered, exactly once.
+        w = self.watcher(retention_days=1)
+        self.fill_old(w, 97)
+        _, _, state = self.snap_frame(TT.hud_new_state())
+        self.event(w.db, '2000-01-01T10:00:01Z', 'CREDENTIAL', 'pid 61 shown-before-retention-1')
+        self.event(w.db, '2000-01-01T10:00:02Z', 'CRED-NET', 'pid 62 shown-before-retention-2')
+        self.event(w.db, '2000-01-01T10:00:03Z', 'NOTE', 'old newest row')          # cursor 100, T0
+        _, pane1, state = self.snap_frame(state)
+        self.assertEqual(state['cursor'][:2], (100, '2000-01-01T10:00:03Z'))
+        self.quiet(w.retain)
+        self.assertEqual(w.db.execute('SELECT id, kind FROM events').fetchall(), [(1, 'RETENTION')])
+        T2, T3 = '2000-01-02T00:00:00Z', '2000-01-03T00:00:00Z'
+        self.event(w.db, T3, 'CREDENTIAL', 'pid 90 low-id-late-time')                 # id 2 at T3
+        page = TT.HUD_FETCH_LIMIT
+        for i in range(page):                                                         # ids 3..2002 at T2
+            self.event(w.db, T2, 'CRED-NET', f'bulk {i}')
+        self.assertEqual(w.db.execute('SELECT max(id) FROM events').fetchone()[0], page + 2)
+        with mock.patch.object(TT, 'HUD_KEEP_ALERTS', 100000):   # remember all, to check each one
+            snap, _, state = self.snap_frame(state)
+            self.assertTrue(snap['reset'])
+            self.assertTrue(snap['recoveryFull'])
+            self.event(w.db, T3, 'UNSIGNED', '/fixture/during-recovery ran with no named signer (adhoc)')
+            _, _, state = self.snap_frame(state)
+            _, _, state = self.snap_frame(state)
+            self.assertIsNone(state['recovery'])
+            delivered = [a[0] for a in state['alerts']]
+            _, _, again = self.snap_frame(state)
+        self.assertEqual(delivered, [98, 99] + list(range(3, page + 3)) + [2, page + 3])
+        prints = [TT.hud_fingerprint(a) for a in state['alerts']]
+        self.assertEqual(len(prints), len(set(prints)))      # ids 98 and 99 are reused: compare rows
+        self.assertEqual(sum(a[3].startswith('bulk ') for a in state['alerts']), page)
+        self.assertEqual([a[0] for a in again['alerts']], delivered)                  # nothing repeats
+        self.assertEqual(again['older'], 0)
+        self.assertIn('low-id-late-time', next(a for a in state['alerts'] if a[0] == 2)[3])
+
     def test_healthy_twin_without_retention(self):
         w = self.watcher(retention_days=0)                                     # 0 keeps events forever
         self.fill_old(w, 97)
@@ -373,6 +410,34 @@ class HudTests(unittest.TestCase):
                 self.assertNotIn(ch, line)
         self.assertIn('mix ' + 'x'.join('?' * len(hidden)) + ' end', pane[1])
         self.assertIn('caf\u00e9 \u0645\u0631\u062d\u0628\u0627 \u5bbd', pane[1])   # ordinary letters kept
+
+    def test_initial_unreadable_frame_marks_the_start(self):
+        pathlib.Path(self.db).write_bytes(b'not a database, ' * 64)
+        lines, state = self.frame(TT.hud_new_state(), size=(300, 40))
+        self.assertTrue(any(l.startswith('database unreadable: ') for l in lines), lines)
+        self.assertIsNone(state['cursor'])
+        os.unlink(self.db)
+        conn = self.make_db()
+        self.event(conn, '2000-01-01T11:00:00Z', 'UNSIGNED', '/fixture/during-unreadable ran (adhoc)')
+        lines, state = self.frame(state)               # first readable frame: the start mark
+        self.assertEqual(self.pane(lines), [])
+        self.event(conn, '2000-01-01T11:00:01Z', 'UNSIGNED', '/fixture/after-start ran (adhoc)')
+        lines, state = self.frame(state)
+        self.assertEqual(len(self.pane(lines)), 1)
+        self.assertIn('/fixture/after-start', self.pane(lines)[0])
+
+    def test_health_sidecar_age_and_stale(self):
+        self.make_db()
+        def health_line(generated):
+            body = {'generatedAt': generated, 'collectionHealth': {
+                k: {'status': 'ok', 'error': None, 'lastAttempt': None, 'lastSuccess': None}
+                for k in ('processes', 'listeners', 'startup', 'crontab')}}
+            (self.dir / 'tattletale-data.js').write_text('window.TATTLETALE = ' + TT.json.dumps(body) + ';\n')
+            lines, _ = self.frame(TT.hud_new_state())
+            return next(l for l in lines if l.startswith('collection health:'))
+        self.assertEqual(health_line('2000-01-01T11:59:00Z'), 'collection health: all ok (as of 11:59:00)')
+        self.assertEqual(health_line('2000-01-01T11:50:00Z'), 'collection health: all ok (as of 11:50:00, STALE)')
+        self.assertIn('time unknown: may be stale', health_line(None))
 
     def test_baseline_file_format(self):
         path = self.dir / 'b'

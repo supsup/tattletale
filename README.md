@@ -160,8 +160,8 @@ version, or with no watcher at all ("watcher not running"). A missing database i
 and checked again on every redraw.
 
 The top lines show whether the watcher's pid (from `data/tattletale.pid`, else the latest
-`START` line) is alive and still a Tattletale watcher (its command line, read with `ps`; a
-reused pid shows as "alive but not tattletale"), its uptime, the time of the last event and
+`START` line) is alive and its command line, read with `ps`, looks like a Tattletale watcher
+(a reused pid shows as "alive but not tattletale"), its uptime, the time of the last event and
 the redraw interval.
 Below come event counts by kind since the last start, listeners currently bound to all
 interfaces, the last few new programs and credential events, and collection health when a
@@ -172,6 +172,22 @@ when the terminal is too short. Each row is tracked by its content as well as it
 alert is neither missed nor repeated when retention empties the table and SQLite reuses
 event ids. Lines are cut to the terminal width, never wrapped; control, bidi and zero-width
 characters in command lines are shown as `?`.
+
+Limits, stated exactly:
+
+- "New" starts at the first frame that can read the database. Alerts already in it then,
+  including any that arrived while it was unreadable, are not shown; if the database does not
+  exist yet, everything it later records is new.
+- After an id reset, rows are recovered from the time of the last row the HUD had read. A row
+  written meanwhile with an earlier timestamp (the clock stepped back) is not recovered.
+- At most 2000 rows are read per page per redraw, so a large backlog takes several redraws,
+  in order. The last 1000 shown rows are remembered to prevent repeats; a reset can repeat a
+  row only if more than 1000 rows were shown at or after the time it recovers from.
+- Collection health is read from `data/tattletale-data.js`, which a running watcher rewrites
+  about once a minute. The HUD shows its time and calls it STALE after 180 seconds; a stopped
+  watcher leaves its last health behind.
+- "Running" is a command-line name check (`tattletale.py`, the jar or the native binary),
+  not proof of process identity.
 
 To make surprises stand out, copy
 [`tattletale.hud-baseline.example`](tattletale.hud-baseline.example) to
