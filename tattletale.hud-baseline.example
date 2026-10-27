@@ -1,0 +1,19 @@
+# Tattletale HUD baseline: rows you already know are benign, labelled "known" in the HUD.
+# Copy to tattletale.hud-baseline at the repository root (git-ignored), or pass
+# --hud-baseline PATH. Only the HUD reads it; the watchers ignore it and nothing is hidden.
+#
+# One pattern per line, matched against the text of a row (for an alert: "KIND message"):
+#   plain text      a case-sensitive substring
+#   re:REGEX        a Python regular expression, searched anywhere in the row
+# Blank lines and lines starting with # are ignored. Leading and trailing spaces are trimmed.
+#
+# These entries are generic examples; replace them with what you see on your own machine.
+
+# A test runner's JVM that listens on all interfaces while tests run.
+re:^LISTEN! EXPOSED on all interfaces java pid \d+
+
+# Your own git asking the macOS keychain for a credential.
+git-credential-osxkeychain
+
+# Programs signed by Apple.
+re:\| signer: Software Signing team:

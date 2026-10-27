@@ -35,6 +35,7 @@ Usage:
   python3 tattletale.py --log ~/tattletale.log --db ~/tattletale.db
   python3 tattletale.py --report           # summary of the database
   python3 tattletale.py --query "SELECT exe, signer FROM programs WHERE signer LIKE 'unsigned%'"
+  python3 tattletale.py --hud              # read-only terminal view, redrawn every 10 s
 
 Read-only: it runs ps, lsof, log and crontab -l, reads files, and writes only its log, its
 database, its page data file and its startup copies.
@@ -60,6 +61,7 @@ import tempfile
 import threading
 import ctypes
 import time
+import unicodedata
 import urllib.parse
 import ipaddress
 
@@ -1671,6 +1673,386 @@ def run_query(db_path, sql):
         sys.exit(f"tattletale: query failed: {e}")
 
 
+# ---- HUD: a read-only terminal view of the database (--hud). Python only. ----
+# A reader, never a producer: it opens the database with mode=ro and query_only, never claims
+# tattletale.pid, writes nothing, and works with the watcher absent or the database missing.
+# Rendering is a pure function of (snapshot, alert state, terminal size, now) returning lines.
+HUD_DEFAULT_INTERVAL = 10
+HUD_MIN_INTERVAL = 2
+HUD_BASELINE = os.path.join(REPO, "tattletale.hud-baseline")
+HUD_ALERT_KINDS = ("LISTEN!", "CRED-NET", "CREDENTIAL", "UNSIGNED", "IDENTITY")
+HUD_KEEP_ALERTS = 1000   # alerts remembered since the HUD started (older ones are only counted)
+HUD_FETCH_LIMIT = 2000   # new alert-kind rows read per refresh; the rest arrive next refresh
+_HUD_SIGNER = re.compile(r"\| signer: (.*?) team: ")
+
+
+def hud_interval(raw):
+    """--hud-interval: seconds between redraws, at least HUD_MIN_INTERVAL."""
+    try:
+        value = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number of seconds, got {raw!r}") from None
+    if not value == value or value in (float("inf"), float("-inf")) or value < HUD_MIN_INTERVAL:
+        raise argparse.ArgumentTypeError(f"must be at least {HUD_MIN_INTERVAL} seconds, got {raw!r}")
+    return value
+
+
+def hud_connect(path):
+    """The HUD's only connection: a read-only URI plus query_only, or None if there is no file.
+    Never creates the database (open_db would)."""
+    return open_db_readonly(path)
+
+
+def hud_load_baseline(path):
+    """Known-benign patterns, one per line: `# comment`, blank lines, `re:REGEX` (Python
+    regular expression, searched) or a plain substring (case-sensitive). A missing file is no
+    baseline; an unreadable file or a bad regex is refused with a message."""
+    patterns = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return patterns
+    except (OSError, UnicodeDecodeError) as e:
+        sys.exit(f"tattletale: cannot read HUD baseline {path}: {e}")
+    for n, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("re:"):
+            try:
+                patterns.append(("re", re.compile(line[3:])))
+            except re.error as e:
+                sys.exit(f"tattletale: {path}:{n}: bad regular expression: {e}")
+        else:
+            patterns.append(("sub", line))
+    return patterns
+
+
+def hud_known(baseline, text):
+    for how, p in baseline:
+        if (p in text) if how == "sub" else p.search(text):
+            return True
+    return False
+
+
+def hud_signer_unknown(message):
+    """An IDENTITY line whose signer is unknown or unavailable. Unsigned and ad-hoc programs are
+    left to their own UNSIGNED line, which the watcher writes for exactly those."""
+    m = _HUD_SIGNER.search(message or "")
+    signer = m.group(1).strip() if m else ""
+    if signer.startswith("unsigned") or signer == "adhoc":
+        return False
+    return signer in ("", "None", "signed, no authority") or signer.startswith(("unknown", "unavailable", "failed"))
+
+
+def hud_is_alert(kind, message):
+    if kind not in HUD_ALERT_KINDS:
+        return False
+    return kind != "IDENTITY" or hud_signer_unknown(message)
+
+
+def _hud_pid_from_file(path):
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return None
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as f:
+            raw = f.read(64)
+        return checked_pid(raw.decode("ascii").strip(ASCII_WS), "ps-parse")
+    except (OSError, ValueError):
+        return None
+
+
+def hud_pid_alive(pid):
+    """os.kill(pid, 0) semantics: no such process is dead; a permission refusal is alive."""
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def hud_snapshot(db_path, cursor, alive=hud_pid_alive):
+    """Everything one frame shows, read in one read-only transaction. `cursor` is the last event
+    id the alert pane has taken (None before the first frame: then no rows are fetched)."""
+    snap = {"db": os.path.abspath(db_path), "state": "ok", "error": None, "pid": None,
+            "pidSource": None, "alive": False, "startedAt": None, "stopped": False,
+            "lastEventAt": None, "maxEventId": 0, "counts": [], "exposed": [], "newPrograms": [],
+            "credentials": [], "health": None, "healthAt": None, "errorsSinceStart": 0,
+            "events": []}
+    pid_file = os.path.join(os.path.dirname(snap["db"]), "tattletale.pid")
+    pid = _hud_pid_from_file(pid_file)
+    if pid:
+        snap["pid"], snap["pidSource"] = pid, "pid file"
+    snap["health"], snap["healthAt"] = _hud_health(os.path.join(os.path.dirname(snap["db"]), "tattletale-data.js"))
+    try:
+        conn = hud_connect(db_path)
+    except sqlite3.Error as e:
+        snap.update(state="error", error=str(e))
+        conn = None
+    if conn is None:
+        if snap["state"] == "ok":
+            snap["state"] = "missing"
+    else:
+        try:
+            conn.execute("BEGIN")
+            one = lambda sql, *a: conn.execute(sql, a).fetchone()
+            start = one("SELECT id, time, message FROM events WHERE kind = 'START' ORDER BY id DESC LIMIT 1")
+            start_id = start[0] if start else 0
+            if start:
+                snap["startedAt"] = start[1]
+                m = re.search(r"\bpid (\d+)\b", start[2] or "")
+                if m and not snap["pid"]:
+                    snap["pid"], snap["pidSource"] = int(m.group(1)), "START event"
+                snap["stopped"] = one("SELECT 1 FROM events WHERE kind = 'STOP' AND id > ? LIMIT 1",
+                                      start_id) is not None
+            last = one("SELECT max(id), max(time) FROM events")
+            snap["maxEventId"], snap["lastEventAt"] = last[0] or 0, last[1]
+            snap["counts"] = [tuple(r) for r in conn.execute(
+                "SELECT kind, count(*) FROM events WHERE id >= ? GROUP BY kind ORDER BY count(*) DESC, kind",
+                (start_id,))]
+            snap["errorsSinceStart"] = one("SELECT count(*) FROM events WHERE id >= ? AND (kind = 'ERROR'"
+                                           " OR (kind = 'NOTE' AND message LIKE '%collection degraded%'))",
+                                           start_id)[0]
+            snap["exposed"] = [tuple(r) for r in conn.execute(
+                "SELECT key, pid, command FROM listeners WHERE present = 1 AND exposed = 1 ORDER BY key")]
+            snap["newPrograms"] = [tuple(r) for r in conn.execute(
+                "SELECT time, message FROM events WHERE kind = 'NEW-PROG' ORDER BY id DESC LIMIT 5")]
+            snap["credentials"] = [tuple(r) for r in conn.execute(
+                "SELECT time, source, exe, chain FROM credential_events ORDER BY id DESC LIMIT 5")]
+            if cursor is not None:
+                marks = ",".join("?" * len(HUD_ALERT_KINDS))
+                snap["events"] = [tuple(r) for r in conn.execute(
+                    f"SELECT id, time, kind, message FROM events WHERE id > ? AND kind IN ({marks})"
+                    " ORDER BY id LIMIT ?", (cursor,) + HUD_ALERT_KINDS + (HUD_FETCH_LIMIT,))]
+        except sqlite3.Error as e:
+            snap.update(state="error", error=str(e))
+        finally:
+            conn.close()
+    snap["alive"] = alive(snap["pid"]) if snap["pid"] else False
+    return snap
+
+
+def _hud_health(path):
+    """Collection health from the page data file the watcher writes beside the database
+    (0.0.3 keeps it there, not in SQLite). Read only; any problem means no health shown."""
+    try:
+        if os.path.getsize(path) > 64 * 1024 * 1024:
+            return None, None
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        prefix = "window.TATTLETALE = "
+        if not text.startswith(prefix):
+            return None, None
+        data = json.loads(text[len(prefix):].rstrip().rstrip(";"))
+        health = data.get("collectionHealth")
+        if not isinstance(health, dict):
+            return None, data.get("generatedAt")
+        return {k: dict(v) for k, v in health.items() if isinstance(v, dict)}, data.get("generatedAt")
+    except (OSError, ValueError, AttributeError):
+        return None, None
+
+
+def hud_new_state():
+    return {"cursor": None, "alerts": (), "older": 0}
+
+
+def _hud_clean(text):
+    """One display line: control characters (including escape sequences in command lines that
+    could move the cursor or recolour the terminal) become '?'; only the first line is kept."""
+    text = "" if text is None else str(text)
+    text = text.split("\n", 1)[0]
+    return "".join("?" if (ord(c) < 32 or 127 <= ord(c) < 160 or c in "  ") else c for c in text)
+
+
+def _hud_width(c):
+    if unicodedata.combining(c):
+        return 0
+    return 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+
+
+def hud_fit(text, width):
+    """Clean `text` and cut it to `width` terminal columns, never wrapping."""
+    text = _hud_clean(text)
+    if width <= 0:
+        return ""
+    if sum(_hud_width(c) for c in text) <= width:
+        return text
+    out, used = [], 0
+    for c in text:
+        w = _hud_width(c)
+        if used + w > width - 1:
+            break
+        out.append(c)
+        used += w
+    return "".join(out) + "…"
+
+
+def _hud_parse_time(value):
+    try:
+        return dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _hud_short(value, now_dt):
+    t = _hud_parse_time(value)
+    if t is None:
+        return "?" if not value else str(value)
+    return t.strftime("%H:%M:%S") if t.date() == now_dt.date() else t.strftime("%m-%d %H:%M")
+
+
+def _hud_age(seconds):
+    seconds = max(0, int(seconds))
+    d, rest = divmod(seconds, 86400)
+    h, rest = divmod(rest, 3600)
+    m, s = divmod(rest, 60)
+    return (f"{d}d " if d else "") + f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def hud_render(snap, state, size, now_dt, baseline=(), interval=HUD_DEFAULT_INTERVAL):
+    """Pure: the frame's lines and the next alert state. No I/O, no clock, no terminal."""
+    width, height = max(1, size[0]), max(1, size[1])
+    state = dict(state)
+    alerts, older = list(state["alerts"]), state["older"]
+    if state["cursor"] is None:
+        # The first frame after the HUD starts marks where "new" begins. A database that appears
+        # later is new in its entirety.
+        if snap["state"] == "ok":
+            state["cursor"] = snap["maxEventId"]
+        elif snap["state"] == "missing":
+            state["cursor"] = 0
+    else:
+        for eid, t, kind, message in snap["events"]:
+            if eid <= state["cursor"]:
+                continue
+            state["cursor"] = eid
+            if hud_is_alert(kind, message):
+                alerts.append((eid, t, kind, message))
+        if len(alerts) > HUD_KEEP_ALERTS:
+            older += len(alerts) - HUD_KEEP_ALERTS
+            alerts = alerts[-HUD_KEEP_ALERTS:]
+    state["alerts"], state["older"] = tuple(alerts), older
+    known = lambda text: hud_known(baseline, text)
+    tag = lambda text: "known " if baseline and known(text) else ""
+
+    top = [f"TATTLETALE HUD {__version__}  read-only  every {interval:g}s  {now_dt.strftime('%Y-%m-%d %H:%M:%SZ')}"]
+    stopped = snap["stopped"] and snap["pidSource"] == "START event"
+    if snap["pid"] and snap["alive"] and not stopped:
+        up = _hud_parse_time(snap["startedAt"])
+        uptime = _hud_age((now_dt - up).total_seconds()) if up else "?"
+        top.append(f"watcher: running pid {snap['pid']} ({snap['pidSource']})  up {uptime}")
+    elif stopped:
+        top.append(f"watcher not running (stopped after its START, pid {snap['pid']})")
+    elif snap["pid"]:
+        top.append(f"watcher not running (pid {snap['pid']} from {snap['pidSource']} is gone)")
+    else:
+        top.append("watcher not running (no pid file or START event)")
+    if snap["state"] == "missing":
+        top.append(f"no database at {snap['db']} (waiting)")
+    elif snap["state"] == "error":
+        top.append(f"database unreadable: {snap['error']} (retrying)")
+    else:
+        last = snap["lastEventAt"]
+        lt = _hud_parse_time(last)
+        ago = f" ({_hud_age((now_dt - lt).total_seconds())} ago)" if lt else ""
+        top.append(f"last event: {last or 'none'}{ago}  db {snap['db']}")
+
+    sections = []
+    if snap["state"] == "ok":
+        counts = "  ".join(f"{k} {n}" for k, n in snap["counts"]) or "none"
+        sections.append([f"events since {'last start' if snap['startedAt'] else 'the beginning'}: {counts}"])
+        rows = [f"  {tag(f'{k} {c}')}{k}  pid {p}  {c}" for k, p, c in snap["exposed"]] or ["  none"]
+        sections.append([f"exposed on all interfaces ({len(snap['exposed'])}):"] + rows)
+        rows = [f"  {_hud_short(t, now_dt)}  {tag(m)}{m.split(' | ', 1)[0]}" for t, m in snap["newPrograms"]] or ["  none"]
+        sections.append(["recent new programs:"] + rows)
+        rows = [f"  {_hud_short(t, now_dt)}  {tag(f'{e} {ch}')}{src}  {e}  <- {ch}"
+                for t, src, e, ch in snap["credentials"]] or ["  none"]
+        sections.append(["recent credential events:"] + rows)
+    health = snap["health"]
+    bad = sorted(k for k, v in (health or {}).items() if v.get("status") == "degraded")
+    if bad or snap["errorsSinceStart"]:
+        parts = [f"{k} degraded ({health[k].get('error') or '?'})" for k in bad]
+        if snap["errorsSinceStart"]:
+            parts.append(f"{snap['errorsSinceStart']} collector error/degraded line(s) since start")
+        sections.append(["collection health: " + "; ".join(parts)])
+    elif health:
+        unknown = sorted(k for k, v in health.items() if v.get("status") != "ok")
+        sections.append(["collection health: " + ("all ok" if not unknown else "unknown: " + ", ".join(unknown))])
+
+    # The alert pane gets what is left, but always at least a header and three rows; middle
+    # sections give way (whole rows from their ends) on a short terminal.
+    pane_min = 4
+    middle = []
+    budget = height - len(top) - pane_min
+    for sec in sections:
+        if budget <= 0:
+            break
+        take = sec[:budget]
+        middle.extend(take)
+        budget -= len(take)
+    top = top[:max(1, height - pane_min)] if height > pane_min else top[:1]
+    room = height - len(top) - len(middle) - 1
+    total = older + len(alerts)
+    if total <= room:
+        shown = alerts
+    else:
+        keep = max(0, room - 1)   # one row says how many are not shown
+        shown = alerts[-keep:] if keep else []
+    hidden = total - len(shown)
+    pane = [f"ALERTS since HUD start ({older + len(alerts)})" + ("" if alerts else ": none yet")]
+    if hidden:
+        pane.append(f"  ({hidden} older not shown)")
+    for eid, t, kind, message in shown:
+        line = f"{kind} {message}"
+        pane.append(f"{'known' if baseline and known(line) else 'ALERT'} {_hud_short(t, now_dt)} {kind:<10} {message}")
+    lines = top + middle + pane
+    return [hud_fit(l, width) for l in lines[:height]], state
+
+
+def hud_main(db_path, interval, baseline_path, out=None, sleep=time.sleep, clock=None, frames=None):
+    """Clear-and-redraw every `interval` seconds until Ctrl-C (or SIGTERM); the cursor is
+    hidden while drawing and always shown again on exit. `frames` stops after that many."""
+    out = out or sys.stdout
+    clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
+    baseline = hud_load_baseline(baseline_path)
+    tty = out.isatty()
+    state = hud_new_state()
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def stop(*_):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, stop)
+    drawn = 0
+    try:
+        if tty:
+            out.write("\x1b[?25l")
+        while True:
+            snap = hud_snapshot(db_path, state["cursor"])
+            size = shutil.get_terminal_size((80, 24))
+            lines, state = hud_render(snap, state, (size.columns, size.lines), clock(), baseline, interval)
+            out.write(("\x1b[H\x1b[2J" if tty else "") + "\n".join(lines) + ("" if tty else "\n\n"))
+            out.flush()
+            drawn += 1
+            if frames is not None and drawn >= frames:
+                break
+            sleep(interval)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if tty:
+            out.write("\x1b[?25h\n")
+            out.flush()
+        signal.signal(signal.SIGTERM, previous)
+
+
 # Files v0.0.1 kept next to tattletale.py, which was then the repo root.
 V001_FILES = ("tattletale.db", "tattletale.db-wal", "tattletale.db-shm", "tattletale-data.js",
               "tattletale.stdout", "tattletale-map.json", "startup-snapshots")
@@ -1722,6 +2104,13 @@ def main():
     ap.add_argument("--report", action="store_true", help="print a summary of the database and exit")
     ap.add_argument("--query", metavar="SQL", help="run one read-only SELECT against the database, print tab-separated rows, and exit")
     ap.add_argument("--show-settings", action="store_true", help="print the effective settings and where each came from, then exit")
+    # HUD flags are Python-only command-line flags, not settings: they are not read from the
+    # environment or tattletale.env, which the Java version shares and would refuse.
+    ap.add_argument("--hud", action="store_true", help="read-only terminal view of the database, redrawn until Ctrl-C (Python only)")
+    ap.add_argument("--hud-interval", metavar="N", type=hud_interval, default=HUD_DEFAULT_INTERVAL,
+                    help=f"seconds between HUD redraws (default {HUD_DEFAULT_INTERVAL}, minimum {HUD_MIN_INTERVAL})")
+    ap.add_argument("--hud-baseline", metavar="PATH", default=None,
+                    help="known-benign patterns for the HUD (default: tattletale.hud-baseline at the repository root)")
     for name, (kind, default, help_text) in SETTINGS.items():
         flag = "--" + name.replace("_", "-")
         if kind is bool:
@@ -1743,6 +2132,9 @@ def main():
         return
     if a.query is not None:
         run_query(eff["db"], a.query)
+        return
+    if a.hud:
+        hud_main(eff["db"], a.hud_interval, os.path.expanduser(a.hud_baseline or HUD_BASELINE))
         return
     if src["db"] == "default":
         moved = migrate_v001(os.path.dirname(eff["db"]))

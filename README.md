@@ -146,6 +146,39 @@ python3 python/tattletale.py --query "SELECT exe, signer FROM programs WHERE sig
 
 `--query` opens the database read-only and accepts a single `SELECT` or `WITH` statement.
 
+## Terminal HUD (Python only)
+
+```sh
+python3 python/tattletale.py --hud                    # redraws every 10 s; Ctrl-C to quit
+python3 python/tattletale.py --hud --hud-interval 5   # any interval of 2 seconds or more
+```
+
+`--hud` is a live terminal view of the same database, for a terminal tab beside the
+watcher. It is **read-only**: it opens the database with a read-only SQLite URI, writes
+nothing, and never takes the watcher's `data/tattletale.pid`, so it runs alongside either
+version, or with no watcher at all ("watcher not running"). A missing database is shown
+and checked again on every redraw.
+
+The top lines show whether the watcher's pid (from `data/tattletale.pid`, else the latest
+`START` line) is alive, its uptime, the time of the last event and the redraw interval.
+Below come event counts by kind since the last start, listeners currently bound to all
+interfaces, the last few new programs and credential events, and collection health when a
+check is degraded. At the bottom, the **ALERTS** pane lists `LISTEN!`, `CRED-NET`,
+`CREDENTIAL`, `UNSIGNED` lines, and `IDENTITY` lines whose signer is unknown, that
+arrived after the HUD started: each once, newest at the bottom, with a count of older ones
+when the terminal is too short. Lines are cut to the terminal width, never wrapped.
+
+To make surprises stand out, copy
+[`tattletale.hud-baseline.example`](tattletale.hud-baseline.example) to
+`tattletale.hud-baseline` at the repository root (git-ignored), or pass
+`--hud-baseline PATH`. Each line is a substring, or `re:` and a regular expression;
+matching rows are labelled `known` instead of `ALERT`. Nothing is hidden.
+
+The HUD flags are Python-only command-line flags, not settings: they are not read from the
+environment or `tattletale.env`. The Java version has no HUD; point the Python HUD at the
+same `data/` folder. Its checks run against a synthetic database in a temp folder:
+`python3 -I tests/test_hud.py`.
+
 ## Settings
 
 Each setting has one name, usable three ways. Highest priority first:
