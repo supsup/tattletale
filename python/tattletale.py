@@ -1764,29 +1764,67 @@ def _hud_pid_from_file(path):
         return None
 
 
-def hud_pid_alive(pid):
-    """os.kill(pid, 0) semantics: no such process is dead; a permission refusal is alive."""
+def hud_pid_status(pid):
+    """"tattletale", "other" (alive, but the pid now belongs to another program), "dead" or
+    "unknown". Liveness has os.kill(pid, 0) semantics (a permission refusal is alive); a live
+    pid is then confirmed by its command line from `ps -o command= -p PID`, judged by the
+    same is_tattletale() the watchers use (Python script, Java jar or native binary)."""
     if not pid:
-        return False
+        return "dead"
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        return False
+        return "dead"
     except PermissionError:
-        return True
+        pass
     except OSError:
+        return "dead"
+    try:
+        r = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    out = r.stdout.decode("utf-8", "replace").strip(ASCII_WS)
+    if r.returncode == 1 and not out:
+        return "dead"   # exited between the two checks
+    if r.returncode != 0 or not out or "\n" in out:
+        return "unknown"
+    return "tattletale" if is_tattletale(out) else "other"
+
+
+def hud_fingerprint(row):
+    """(id, time, kind, message hash) of an events row. Ids alone are not identity: events has
+    no AUTOINCREMENT, so after retention empties the table SQLite reuses low ids."""
+    eid, t, kind, message = row
+    digest = hashlib.sha256(("" if message is None else str(message)).encode("utf-8", "replace")).hexdigest()[:16]
+    return (eid, t, kind, digest)
+
+
+HUD_CURSOR_ZERO = (0, None, None, None)   # "from the beginning": a database the HUD saw appear
+
+
+def hud_cursor_reset(cursor, cursor_row, max_id):
+    """True when the events table no longer continues past `cursor`: its highest id is below the
+    cursor's, or the row at the cursor's id is gone or is a different row (an id reused after
+    retention deleted everything, possibly between two redraws)."""
+    if cursor is None or cursor[0] == 0:
         return False
-    return True
+    if max_id < cursor[0]:
+        return True
+    return cursor_row is None or hud_fingerprint(cursor_row) != tuple(cursor)
 
 
-def hud_snapshot(db_path, cursor, alive=hud_pid_alive):
-    """Everything one frame shows, read in one read-only transaction. `cursor` is the last event
-    id the alert pane has taken (None before the first frame: then no rows are fetched)."""
+def hud_snapshot(db_path, cursor, pid_status=hud_pid_status):
+    """Everything one frame shows, read in one read-only transaction. `cursor` is the alert
+    pane's position, the fingerprint of the newest events row it has taken (None before the
+    first frame: then no alert rows are fetched). Normally the alert rows are those after the
+    cursor's id; if the table no longer continues past the cursor (hud_cursor_reset), they are
+    every alert-kind row timed at or after the cursor's time, and hud_render drops the ones
+    it has already shown."""
     snap = {"db": os.path.abspath(db_path), "state": "ok", "error": None, "pid": None,
-            "pidSource": None, "alive": False, "startedAt": None, "stopped": False,
-            "lastEventAt": None, "maxEventId": 0, "counts": [], "exposed": [], "newPrograms": [],
-            "credentials": [], "health": None, "healthAt": None, "errorsSinceStart": 0,
-            "events": []}
+            "pidSource": None, "pidStatus": "dead", "startedAt": None, "stopped": False,
+            "lastEventAt": None, "maxEventId": 0, "maxRow": None, "counts": [], "exposed": [],
+            "newPrograms": [], "credentials": [], "health": None, "healthAt": None,
+            "errorsSinceStart": 0, "events": [], "reset": False, "limitHit": False}
     pid_file = os.path.join(os.path.dirname(snap["db"]), "tattletale.pid")
     pid = _hud_pid_from_file(pid_file)
     if pid:
@@ -1827,16 +1865,27 @@ def hud_snapshot(db_path, cursor, alive=hud_pid_alive):
                 "SELECT time, message FROM events WHERE kind = 'NEW-PROG' ORDER BY id DESC LIMIT 5")]
             snap["credentials"] = [tuple(r) for r in conn.execute(
                 "SELECT time, source, exe, chain FROM credential_events ORDER BY id DESC LIMIT 5")]
+            top_row = one("SELECT id, time, kind, message FROM events ORDER BY id DESC LIMIT 1")
+            snap["maxRow"] = tuple(top_row) if top_row else None
             if cursor is not None:
                 marks = ",".join("?" * len(HUD_ALERT_KINDS))
-                snap["events"] = [tuple(r) for r in conn.execute(
-                    f"SELECT id, time, kind, message FROM events WHERE id > ? AND kind IN ({marks})"
-                    " ORDER BY id LIMIT ?", (cursor,) + HUD_ALERT_KINDS + (HUD_FETCH_LIMIT,))]
+                at = one("SELECT id, time, kind, message FROM events WHERE id = ?", cursor[0])
+                snap["reset"] = hud_cursor_reset(cursor, tuple(at) if at else None, snap["maxEventId"])
+                if snap["reset"]:
+                    rows = conn.execute(
+                        f"SELECT id, time, kind, message FROM events WHERE time >= ? AND kind IN ({marks})"
+                        " ORDER BY time, id LIMIT ?", (cursor[1] or "",) + HUD_ALERT_KINDS + (HUD_FETCH_LIMIT,))
+                else:
+                    rows = conn.execute(
+                        f"SELECT id, time, kind, message FROM events WHERE id > ? AND kind IN ({marks})"
+                        " ORDER BY id LIMIT ?", (cursor[0],) + HUD_ALERT_KINDS + (HUD_FETCH_LIMIT,))
+                snap["events"] = [tuple(r) for r in rows]
+                snap["limitHit"] = len(snap["events"]) >= HUD_FETCH_LIMIT
         except sqlite3.Error as e:
             snap.update(state="error", error=str(e))
         finally:
             conn.close()
-    snap["alive"] = alive(snap["pid"]) if snap["pid"] else False
+    snap["pidStatus"] = pid_status(snap["pid"]) if snap["pid"] else "dead"
     return snap
 
 
@@ -1864,12 +1913,18 @@ def hud_new_state():
     return {"cursor": None, "alerts": (), "older": 0}
 
 
+_HUD_HIDDEN_CATEGORIES = ("Cc", "Cf", "Zl", "Zp", "Cs")
+
+
 def _hud_clean(text):
-    """One display line: control characters (including escape sequences in command lines that
-    could move the cursor or recolour the terminal) become '?'; only the first line is kept."""
+    """One display line; only the first line is kept. Every control (Cc: escape sequences that
+    could move the cursor or recolour the terminal), format character (Cf: bidi overrides,
+    embeddings and isolates, zero-width spaces and joiners, the BOM), line or paragraph
+    separator (Zl, Zp) and lone surrogate (Cs) becomes '?', so a process name cannot reorder
+    or hide text. Ordinary non-ASCII letters are kept."""
     text = "" if text is None else str(text)
     text = text.split("\n", 1)[0]
-    return "".join("?" if (ord(c) < 32 or 127 <= ord(c) < 160 or c in "  ") else c for c in text)
+    return "".join("?" if unicodedata.category(c) in _HUD_HIDDEN_CATEGORIES else c for c in text)
 
 
 def _hud_width(c):
@@ -1892,7 +1947,7 @@ def hud_fit(text, width):
             break
         out.append(c)
         used += w
-    return "".join(out) + "…"
+    return "".join(out) + "\u2026"
 
 
 def _hud_parse_time(value):
@@ -1926,16 +1981,29 @@ def hud_render(snap, state, size, now_dt, baseline=(), interval=HUD_DEFAULT_INTE
         # The first frame after the HUD starts marks where "new" begins. A database that appears
         # later is new in its entirety.
         if snap["state"] == "ok":
-            state["cursor"] = snap["maxEventId"]
+            state["cursor"] = hud_fingerprint(snap["maxRow"]) if snap["maxRow"] else HUD_CURSOR_ZERO
         elif snap["state"] == "missing":
-            state["cursor"] = 0
-    else:
-        for eid, t, kind, message in snap["events"]:
-            if eid <= state["cursor"]:
+            state["cursor"] = HUD_CURSOR_ZERO
+    elif snap["state"] == "ok":
+        # Already-shown rows are known by fingerprint, so a reset (ids reused after retention)
+        # neither repeats them nor hides a new row that took a low id.
+        shown = {hud_fingerprint(a) for a in alerts}
+        last = None
+        for row in snap["events"]:
+            fp = hud_fingerprint(row)
+            last = fp
+            if not snap["reset"] and row[0] <= state["cursor"][0]:
                 continue
-            state["cursor"] = eid
-            if hud_is_alert(kind, message):
-                alerts.append((eid, t, kind, message))
+            if fp in shown or not hud_is_alert(row[2], row[3]):
+                continue
+            shown.add(fp)
+            alerts.append(tuple(row))
+        if snap["limitHit"] and last is not None:
+            state["cursor"] = last          # more rows wait; continue from the last one read
+        elif snap["maxRow"] is not None:
+            state["cursor"] = hud_fingerprint(snap["maxRow"])
+        else:
+            state["cursor"] = HUD_CURSOR_ZERO   # an empty table: everything after is new
         if len(alerts) > HUD_KEEP_ALERTS:
             older += len(alerts) - HUD_KEEP_ALERTS
             alerts = alerts[-HUD_KEEP_ALERTS:]
@@ -1945,12 +2013,17 @@ def hud_render(snap, state, size, now_dt, baseline=(), interval=HUD_DEFAULT_INTE
 
     top = [f"TATTLETALE HUD {__version__}  read-only  every {interval:g}s  {now_dt.strftime('%Y-%m-%d %H:%M:%SZ')}"]
     stopped = snap["stopped"] and snap["pidSource"] == "START event"
-    if snap["pid"] and snap["alive"] and not stopped:
+    status = snap["pidStatus"]
+    if snap["pid"] and status == "tattletale" and not stopped:
         up = _hud_parse_time(snap["startedAt"])
         uptime = _hud_age((now_dt - up).total_seconds()) if up else "?"
         top.append(f"watcher: running pid {snap['pid']} ({snap['pidSource']})  up {uptime}")
     elif stopped:
         top.append(f"watcher not running (stopped after its START, pid {snap['pid']})")
+    elif snap["pid"] and status == "other":
+        top.append(f"watcher not running (pid {snap['pid']} alive but not tattletale)")
+    elif snap["pid"] and status == "unknown":
+        top.append(f"watcher unknown (pid {snap['pid']} alive, command line unreadable)")
     elif snap["pid"]:
         top.append(f"watcher not running (pid {snap['pid']} from {snap['pidSource']} is gone)")
     else:

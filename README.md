@@ -160,13 +160,18 @@ version, or with no watcher at all ("watcher not running"). A missing database i
 and checked again on every redraw.
 
 The top lines show whether the watcher's pid (from `data/tattletale.pid`, else the latest
-`START` line) is alive, its uptime, the time of the last event and the redraw interval.
+`START` line) is alive and still a Tattletale watcher (its command line, read with `ps`; a
+reused pid shows as "alive but not tattletale"), its uptime, the time of the last event and
+the redraw interval.
 Below come event counts by kind since the last start, listeners currently bound to all
 interfaces, the last few new programs and credential events, and collection health when a
 check is degraded. At the bottom, the **ALERTS** pane lists `LISTEN!`, `CRED-NET`,
 `CREDENTIAL`, `UNSIGNED` lines, and `IDENTITY` lines whose signer is unknown, that
 arrived after the HUD started: each once, newest at the bottom, with a count of older ones
-when the terminal is too short. Lines are cut to the terminal width, never wrapped.
+when the terminal is too short. Each row is tracked by its content as well as its id, so an
+alert is neither missed nor repeated when retention empties the table and SQLite reuses
+event ids. Lines are cut to the terminal width, never wrapped; control, bidi and zero-width
+characters in command lines are shown as `?`.
 
 To make surprises stand out, copy
 [`tattletale.hud-baseline.example`](tattletale.hud-baseline.example) to
