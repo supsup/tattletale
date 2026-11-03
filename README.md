@@ -110,6 +110,16 @@ It opens in dark mode; the Theme button switches to light and the page remembers
 works at phone width too. Click or press Enter on any row for its details. The footer names the
 version that wrote the data.
 
+**Mark reviewed** remembers a timestamp and the observations in the last fully accepted
+page in this browser. **Since reviewed** filters only Needs attention; turn it off to see
+all attention items again. Other panels and database evidence stay intact. Reviewed does
+not mean safe: non-loopback listeners in the retained sample always stay visible. A new
+program identity, changed signing information, startup state or event returns to attention,
+even if it arrives with an older timestamp. Ordinary polling updates to `lastSeen` do not.
+If browser storage is unavailable or full, the page shows all observations and says the
+review was not saved. A failed refresh cannot advance the marker. The shared page provides
+the same feature with either producer; no watcher or database format changes are required.
+
 The page's **Live/Stale** indicator measures data-file freshness (Stale after 180 seconds).
 Separately, collection health shows the last attempt, last accepted success and
 `unknown`/`ok`/`degraded` state for four polling checks: processes, listeners, startup and
