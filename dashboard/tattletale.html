@@ -161,7 +161,8 @@
   .feed .kind { font-weight: 650; }
   .feed .msg { overflow-wrap: anywhere; white-space: pre-wrap; min-width: 0; }
   .tools { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; align-items: center; }
-  .tools input { flex: 1; min-width: min(200px, 100%); }
+  .tools input[type="search"] { flex: 1; min-width: min(200px, 100%); }
+  .tools label { display: inline-flex; align-items: center; gap: 6px; }
   .chart svg { display: block; overflow: visible; }
   .axis-label { fill: var(--muted); font-size: 11px; }
   .axis-date { fill: var(--ink-2); font-size: 11px; font-weight: 600; }
@@ -237,6 +238,11 @@
 
   <div class="card section att" id="attention" aria-labelledby="att-h">
     <h2 id="att-h">Needs attention</h2>
+    <div class="tools">
+      <button id="mark-reviewed" type="button" disabled>Mark reviewed</button>
+      <label><input id="since-reviewed" type="checkbox"> Since reviewed</label>
+    </div>
+    <p class="desc" id="review-status" role="status">No review marker in this browser. Reviewed does not mean safe.</p>
     <div id="att-list"></div>
   </div>
 
@@ -508,6 +514,74 @@
   let health = unknownHealth(), loadFailed = false, hasData = false;
   let publication = readPublication({});
   let acceptedPayload = null;
+  // Remember observations, not just their dates: identity completion and late events may
+  // carry old firstSeen/time values. Polling lastSeen and process IDs are not identities.
+  const REVIEW_KEY = "tattletale-review-v1";
+  const programReviewKey = (r) => JSON.stringify(["program", r.exe,
+    ...["firstSeen", "sha256", "size", "signer", "team", "signingId"].map((k) =>
+      Object.hasOwn(r, k) ? [k, r[k]] : [k])]);
+  const startupReviewKey = (path, hash) => JSON.stringify(["startup", path, hash]);
+  const eventReviewKey = (e) => JSON.stringify(["event", e.t, e.kind, e.msg]);
+  const credentialReviewKey = (c) => JSON.stringify(["credential",
+    ...["time", "exe", "source", "pid", "user", "args", "chain"].map((k) => c[k] ?? null)]);
+  let review = null, sinceReviewed = false, reviewReadFailed = false, reviewMessage = "", lastAttention = null;
+  let storedReview = null;
+  try {
+    storedReview = localStorage.getItem(REVIEW_KEY);
+  } catch (_) {
+    reviewReadFailed = true;
+    reviewMessage = "Review marker unavailable. Showing all observations.";
+  }
+  try {
+    if (storedReview !== null) {
+      const v = JSON.parse(storedReview);
+      if (!v || v.version !== 1 || Object.keys(v).sort().join(",") !== "observations,reviewedAt,version" ||
+          typeof v.reviewedAt !== "string" || !Number.isFinite(Date.parse(v.reviewedAt)) ||
+          new Date(v.reviewedAt).toISOString() !== v.reviewedAt || !Array.isArray(v.observations) ||
+          v.observations.some((key) => {
+            if (typeof key !== "string") return true;
+            const parts = JSON.parse(key);
+            return !Array.isArray(parts) || !["program", "startup", "event", "credential"].includes(parts[0]) ||
+              (parts[0] === "startup" && (parts.length !== 3 || typeof parts[1] !== "string"));
+          })) throw Error("invalid-review-marker");
+      review = v; sinceReviewed = true;
+    }
+  } catch (_) {
+    reviewMessage = "Review marker unavailable. Showing all observations.";
+  }
+  function renderReviewControls() {
+    $("#mark-reviewed").disabled = !hasData || loadFailed;
+    $("#since-reviewed").checked = sinceReviewed;
+    $("#review-status").textContent = reviewMessage || (review ?
+      "Reviewed " + local(review.reviewedAt) + ". This filters attention in this browser only. Reviewed does not mean safe; non-loopback listeners stay visible." :
+      "No review marker in this browser. Reviewed does not mean safe; non-loopback listeners stay visible.");
+  }
+  $("#mark-reviewed").addEventListener("click", () => {
+    if (!acceptedPayload || loadFailed) return;
+    const map = acceptedPayload.map;
+    const marker = { version: 1, reviewedAt: new Date().toISOString(), observations: [
+      ...Object.entries(map.programs || {}).map(([exe, v]) => programReviewKey({ ...v, exe })),
+      ...Object.entries(map.startup || {}).map(([path, hash]) => startupReviewKey(path, hash)),
+      ...(map.credentials || []).map(credentialReviewKey), ...parseLog(acceptedPayload.log || []).map(eventReviewKey)
+    ] };
+    try {
+      if (reviewReadFailed) throw Error("review-storage-unavailable");
+      const encoded = JSON.stringify(marker);
+      localStorage.setItem(REVIEW_KEY, encoded);
+      if (localStorage.getItem(REVIEW_KEY) !== encoded) throw Error("review-not-persisted");
+      review = marker; sinceReviewed = true; reviewMessage = "";
+    } catch (_) {
+      sinceReviewed = false;
+      reviewMessage = "Review not saved; browser storage unavailable. Showing all observations.";
+    }
+    renderReviewControls();
+    if (lastAttention) renderAttention(lastAttention);
+  });
+  $("#since-reviewed").addEventListener("change", () => {
+    sinceReviewed = $("#since-reviewed").checked;
+    if (hasData && !loadFailed && lastAttention) renderAttention(lastAttention);
+  });
+  renderReviewControls();
   const publicationIncomplete = () => publication.present && publication.health.status !== "ok";
   const complete = () => Object.values(health).every((v) => v.status === "ok") && !publicationIncomplete();
   const incompleteChecks = () => Object.entries(HEALTH_NAMES).filter(([k]) => health[k].status !== "ok")
@@ -560,6 +634,7 @@
   }
   function failLoad(message) {
     loadFailed = true;
+    renderReviewControls();
     renderHealth();
     $("#updated").textContent = hasData ? "last-known; updated " + local(lastGenerated) : "";
     $("#live").replaceChildren(status("critical", hasData ? "Refresh failed; last-known data" : "No data"));
@@ -623,7 +698,9 @@
     $("#updated").textContent = "updated " + local(D.generatedAt);
     tick();
 
-    renderAttention({ exposed, risky, newRows, creds, logCreds, startupEvents, stops, starts });
+    lastAttention = { exposed, risky, newRows, creds, logCreds, startupEvents, stops, starts, rows, startup };
+    renderAttention(lastAttention);
+    renderReviewControls();
 
     // tiles: attention tiles keep full ink; good or zero tiles are muted
     const tile = (label, value, notes, quiet) => el("div", { class: "tile" + (quiet ? " quiet" : "") },
@@ -691,6 +768,24 @@
   }
 
   function renderAttention(f) {
+    let changedIdentities = [], changedStartup = [];
+    let restarts = Math.max(f.stops.length, f.starts.length - 1);
+    if (sinceReviewed && review && !reviewMessage) {
+      const known = new Set(review.observations);
+      const unseenProgram = (r) => !known.has(programReviewKey(r));
+      const unseenEvent = (e) => !known.has(eventReviewKey(e));
+      restarts = Math.max(f.stops.filter(unseenEvent).length, f.starts.slice(1).filter(unseenEvent).length);
+      f = { ...f, risky: f.risky.filter(unseenProgram), newRows: f.newRows.filter(unseenProgram),
+        creds: f.creds.filter((c) => !known.has(credentialReviewKey(c))), logCreds: f.logCreds.filter(unseenEvent),
+        startupEvents: f.startupEvents.filter(unseenEvent), stops: f.stops.filter(unseenEvent) };
+      const alreadyShown = new Set([...f.risky, ...f.newRows].map((r) => r.exe));
+      changedIdentities = f.rows.filter((r) => unseenProgram(r) && !alreadyShown.has(r.exe));
+      changedStartup = Object.entries(f.startup).filter(([path, hash]) => !known.has(startupReviewKey(path, hash))).map(([path]) => path);
+      for (const key of review.observations) {
+        const parts = JSON.parse(key);
+        if (parts[0] === "startup" && !Object.hasOwn(f.startup, parts[1])) changedStartup.push(parts[1]);
+      }
+    }
     const items = [];
     const add = (level, label, count, names, target, linkText, before) => {
       if (count) items.push({ level, label, count, names, target, linkText, before });
@@ -702,6 +797,8 @@
     add("neutral", "New programs since baseline", f.newRows.length,
       f.newRows.slice().sort((a, b) => String(b.firstSeen).localeCompare(String(a.firstSeen))).map((r) => base(r.exe)),
       "sec-programs", "Show in table", setProgFilter("__new"));
+    add("warning", "Program identities changed since review", changedIdentities.length,
+      changedIdentities.map((r) => base(r.exe)), "sec-programs", "All programs");
     add("warning", "Credential helpers run", f.creds.length, f.creds.slice().reverse().map((c) => base(c.exe)), "sec-creds", "Credential prompts");
     add("warning", "Password dialogs and git network calls (log)", f.logCreds.length,
       LOG_CRED_KINDS.map((k) => [k, f.logCreds.filter((e) => e.kind === k).length]).filter((x) => x[1]).map((x) => x[1] + " " + x[0]), "sec-events", "Show events", showKinds(LOG_CRED_KINDS));
@@ -709,7 +806,8 @@
       // Lines read "added: PATH | copy: ..." (or changed:/removed:); PATH may hold a space ("crontab -l").
       f.startupEvents.slice().reverse().map((e) =>
         base(e.msg.replace(/^(added|changed|removed):\s*/, "").split(" | ")[0]) || e.msg.slice(0, 60)), "sec-startup", "Startup items");
-    const restarts = Math.max(f.stops.length, f.starts.length - 1);
+    add("warning", "Startup state changed since review", changedStartup.length,
+      changedStartup.map(base), "sec-startup", "Startup items");
     add("warning", "Watcher stopped or restarted", restarts,
       f.stops.slice().reverse().map((e) => "stopped " + when(e.t)), "sec-events", "Show events", showKinds(["START", "STOP"]));
 

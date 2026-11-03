@@ -27,6 +27,20 @@ Both versions default to `<repo>/data/`. Everything in it is machine data and is
 
 Settings live in `<repo>/tattletale.env`, shared by both versions.
 
+### Browser review state
+
+The shared dashboard's `tattletale-review-v1` localStorage entry is separate from the data
+folder and database. It contains `version: 1`, a `reviewedAt` UTC ISO timestamp with
+milliseconds, and `observations`: JSON-encoded keys for program identity fields, startup
+path/hash state, credential observations and log events from the last accepted page. This
+snapshot lets a late identity or event reappear even when its original timestamp predates
+the marker. Polling `lastSeen` and program PIDs are excluded from program identity keys.
+These browser records can contain local paths and event details; treat browser storage as
+private machine data too. Clearing it restores the full attention view. It is never written
+to the database or `tattletale-data.js`, does not certify safety, and never suppresses a
+non-loopback listener in the retained sample. Invalid or unavailable storage fails open to
+all observations. Python and Java still emit the same existing format-2 projection.
+
 ## Database (schema 1)
 
 The schema, exactly as created (`CREATE ... IF NOT EXISTS`):

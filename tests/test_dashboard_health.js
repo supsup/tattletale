@@ -43,7 +43,7 @@ class Node {
   remove() { if (this.parent) this.parent.children = this.parent.children.filter((n) => n !== this); }
   get options() { return this.querySelectorAll("option"); }
 }
-function page() {
+function page(options = {}) {
   const ids = new Map([...html.matchAll(/\bid="([^"]+)"/g)].map((m) => [m[1], new Node("div")]));
   const head = new Node("head"), root = new Node("html"), body = new Node("tbody");
   const headers = ["exe", "signerClass", "user", "firstSeen", "lastSeen"].map((k) => {
@@ -61,9 +61,13 @@ function page() {
   let now = Date.parse(clock);
   class ClockDate extends Date { constructor(...args) { super(...(args.length ? args : [now])); } static now() { return now; } }
   const intervals = [];
+  const storage = options.storage || new Map();
   const context = {
     document, Date: ClockDate, console,
-    localStorage: { getItem: () => null, setItem: () => {} },
+    localStorage: {
+      getItem: (key) => { if (options.denyRead) throw Error("synthetic storage denial"); return storage.get(key) ?? null; },
+      setItem: (key, value) => { if (options.denyWrite) throw Error("synthetic quota failure"); storage.set(key, value); }
+    },
     MutationObserver: class { observe() {} },
     matchMedia: () => ({ matches: false }), addEventListener: () => {},
     innerWidth: 1024, innerHeight: 768, setInterval: (fn, ms) => { intervals.push({ fn, ms }); },
@@ -75,7 +79,15 @@ function page() {
   assert.match(script, /\}\)\(\);\s*$/);
   vm.runInContext(script.replace(/\}\)\(\);\s*$/, "globalThis.fixture = {render, tick, load}; })();"), context, { timeout: 1000 });
   return {
-    ...context.fixture, ids, head,
+    ...context.fixture, ids, head, storage,
+    click: (id) => {
+      const n = ids.get(id); assert.ok(n, "missing control: " + id);
+      if (!n.disabled) n.listeners.click({ target: n });
+    },
+    sinceReviewed: (enabled) => {
+      const n = ids.get("since-reviewed"); assert.ok(n, "missing since-reviewed control");
+      n.checked = enabled; n.listeners.change({ target: n });
+    },
     setPayload: (d, script = head.children.at(-1)) => {
       document.currentScript = script; context.TATTLETALE = d; document.currentScript = null;
     },
@@ -446,4 +458,110 @@ for (const legacy of [false, true]) test((legacy ? "legacy" : "format-2") + " fi
   p.render(d);
   assert.equal((p.text("feed").match(/STARTUP~/g) || []).length, 1);
   assert.match(p.text("startup"), /1 change/);
+});
+
+// Since-reviewed tests drive real page controls. All paths, identities and ports are invented.
+const REVIEW_KEY = "tattletale-review-v1";
+function reviewData() {
+  const d = data();
+  d.map.programs["/fixture/tool"] = { firstSeen: clock, lastSeen: clock,
+    signer: "adhoc", sha256: "fixture-old-digest", size: 12, team: "fixture-team" };
+  d.map.startup["/fixture/agent.plist"] = "fixture-old-startup";
+  d.log = [clock + "  STARTUP+  added: /fixture/agent.plist"];
+  return d;
+}
+test("mark reviewed persists a timestamp, filters attention only and reloads per browser", () => {
+  const p = page(), d = reviewData(), original = JSON.stringify(d);
+  p.render(d); const programs = p.programText(), startup = p.text("startup"), feed = p.text("feed");
+  p.click("mark-reviewed");
+  const saved = JSON.parse(p.storage.get(REVIEW_KEY));
+  assert.equal(saved.reviewedAt, new Date(clock).toISOString());
+  assert.match(p.text("review-status"), /Reviewed/);
+  assert.doesNotMatch(p.text("att-list"), /Unsigned or ad-hoc programs|Startup item changes/);
+  assert.equal(p.programText(), programs); assert.equal(p.text("startup"), startup); assert.equal(p.text("feed"), feed);
+  assert.equal(JSON.stringify(d), original);
+  p.sinceReviewed(false); assert.match(p.text("att-list"), /Unsigned or ad-hoc programs/);
+  p.sinceReviewed(true); assert.doesNotMatch(p.text("att-list"), /Unsigned or ad-hoc programs/);
+  const reloaded = page({ storage: p.storage }); reloaded.render(d);
+  assert.doesNotMatch(reloaded.text("att-list"), /Unsigned or ad-hoc programs/);
+  const independent = page(); independent.render(d);
+  assert.match(independent.text("att-list"), /Unsigned or ad-hoc programs/);
+});
+for (const [name, mutate] of [
+  ["changed digest at old path and firstSeen", (d) => { d.map.programs["/fixture/tool"].sha256 = "fixture-new-digest"; }],
+  ["changed team", (d) => { d.map.programs["/fixture/tool"].team = "fixture-other-team"; }],
+  ["changed signing id", (d) => { d.map.programs["/fixture/tool"].signingId = "fixture.signing.id"; }],
+  ["signed replacement at an old firstSeen", (d) => { d.map.programs["/fixture/tool"].signer = "Developer ID Application: Fixture"; }],
+  ["new path with an old timestamp", (d) => { d.map.programs["/fixture/new"] = { ...d.map.programs["/fixture/tool"] }; }]
+]) test(name + " returns to attention without relying on lastSeen", () => {
+  const p = page(), d = reviewData(); p.render(d); p.click("mark-reviewed");
+  mutate(d); p.render(d);
+  assert.match(p.text("att-list"), /Unsigned or ad-hoc programs|Program identities changed since review/);
+});
+test("late identity completion is material, polling lastSeen and pid changes are not", () => {
+  const p = page(), d = reviewData(); delete d.map.programs["/fixture/tool"].signer;
+  p.render(d); p.click("mark-reviewed");
+  d.map.programs["/fixture/tool"].lastSeen = "2000-01-01T00:01:00Z";
+  d.map.programs["/fixture/tool"].firstPid = 9999;
+  p.render(d); assert.doesNotMatch(p.text("att-list"), /Program identities changed since review/);
+  d.map.programs["/fixture/tool"].signer = "Developer ID Application: Fixture";
+  p.render(d); assert.match(p.text("att-list"), /Program identities changed since review/);
+});
+for (const [name, mutate] of [
+  ["changed hash without a new log line", (d) => { d.map.startup["/fixture/agent.plist"] = "fixture-new-startup"; }],
+  ["new startup item", (d) => { d.map.startup["/fixture/new.plist"] = "fixture-new-startup"; }],
+  ["removed startup item", (d) => { delete d.map.startup["/fixture/agent.plist"]; }],
+  ["late startup event with a pre-marker timestamp", (d) => { d.log.push(clock + "  STARTUP~  changed: /fixture/agent.plist"); }]
+]) test(name + " returns to attention", () => {
+  const p = page(), d = reviewData(); p.render(d); p.click("mark-reviewed"); mutate(d); p.render(d);
+  assert.match(p.text("att-list"), /Startup item changes|Startup state changed since review/);
+});
+for (const fields of [{ bindScope: "wildcard" }, { bindScope: "non-loopback" }, { exposed: true }]) {
+  test("review never filters a retained exposed listener: " + JSON.stringify(fields), () => {
+    const p = page(), d = reviewData();
+    d.map.listeners["/fixture/service *:12345"] = { present: true, command: "fixture", ...fields };
+    p.render(d); p.click("mark-reviewed");
+    assert.match(p.text("att-list"), /Non-loopback listener binds in retained sample1/);
+    d.map.listeners["/fixture/new-service *:23456"] = { present: true, command: "new fixture", bindScope: "wildcard" };
+    p.render(d); assert.match(p.text("att-list"), /Non-loopback listener binds in retained sample2/);
+    d.collectionHealth.listeners.status = "degraded"; d.collectionHealth.listeners.error = "lsof-warning";
+    p.render(d); assert.match(p.text("att-list"), /Non-loopback listener binds/);
+    assert.match(p.text("banner"), /Collection incomplete/);
+  });
+}
+test("new credential and restart events return while unchanged events stay reviewed", () => {
+  const p = page(), d = reviewData();
+  d.map.credentials.push({ time: clock, exe: "/fixture/helper", source: "ps" });
+  d.log.push(clock + "  START  fixture watcher", clock + "  PASSWORD  fixture prompt");
+  p.render(d); p.click("mark-reviewed");
+  assert.doesNotMatch(p.text("att-list"), /Credential helpers run|Password dialogs/);
+  d.map.credentials.push({ time: "2000-01-01T00:00:01Z", exe: "/fixture/helper", source: "ps" });
+  d.log.push(clock + "  STOP  fixture stop", clock + "  START  fixture restarted", clock + "  PASSWORD  new fixture prompt");
+  p.render(d); assert.match(p.text("att-list"), /Credential helpers run1/);
+  assert.match(p.text("att-list"), /Password dialogs/); assert.match(p.text("att-list"), /Watcher stopped or restarted/);
+});
+for (const options of [{ denyRead: true }, { denyWrite: true }]) test("unavailable storage fails open: " + JSON.stringify(options), () => {
+  const p = page(options); p.render(reviewData()); p.click("mark-reviewed"); p.sinceReviewed(true);
+  assert.match(p.text("att-list"), /Unsigned or ad-hoc programs/);
+  assert.match(p.text("review-status"), /unavailable|not saved/i);
+  assert.match(p.text("live"), /Live/); assert.equal(p.shown(), false);
+});
+for (const bad of ["{", "null", '{"version":99}', '{"version":1,"reviewedAt":"bad","observations":[]}',
+  '{"version":1,"reviewedAt":"2000-01-01T00:00:00.000Z","observations":["not-json"]}']) {
+  test("malformed review state cannot hide evidence: " + bad, () => {
+    const p = page({ storage: new Map([[REVIEW_KEY, bad]]) }); p.render(reviewData()); p.sinceReviewed(true);
+    assert.match(p.text("att-list"), /Unsigned or ad-hoc programs/);
+    assert.match(p.text("live"), /Live/);
+    p.click("mark-reviewed");
+    assert.doesNotMatch(p.text("att-list"), /Unsigned or ad-hoc programs/);
+  });
+}
+test("failed refresh cannot mark rejected data or overwrite the prior review marker", () => {
+  const p = page(), d = reviewData(); p.render(d); p.click("mark-reviewed");
+  const saved = p.storage.get(REVIEW_KEY);
+  const rejected = reviewData(); rejected.map.programs["/fixture/tool"].sha256 = "fixture-rejected";
+  p.failNextProgramRender(); p.render(rejected); p.click("mark-reviewed"); p.sinceReviewed(true);
+  assert.equal(p.storage.get(REVIEW_KEY), saved);
+  assert.match(p.text("att-list"), /no accepted refresh/); assert.match(p.text("live"), /Refresh failed/);
+  p.render(rejected); assert.match(p.text("att-list"), /Unsigned or ad-hoc programs/);
 });

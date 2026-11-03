@@ -1,0 +1,97 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Since-reviewed browser acceptance — synthetic fixtures</title>
+<style>body{font:16px system-ui;max-width:1000px;margin:2em auto}iframe{width:100%;height:500px;border:1px solid #888}pre{white-space:pre-wrap}</style>
+<h1>Since-reviewed browser acceptance</h1>
+<p>Only invented fixture data. No watcher, database or host inventory. The frames run the repository's actual dashboard script and real controls; their data loader is replaced with synthetic input.</p>
+<pre id="result" role="status">RUNNING — no result yet</pre>
+<div id="frames"></div>
+<script>
+(async () => {
+  "use strict";
+  const results = [];
+  window.BROWSER_RESULTS = results;
+  const output = document.getElementById("result");
+  const page = await fetch("../dashboard/tattletale.html").then((r) => { if (!r.ok) throw Error("page fetch " + r.status); return r.text(); });
+  const stamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+  const data = { formatVersion: 2, generatedAt: stamp, version: "synthetic-browser-fixture",
+    collectionHealth: Object.fromEntries(["processes", "listeners", "startup", "crontab"].map((k) =>
+      [k, { status: "ok", lastAttempt: stamp, lastSuccess: stamp, error: null }])),
+    map: { programs: { "/fixture/tool": { firstSeen: stamp, lastSeen: stamp, signer: "adhoc", sha256: "fixture-old" } },
+      listeners: { "/fixture/service *:12345": { present: true, bindScope: "wildcard", command: "fixture service" } },
+      credentials: [], startup: { "/fixture/agent.plist": "fixture-old-startup" } },
+    log: [stamp + "  STARTUP+  added: /fixture/agent.plist"] };
+  function scenario(denied) {
+    return new Promise((resolve, reject) => {
+      const frame = document.createElement("iframe");
+      frame.title = denied ? "Storage denied acceptance" : "Normal browser acceptance";
+      frame.sandbox = denied ? "allow-scripts" : "allow-scripts allow-same-origin";
+      const timeout = setTimeout(() => { window.removeEventListener("message", receive); reject(Error("browser fixture timed out")); }, 20000);
+      function receive(e) {
+        if (e.source !== frame.contentWindow || !e.data || e.data.fixture !== "since-reviewed-browser") return;
+        clearTimeout(timeout); window.removeEventListener("message", receive);
+        results.push(...e.data.results); resolve();
+      }
+      window.addEventListener("message", receive);
+      // Replace only the startup data load and its refresh timer. render(), all UI
+      // handlers, DOM operations, localStorage and browser sandbox behavior are real.
+      const script = page.match(/<script>\s*([\s\S]*?)<\/script>/)[1];
+      if ((script.match(/^  load\(\);$/gm) || []).length !== 1) throw Error("startup load discriminator changed");
+      let actual = script.replace(/^  load\(\);$/m, () => "  render(" + JSON.stringify(data) + ");")
+        .replace("  setInterval(load, 60000);", "");
+      const checks = `
+        const results = [];
+        const text = () => document.getElementById("att-list").textContent;
+        const check = (name, fn) => { try { fn(); results.push({name, pass:true}); } catch(e) { results.push({name, pass:false, error:String(e)}); } };
+        const assert = (v, why) => { if (!v) throw Error(why); };
+        const d = ${JSON.stringify(data)};
+        if (${denied}) {
+          check("storage denied keeps evidence and controls usable", () => {
+            document.getElementById("mark-reviewed").click();
+            const box = document.getElementById("since-reviewed"); box.checked = true; box.dispatchEvent(new Event("change"));
+            assert(text().includes("Unsigned or ad-hoc programs"), "storage denial hid evidence");
+            assert(/unavailable|not saved/i.test(document.getElementById("review-status").textContent), "missing storage status");
+            assert(document.getElementById("live").textContent.includes("Live"), "page failed");
+          });
+        } else {
+          check("mark and filter use real controls without erasing detail", () => {
+            assert(text().includes("Unsigned or ad-hoc programs"), "missing positive baseline");
+            document.getElementById("mark-reviewed").click();
+            assert(!text().includes("Unsigned or ad-hoc programs"), "review failed to filter");
+            assert(document.getElementById("progs").textContent.includes("tool"), "program evidence erased");
+            const box = document.getElementById("since-reviewed"); box.checked = false; box.dispatchEvent(new Event("change"));
+            assert(text().includes("Unsigned or ad-hoc programs"), "All view failed");
+            box.checked = true; box.dispatchEvent(new Event("change"));
+          });
+          check("same-path identity change with old firstSeen reappears", () => {
+            d.map.programs["/fixture/tool"].sha256 = "fixture-new"; render(d);
+            assert(text().includes("Unsigned or ad-hoc programs"), "changed identity hidden");
+          });
+          check("startup state change without a new log timestamp reappears", () => {
+            d.map.startup["/fixture/agent.plist"] = "fixture-new-startup"; render(d);
+            assert(text().includes("Startup state changed since review"), "startup change hidden");
+          });
+          check("old and new exposed listeners remain visible", () => {
+            assert(text().includes("Non-loopback listener binds in retained sample1"), "old listener hidden");
+            d.map.listeners["/fixture/new *:23456"] = {present:true,bindScope:"wildcard",command:"fixture new"}; render(d);
+            assert(text().includes("Non-loopback listener binds in retained sample2"), "new listener hidden");
+          });
+        }
+        parent.postMessage({fixture:"since-reviewed-browser",results}, "*");
+      `;
+      actual = actual.replace(/\}\)\(\);\s*$/, () => checks + "})();");
+      const reset = denied ? "" : '<script>localStorage.removeItem("tattletale-review-v1");<\/script>';
+      frame.srcdoc = page.replace(/<script>\s*[\s\S]*?<\/script>/, () => reset + "<script>" + actual + "<\/script>");
+      document.getElementById("frames").append(frame);
+    });
+  }
+  await scenario(false); await scenario(true);
+  localStorage.removeItem("tattletale-review-v1");
+  const passed = results.filter((r) => r.pass).length;
+  document.documentElement.dataset.testResult = passed === 5 && results.length === 5 ? "PASS" : "FAIL";
+  output.textContent = document.documentElement.dataset.testResult + " " + passed + "/5\n" + JSON.stringify(results, null, 2);
+})().catch((e) => {
+  document.documentElement.dataset.testResult = "FAIL";
+  document.getElementById("result").textContent = "FAIL " + String(e);
+});
+</script>
