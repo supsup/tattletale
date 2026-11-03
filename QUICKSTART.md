@@ -90,6 +90,20 @@ The four health checks follow the existing polling schedule; no automatic retry 
 They do not cover every watcher component. More detail, including startup/crontab rejection
 and accepted-empty results, is in [the data contract](docs/DATA_FORMAT.md#collection-health).
 
+## Optional: watch it in a terminal
+
+```sh
+python3 python/tattletale.py --hud                   # in a second tab; Ctrl-C to quit
+python3 python/tattletale.py --hud --hud-interval 5  # redraw every 5 s (default 10, minimum 2)
+```
+
+The HUD is read-only and Python-only (it reads the same `data/` folder whichever version
+is watching). It shows whether the watcher is running, counts since its start, ports open
+on all interfaces, recent new programs and credential events, and an ALERTS pane at the
+bottom for alerts that arrived since the HUD started. To label rows you already know are
+fine, copy `tattletale.hud-baseline.example` to `tattletale.hud-baseline` (git-ignored) and
+edit it; matching rows say `known` instead of `ALERT`.
+
 ## 4. Optional: settings
 
 ```sh
