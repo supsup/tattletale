@@ -191,6 +191,13 @@ nothing, and never takes the watcher's `data/tattletale.pid`, so it runs alongsi
 version, or with no watcher at all ("watcher not running"). A missing database is shown
 and checked again on every redraw.
 
+It draws the way `top` does: on the terminal's alternate screen, overwriting the previous
+frame in place, so nothing piles up in your scrollback and the screen you had comes back
+when you quit. (Version 0.0.3 as first released cleared the whole screen on every redraw;
+iTerm2 and Terminal.app save a cleared screen into scrollback, which left a blank block
+around each refresh.) Piped to a file, frames are written one after another, separated by a
+blank line.
+
 The top lines show whether the watcher's pid (from `data/tattletale.pid`, else the latest
 `START` line) is alive and its command line, read with `ps`, looks like a Tattletale watcher
 (a reused pid shows as "alive but not tattletale"), its uptime, the time of the last event and

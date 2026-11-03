@@ -2554,9 +2554,29 @@ def hud_render(snap, state, size, now_dt, baseline=(), interval=HUD_DEFAULT_INTE
     return [hud_fit(l, width) for l in lines[:height]], state
 
 
+HUD_TTY_ENTER = "\x1b[?1049h\x1b[H\x1b[2J\x1b[?25l"   # alternate screen, home, clear once, hide cursor
+HUD_TTY_LEAVE = "\x1b[?25h\x1b[?1049l"                # show cursor, back to the main screen (scrollback intact)
+HUD_TTY_HOME = "\x1b[H"                               # each frame starts at the top-left corner
+HUD_TTY_EOL = "\x1b[K"                                # erase the rest of the row the previous frame drew
+HUD_TTY_EOS = "\x1b[J"                                # erase the rows below the last line of this frame
+
+
+def hud_frame(lines, tty):
+    """One frame as the bytes to write. On a terminal the frame overwrites the previous one in
+    place: home, each line followed by erase-to-end-of-line, then erase-to-end-of-screen, like
+    `top`. There is no per-frame clear-screen: iTerm2 and Terminal.app push a cleared screen
+    into scrollback, so the first version left a screen-height block of blank rows above and
+    below every redraw. Off a terminal, frames are separated by a blank line."""
+    if not tty:
+        return "\n".join(lines) + "\n\n"
+    return HUD_TTY_HOME + (HUD_TTY_EOL + "\n").join(lines) + HUD_TTY_EOL + HUD_TTY_EOS
+
+
 def hud_main(db_path, interval, baseline_path, out=None, sleep=time.sleep, clock=None, frames=None):
-    """Clear-and-redraw every `interval` seconds until Ctrl-C (or SIGTERM); the cursor is
-    hidden while drawing and always shown again on exit. `frames` stops after that many."""
+    """Redraw in place every `interval` seconds until Ctrl-C (or SIGTERM). On a terminal the HUD
+    runs on the alternate screen (the one `top`, `less` and `vim` use), so the main screen and
+    its scrollback are untouched and come back on exit; the cursor is hidden while drawing and
+    always shown again. `frames` stops after that many."""
     out = out or sys.stdout
     clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
     baseline = hud_load_baseline(baseline_path)
@@ -2570,12 +2590,12 @@ def hud_main(db_path, interval, baseline_path, out=None, sleep=time.sleep, clock
     drawn = 0
     try:
         if tty:
-            out.write("\x1b[?25l")
+            out.write(HUD_TTY_ENTER)
         while True:
             snap = hud_snapshot(db_path, state["cursor"], state["recovery"])
             size = shutil.get_terminal_size((80, 24))
             lines, state = hud_render(snap, state, (size.columns, size.lines), clock(), baseline, interval)
-            out.write(("\x1b[H\x1b[2J" if tty else "") + "\n".join(lines) + ("" if tty else "\n\n"))
+            out.write(hud_frame(lines, tty))
             out.flush()
             drawn += 1
             if frames is not None and drawn >= frames:
@@ -2585,7 +2605,7 @@ def hud_main(db_path, interval, baseline_path, out=None, sleep=time.sleep, clock
         pass
     finally:
         if tty:
-            out.write("\x1b[?25h\n")
+            out.write(HUD_TTY_LEAVE + "\n")
             out.flush()
         signal.signal(signal.SIGTERM, previous)
 
