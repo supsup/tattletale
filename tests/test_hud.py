@@ -238,9 +238,21 @@ class HudTests(unittest.TestCase):
                         clock=lambda: NOW)
         text = out.getvalue()
         self.assertEqual(ticks, [3.0, 3.0])
-        self.assertTrue(text.startswith('\x1b[?25l\x1b[H\x1b[2J'))
-        self.assertTrue(text.endswith('\x1b[?25h\n'))
-        self.assertEqual(text.count('\x1b[H\x1b[2J'), 2)
+        # Alternate screen on, one clear, cursor hidden; every frame overwrites in place from the
+        # home position and erases what the previous frame left (row tails and rows below);
+        # never a per-frame clear-screen, which terminals push into scrollback as blank blocks.
+        self.assertTrue(text.startswith('\x1b[?1049h\x1b[H\x1b[2J\x1b[?25l'))
+        self.assertTrue(text.endswith('\x1b[?25h\x1b[?1049l\n'))
+        self.assertEqual(text.count('\x1b[2J'), 1)
+        body = text[len('\x1b[?1049h\x1b[H\x1b[2J\x1b[?25l'):-len('\x1b[?25h\x1b[?1049l\n')]
+        frames = body.split('\x1b[H')
+        self.assertEqual(frames[0], '')
+        self.assertEqual(len(frames) - 1, 2)
+        for frame in frames[1:]:
+            self.assertTrue(frame.endswith('\x1b[K\x1b[J'), repr(frame[-20:]))
+            rows = frame[:-len('\x1b[J')].split('\n')
+            self.assertTrue(all(r.endswith('\x1b[K') for r in rows), repr(rows))
+            self.assertIn('TATTLETALE HUD', rows[0])
         after = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in self.dir.iterdir()}
         # The database and its WAL are byte-identical. A WAL reader (this HUD, like --query)
         # takes read marks in the -shm shared-memory index; that is SQLite coordination, not data.
@@ -248,6 +260,14 @@ class HudTests(unittest.TestCase):
         self.assertEqual({k: v for k, v in after.items() if not k.endswith('-shm')},
                          {k: v for k, v in before.items() if not k.endswith('-shm')})
         self.assertNotIn('tattletale.pid', after)
+
+    def test_frame_shapes(self):
+        # A shorter second frame cannot leave the first frame's tail behind: each row is
+        # erased past its text and the screen below the frame is erased after the last row.
+        tty = TT.hud_frame(['one', 'two words'], True)
+        self.assertEqual(tty, '\x1b[Hone\x1b[K\ntwo words\x1b[K\x1b[J')
+        self.assertNotIn('\x1b[2J', tty)
+        self.assertEqual(TT.hud_frame(['one', 'two words'], False), 'one\ntwo words\n\n')
 
     # ---- alert continuity when SQLite reuses event ids (events has no AUTOINCREMENT) ----
     def watcher(self, retention_days):
