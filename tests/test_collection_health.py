@@ -1553,6 +1553,8 @@ def fatal_lifecycle_fixture(trace):
         def close(self): trace.append('close-db'); raise OSError('public cleanup fixture')
     class Lifecycle:
         stop = Stop(); stream_proc = Stream(); db = Database()
+        worker_database_failure = None
+        _owned_worker = TT.Watch._owned_worker
         log_path = '/fixture/log'; db_path = '/fixture/db'
         def claim_pid_file(self): trace.append('claim-fake-pid')
         def install_dashboard(self): pass

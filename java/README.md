@@ -82,11 +82,19 @@ SIGINT and SIGTERM without exiting the JVM (see below).
     java -jar java/build/tattletale.jar --report
     java -jar java/build/tattletale.jar --query "SELECT exe, signer FROM programs WHERE signer LIKE 'unsigned%'"
     java -jar java/build/tattletale.jar --show-settings
+    java -jar java/build/tattletale.jar --review --since 2000-01-01T00:00:00Z --until 2000-01-01T01:00:00Z
     java -jar java/build/tattletale.jar --version  # tattletale 0.0.3
 
 Every flag, environment variable and `tattletale.env` line is the Python version's (see
 `tattletale.env.example`). The precedence is the same: flag > `TATTLETALE_*` environment
 variable > `tattletale.env` > default.
+
+Read-only `--review` shares Python's protocol-1 heartbeat guard and JSON results. It checks
+processes, listeners, startup, crontab and the live keychain stream over the entire explicit
+UTC window before counting events. Missing/degraded/gapped evidence refuses `QUIET`; an
+idle stream needs worker-owned liveness pulses. It supports committed WAL data without
+watcher setup or missing-DB creation. See the shared
+[coverage contract](../docs/DATA_FORMAT.md#durable-heartbeats-and-read-only-review).
 
 At login: `sh java/install-login-agent.sh` (with `--dry-run` to print the agent file and change
 nothing), and `sh java/uninstall-login-agent.sh` to remove it. The agent runs the native binary

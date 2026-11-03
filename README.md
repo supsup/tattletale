@@ -43,6 +43,28 @@ The first run records what is already there as a **baseline** and reports only w
 after it. Failed or partial polling samples retain the last-good inventory and baseline;
 they do not turn missing output into stopped listeners or removed startup items.
 
+Both versions also store durable per-cycle counts and health for those polling collectors
+and the keychain log stream. To review a window without starting a watcher:
+
+```sh
+python3 python/tattletale.py --review --since 2000-01-01T00:00:00Z --until 2000-01-01T01:00:00Z
+java -jar java/build/tattletale.jar --review --since 2000-01-01T00:00:00Z --until 2000-01-01T01:00:00Z
+```
+
+Use the UTC window you want and optionally `--db PATH`. The JSON result is `QUIET` only
+when all five collectors have valid sampled coverage through the window and it contains
+zero events. Missing, degraded, malformed, or stale coverage returns `REFUSED` (exit 2),
+naming the collector and reason. Quiet keychain intervals require the stream worker and
+its child to stay live; the process-list fallback does not qualify. Review supports the
+running WAL database and does not create a missing database or watcher files. Coverage is
+sampled progress with bounded grace, not proof of continuous capture; see the
+[window rules and result contract](docs/DATA_FORMAT.md#durable-heartbeats-and-read-only-review).
+Historical coverage refusal is currently **CLI-only**. The browser's since-reviewed view
+and existing dashboard/HUD health displays do not consume this durable window guard and
+do not certify coverage while the watcher was off. Browser wiring is a separate slice.
+Synthetic producer, active-WAL, stream-liveness and parity checks are in
+[docs/COVERAGE_TESTING.md](docs/COVERAGE_TESTING.md).
+
 ## What it does not do
 
 - It never blocks, kills or changes anything. It only reads (`ps`, `lsof`, `codesign`,
@@ -218,15 +240,23 @@ ignored.
 | `db` | `data/tattletale.db` | SQLite database; the dashboard data file and `startup-snapshots/` are written beside it |
 | `log` | `data/tattletale.log` | human-readable log |
 | `map` | `data/tattletale-map.json` | only read once, to import a JSON map from an older version |
-| `process_interval` | `3` | seconds between process-list scans |
-| `listen_interval` | `30` | seconds between listening-port scans |
-| `startup_interval` | `300` | seconds between startup-item scans |
+| `process_interval` | `3` | seconds between process-list scans; finite, 0.5–3600 inclusive |
+| `listen_interval` | `30` | seconds between listening-port scans; finite, 0.5–3600 inclusive |
+| `startup_interval` | `300` | seconds between startup-item scans; finite, 0.5–3600 inclusive |
 | `notify` | `true` | macOS notifications for alerts, at most one per kind per minute |
 | `rotate_mb` | `20` | rotate the log at this size |
 | `keep_logs` | `3` | how many rotated logs to keep |
 | `retention_days` | `30` | days of events and credential events to keep (0 = forever) |
 | `sightings_retention_days` | `7` | days of process sightings to keep, the busiest table (0 = forever) |
 | `extra_startup` | none | extra files to watch as startup items (colon-separated in env and config) |
+
+Upgrade/release note: polling intervals now require finite values from 0.5 to 3600 inclusive.
+Previously accepted settings such as `startup_interval=86400` or
+`process_interval=0.25` exit with status 2 before collection starts. The installed login
+agents use launchd `KeepAlive` on unsuccessful exit and `ThrottleInterval=30`, so launchd
+retries failed starts with a 30-second throttle and no data is collected. The interval error
+appears in `data/tattletale.stdout`, which receives both stdout and stderr. Correct the
+settings to the supported range or defaults before restarting an existing login agent.
 
 ## Notifications
 

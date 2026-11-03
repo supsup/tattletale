@@ -51,13 +51,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--xml', required=True)
     ap.add_argument('--parity-output')
+    ap.add_argument('--suite', choices=('collection-health', 'coverage'), default='collection-health')
     ap.add_argument('--case', action='append', help='Exact case name for focused fixture checks; default is the full suite')
     ap.add_argument('--fatal-control', action='store_true', help='Expected nonzero fully fake fatal-lifecycle discriminator')
     args = ap.parse_args()
+    if args.suite == 'coverage' and (args.case or args.fatal_control):
+        ap.error('coverage suite runs all coverage controls; focused/fatal options belong to collection-health')
     for output in [args.xml, args.parity_output]:
         if output and pathlib.Path(output).exists():
             ap.error('refusing an existing output')
-    spec = importlib.util.spec_from_file_location('test_collection_health', pathlib.Path(__file__).with_name('test_collection_health.py'))
+    filename = 'test_coverage.py' if args.suite == 'coverage' else 'test_collection_health.py'
+    spec = importlib.util.spec_from_file_location(filename[:-3], pathlib.Path(__file__).with_name(filename))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     if args.fatal_control:
@@ -76,7 +80,7 @@ def main():
         suite = unittest.defaultTestLoader.loadTestsFromModule(module)
     started = datetime.datetime.now(datetime.timezone.utc).isoformat()
     result = unittest.TextTestRunner(verbosity=2, resultclass=Result).run(suite)
-    root = ET.Element('testsuite', name='python.collection-health', tests=str(result.testsRun),
+    root = ET.Element('testsuite', name='python.' + args.suite, tests=str(result.testsRun),
                       failures=str(len(result.failures)), errors=str(len(result.errors)),
                       skipped=str(len(result.skipped)), timestamp=started,
                       time=str(sum(r['seconds'] for r in result.records)))

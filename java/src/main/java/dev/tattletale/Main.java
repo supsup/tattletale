@@ -209,8 +209,8 @@ public final class Main {
 
     // ---- the command line, as argparse reads it ----
     static final class Args {
-        String config, query;
-        boolean report, showSettings;
+        String config, query, since, until;
+        boolean report, showSettings, review;
         final Map<String, Object> values = new LinkedHashMap<>();
     }
 
@@ -218,7 +218,7 @@ public final class Main {
 
     static String usage() {
         StringBuilder sb = new StringBuilder("usage: " + PROG
-                + " [-h] [--config CONFIG] [--version] [--report] [--query SQL] [--show-settings]");
+                + " [-h] [--config CONFIG] [--version] [--report] [--query SQL] [--show-settings] [--review --since SINCE --until UNTIL]");
         for (Setting s : SETTINGS) {
             String f = "--" + s.name().replace('_', '-');
             if (s.kind() == Kind.BOOL) sb.append(" [").append(f).append("] [--no-").append(s.name().replace('_', '-')).append(']');
@@ -237,6 +237,9 @@ public final class Main {
         sb.append("  --report              print a summary of the database and exit\n");
         sb.append("  --query SQL           run one read-only SELECT against the database, print tab-separated rows, and exit\n");
         sb.append("  --show-settings       print the effective settings and where each came from, then exit\n");
+        sb.append("  --review              read-only sampled coverage and event-count JSON; exits 2 on refusal\n");
+        sb.append("  --since SINCE         inclusive review start, UTC YYYY-MM-DDTHH:MM:SSZ\n");
+        sb.append("  --until UNTIL         inclusive review end, UTC YYYY-MM-DDTHH:MM:SSZ\n");
         for (Setting s : SETTINGS) {
             String f = "--" + s.name().replace('_', '-');
             String h = switch (s.kind()) {
@@ -268,6 +271,9 @@ public final class Main {
         opts.put("--report", new String[] {"report", "flag"});
         opts.put("--query", new String[] {"query", "value"});
         opts.put("--show-settings", new String[] {"show_settings", "flag"});
+        opts.put("--review", new String[] {"review", "flag"});
+        opts.put("--since", new String[] {"since", "value"});
+        opts.put("--until", new String[] {"until", "value"});
         for (Setting s : SETTINGS) {
             String f = "--" + s.name().replace('_', '-');
             switch (s.kind()) {
@@ -327,6 +333,7 @@ public final class Main {
                     }
                     case "report" -> a.report = true;
                     case "show_settings" -> a.showSettings = true;
+                    case "review" -> a.review = true;
                     default -> a.values.put(dest, act.equals("true"));
                 }
                 continue;
@@ -341,6 +348,8 @@ public final class Main {
             switch (dest) {
                 case "config" -> a.config = val;
                 case "query" -> a.query = val;
+                case "since" -> a.since = val;
+                case "until" -> a.until = val;
                 default -> {
                     Setting s = setting(dest);
                     Object v = val;
@@ -360,6 +369,10 @@ public final class Main {
             }
         }
         if (!extras.isEmpty()) throw usageError("unrecognized arguments: " + String.join(" ", extras));
+        if((a.review?1:0)+(a.report?1:0)+(a.query!=null?1:0)+(a.showSettings?1:0)>1)
+            throw usageError("--review, --report, --query and --show-settings are mutually exclusive");
+        if(a.review!=(a.since!=null && a.until!=null) || (!a.review && (a.since!=null || a.until!=null)))
+            throw usageError("--review requires both --since and --until; window flags require --review");
         return a;
     }
 
@@ -538,6 +551,11 @@ public final class Main {
             return 0;
         }
         String dbPath = (String) eff.get("db");
+        if(a.review) {
+            Map<String,Object> result=Coverage.review(dbPath,a.since,a.until,Watch.now());
+            Watch.OUT.println(Json.write(result));
+            return result.get("outcome").equals("REFUSED")?2:0;
+        }
         try {
             if (a.report) {
                 report(dbPath);
@@ -547,6 +565,7 @@ public final class Main {
                 runQuery(dbPath, a.query);
                 return 0;
             }
+            Watch.validatePolling(num(eff.get("process_interval")),num(eff.get("listen_interval")),num(eff.get("startup_interval")));
             if (r.src().get("db").equals("default")) {
                 List<String> moved = migrateV001(Py.dirname(dbPath));
                 if (moved != null && !moved.isEmpty())
@@ -563,7 +582,7 @@ public final class Main {
         List<String> extra = (List<String>) eff.get("extra_startup");
         Watch w = new Watch((String) eff.get("log"), dbPath, num(eff.get("listen_interval")), num(eff.get("startup_interval")),
                 extra, (Boolean) eff.get("notify"), (long) (num(eff.get("rotate_mb")) * 1024 * 1024), Math.max(0, keep),
-                pi > 0.5 ? pi : 0.5, (String) eff.get("map"), (Long) eff.get("retention_days"),
+                pi, (String) eff.get("map"), (Long) eff.get("retention_days"),
                 (Long) eff.get("sightings_retention_days"), DASHBOARD);
         Signals.install(w::requestStop);
         try {
