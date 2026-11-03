@@ -165,6 +165,60 @@ python3 python/tattletale.py --query "SELECT exe, signer FROM programs WHERE sig
 
 `--query` opens the database read-only and accepts a single `SELECT` or `WITH` statement.
 
+## Terminal HUD (Python only)
+
+```sh
+python3 python/tattletale.py --hud                    # redraws every 10 s; Ctrl-C to quit
+python3 python/tattletale.py --hud --hud-interval 5   # any interval of 2 seconds or more
+```
+
+`--hud` is a live terminal view of the same database, for a terminal tab beside the
+watcher. It is **read-only**: it opens the database with a read-only SQLite URI, writes
+nothing, and never takes the watcher's `data/tattletale.pid`, so it runs alongside either
+version, or with no watcher at all ("watcher not running"). A missing database is shown
+and checked again on every redraw.
+
+The top lines show whether the watcher's pid (from `data/tattletale.pid`, else the latest
+`START` line) is alive and its command line, read with `ps`, looks like a Tattletale watcher
+(a reused pid shows as "alive but not tattletale"), its uptime, the time of the last event and
+the redraw interval.
+Below come event counts by kind since the last start, listeners currently bound to all
+interfaces, the last few new programs and credential events, and collection health when a
+check is degraded. At the bottom, the **ALERTS** pane lists `LISTEN!`, `CRED-NET`,
+`CREDENTIAL`, `UNSIGNED` lines, and `IDENTITY` lines whose signer is unknown, that
+arrived after the HUD started: each once, newest at the bottom, with a count of older ones
+when the terminal is too short. Each row is tracked by its content as well as its id, so an
+alert is neither missed nor repeated when retention empties the table and SQLite reuses
+event ids. Lines are cut to the terminal width, never wrapped; control, bidi and zero-width
+characters in command lines are shown as `?`.
+
+Limits, stated exactly:
+
+- "New" starts at the first frame that can read the database. Alerts already in it then,
+  including any that arrived while it was unreadable, are not shown; if the database does not
+  exist yet, everything it later records is new.
+- After an id reset, rows are recovered from the time of the last row the HUD had read. A row
+  written meanwhile with an earlier timestamp (the clock stepped back) is not recovered.
+- At most 2000 rows are read per page per redraw, so a large backlog takes several redraws,
+  in order. The last 1000 shown rows are remembered to prevent repeats; a reset can repeat a
+  row only if more than 1000 rows were shown at or after the time it recovers from.
+- Collection health is read from `data/tattletale-data.js`, which a running watcher rewrites
+  about once a minute. The HUD shows its time and calls it STALE after 180 seconds; a stopped
+  watcher leaves its last health behind.
+- "Running" is a command-line name check (`tattletale.py`, the jar or the native binary),
+  not proof of process identity.
+
+To make surprises stand out, copy
+[`tattletale.hud-baseline.example`](tattletale.hud-baseline.example) to
+`tattletale.hud-baseline` at the repository root (git-ignored), or pass
+`--hud-baseline PATH`. Each line is a substring, or `re:` and a regular expression;
+matching rows are labelled `known` instead of `ALERT`. Nothing is hidden.
+
+The HUD flags are Python-only command-line flags, not settings: they are not read from the
+environment or `tattletale.env`. The Java version has no HUD; point the Python HUD at the
+same `data/` folder. Its checks run against a synthetic database in a temp folder:
+`python3 -I tests/test_hud.py`.
+
 ## Settings
 
 Each setting has one name, usable three ways. Highest priority first:

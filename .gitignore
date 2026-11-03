@@ -22,3 +22,6 @@ __pycache__/
 
 # Java build output
 java/build/
+
+# Local HUD baseline (see tattletale.hud-baseline.example); machine-specific, never commit.
+tattletale.hud-baseline
