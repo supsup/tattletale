@@ -43,6 +43,25 @@ The first run records what is already there as a **baseline** and reports only w
 after it. Failed or partial polling samples retain the last-good inventory and baseline;
 they do not turn missing output into stopped listeners or removed startup items.
 
+Both versions also store durable per-cycle counts and health for those polling collectors
+and the keychain log stream. To review a window without starting a watcher:
+
+```sh
+python3 python/tattletale.py --review --since 2000-01-01T00:00:00Z --until 2000-01-01T01:00:00Z
+java -jar java/build/tattletale.jar --review --since 2000-01-01T00:00:00Z --until 2000-01-01T01:00:00Z
+```
+
+Use the UTC window you want and optionally `--db PATH`. The JSON result is `QUIET` only
+when all five collectors have valid sampled coverage through the window and it contains
+zero events. Missing, degraded, malformed, or stale coverage returns `REFUSED` (exit 2),
+naming the collector and reason. Quiet keychain intervals require the stream worker and
+its child to stay live; the process-list fallback does not qualify. Review supports the
+running WAL database and does not create a missing database or watcher files. Coverage is
+sampled progress with bounded grace, not proof of continuous capture; see the
+[window rules and result contract](docs/DATA_FORMAT.md#durable-heartbeats-and-read-only-review).
+Synthetic producer, active-WAL, stream-liveness and parity checks are in
+[docs/COVERAGE_TESTING.md](docs/COVERAGE_TESTING.md).
+
 ## What it does not do
 
 - It never blocks, kills or changes anything. It only reads (`ps`, `lsof`, `codesign`,

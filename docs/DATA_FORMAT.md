@@ -6,7 +6,8 @@ event contract, so either one can run against the same `data/` folder (one at a 
 [The pid file](#the-pid-file)) and the one dashboard serves both.
 
 The generated dashboard data uses **formatVersion 2**. The SQLite database remains
-**schema 1**, unchanged. These numbers are independent of the producer's `version` string;
+**schema 1**, with the additive heartbeat protocol-1 tables below. Existing inventory columns
+and the dashboard contract are unchanged. These numbers are independent of the producer's `version` string;
 this format change does not announce a new release or tag. Python and Java follow the same
 contract below.
 
@@ -50,6 +51,12 @@ CREATE TABLE IF NOT EXISTS startup_items(path TEXT PRIMARY KEY, hash TEXT, last_
 CREATE TABLE IF NOT EXISTS startup_versions(
   id INTEGER PRIMARY KEY, path TEXT, hash TEXT, copy_path TEXT, seen_at TEXT);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, time TEXT, kind TEXT, message TEXT);
+CREATE TABLE IF NOT EXISTS heartbeat_schema(version INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS coverage_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS collector_heartbeats(
+  id INTEGER PRIMARY KEY, version INTEGER NOT NULL, collector TEXT NOT NULL, time TEXT NOT NULL,
+  observed_count INTEGER, status TEXT NOT NULL, error TEXT, cadence_seconds REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS collector_heartbeats_time ON collector_heartbeats(collector,time);
 CREATE INDEX IF NOT EXISTS programs_first_seen ON programs(first_seen);
 CREATE INDEX IF NOT EXISTS sightings_time ON sightings(time);
 CREATE INDEX IF NOT EXISTS sightings_exe ON sightings(exe);
@@ -61,10 +68,12 @@ CREATE INDEX IF NOT EXISTS events_time ON events(time);
 
 Rules:
 
-- `schema_version` holds one row. A database whose version is higher than the watcher knows
-  is refused at start. This check follows read-write initialization: WAL setup and
-  `CREATE ... IF NOT EXISTS` have already run. Refusal does not guarantee an untouched
-  database, journal or schema; it is not a read-only compatibility preflight.
+- `schema_version` holds one integer row, 1. `heartbeat_schema` holds one integer row, 1.
+  Existing nonempty version tables are checked before WAL setup and schema extension;
+  unsupported or ambiguous versions are refused. A writer adds the new tables/header to
+  an existing schema-1 database without changing inventory or inventing historical coverage.
+  The read-only review never performs this extension. Older writers can still use the
+  inventory tables, but their silence in the heartbeat history cannot certify coverage.
 - Every time is UTC ISO-8601 to the second with a `Z` (`2026-10-23T15:02:28Z`).
 - `programs.exe` is the full executable path (spaces kept). Identity columns (`sha256`, `size`,
   `signer`, `team`, `signing_id`) are NULL until the identity worker has read the file.
@@ -92,7 +101,109 @@ Rules:
   crontab copies are saved in full. A marker never stands for invented copy bytes.
 - Retention: rows of `sightings` older than `sightings_retention_days`, and of `events` and
   `credential_events` older than `retention_days`, are deleted hourly (0 keeps them forever).
-  `programs`, `listeners` and `startup_*` are never trimmed.
+  Heartbeats follow the existing event retention window. In that same transaction,
+  `coverage_metadata.event_floor` records the greatest event-retention cutoff applied;
+  review refuses a window beginning before it, even if retained boundary heartbeats exist.
+  This watermark never moves backward when retention settings change. No new retention
+  setting or schedule is introduced. `programs`, `listeners` and `startup_*` are never trimmed.
+
+## Durable heartbeats and read-only review
+
+`collector_heartbeats` records every completed polling cycle for `processes`, `listeners`,
+`startup`, and `crontab`, and serviced three-second intervals of the `keychain` log-stream
+worker. Each row has protocol `version: 1`, a UTC sample time, the collector's configured
+`cadence_seconds`, `status` (`ok` or `degraded`), and a bounded error code or NULL.
+`observed_count` is a nonnegative integer only for a wholly accepted observation; failed,
+partial, ended, or unverifiable observations use NULL. Zero means an observed empty result.
+
+Counts mean process records returned by the accepted process sample, distinct present
+listener keys, filesystem startup entries, absent/present crontab (0/1, including an empty
+but present crontab), and valid keychain records before notification/PID deduplication.
+An unreadable filesystem marker keeps startup degraded with an unknown count. Existing
+last-good inventory/baseline rules remain in force. Success heartbeats commit in the same
+transaction as their inventory/events; a rollback cannot leave a healthy heartbeat behind.
+A recoverable failed collection records a degraded heartbeat separately after rollback.
+If the connection cannot persist progress, no healthy replacement row is invented.
+
+The Python keychain worker services nonblocking stdout; Java owns one blocking reader with
+a bounded eight-chunk queue (64 KiB per chunk), independent EOF/failure reporting, and a
+one-MiB partial-record limit. The worker checks its own child and live reader before periodic
+ok-zero heartbeats, and its current interval must contain no malformed or partial record.
+Closed stdout is degraded even if the child remains alive; `available()==0` cannot establish
+healthy idle coverage. Main-loop progress and the process-list credential fallback provide no
+keychain credit. Invalid UTF-8/JSON, duplicate JSON fields, invalid record identities, and
+unterminated records degrade that interval. Worker stalls create heartbeat gaps. Child exit
+is degraded after buffered final records are drained; the existing confirmed-terminal
+restart waits ten seconds, after both owned child and reader are confirmed stopped.
+Incomplete cleanup retains ownership, blocks restart, and stops the watcher with failure.
+An unexpected interrupt records degraded coverage and stops honestly. Initial unavailable or zero-output
+nonzero-exit streams retain the existing process-only fallback, which cannot produce full
+coverage. A mere idle read never restarts the child. A fresh successful interval can recover,
+but cannot erase a failure already inside the requested review window.
+
+Both CLIs accept the same minimal review command:
+
+```sh
+python3 python/tattletale.py --review --db /path/to/tattletale.db \
+  --since 2000-01-01T00:00:00Z --until 2000-01-01T01:00:00Z
+java -jar java/build/tattletale.jar --review --db /path/to/tattletale.db \
+  --since 2000-01-01T00:00:00Z --until 2000-01-01T01:00:00Z
+```
+
+The window includes both endpoints, requires start < end, and uses exact UTC seconds with
+`Z` (no local time, fractional seconds, offsets, or future end). Both window flags are
+required with `--review`; using either without review or mixing review with `--report`,
+`--query`, or `--show-settings` is a usage error before watcher setup. Review opens an
+existing database read-only/query-only and uses one read transaction for schema, heartbeat,
+and event evidence. It supports the actively running WAL writer and its committed rows.
+Normal SQLite read locks/shared-memory bookkeeping may occur; review performs no application
+DDL/DML, checkpoint, migration, copy, PID claim, dashboard publication, or missing-DB creation.
+A database replacement detected across the read is refused. Writer commits after the read
+snapshot begins belong to a subsequent review.
+
+For each collector, review requires a healthy heartbeat inside the requested window and a
+healthy start anchor: a heartbeat exactly at start, or the last prior heartbeat within its
+grace. A degraded prior anchor requires recovery at/before the start of the new window.
+Every in-window degraded row refuses review. Internal gaps must fit **both** adjacent rows'
+grace, and the final in-window heartbeat must be fresh at the window end. Even a very short
+window with no heartbeat inside is unverifiable. One early row cannot cover a whole hour.
+
+Grace is `max(5, 2 * cadence_seconds + 2)` seconds. Declared cadence must be finite and
+between 0.5 and 3600 seconds; unsupported cadences refuse coverage rather than expanding
+grace without a bound (maximum grace 7202 seconds). Process cadence is its actual loop
+interval; listener/startup/crontab cadence is `max(check interval, process interval) + process
+interval`, allowing for scheduling on that loop. Keychain cadence is always three seconds.
+Defaults therefore give 8 seconds for processes/keychain, 68 for listeners, and 608 for
+startup/crontab. Slow commands, suspension, worker death, and clock discontinuities can
+exceed these bounds and correctly refuse coverage. This is evidence of sampled collector
+progress with bounded scheduling grace, not continuous OS capture or all-machine safety.
+
+Results are shared JSON with `resultVersion: 1`, `since`, `until`, `outcome`, `eventCount`,
+and `issues`. Only complete coverage with zero stored events yields `QUIET`. Complete
+coverage with events yields `EVENTS`; this entrypoint does not filter kinds or apply baseline
+rules. `REFUSED` has a NULL event count and issues naming the collector/error, for example:
+
+```json
+{"resultVersion":1,"since":"2000-01-01T00:00:00Z","until":"2000-01-01T01:00:00Z","outcome":"REFUSED","eventCount":null,"issues":[{"collector":"keychain","reason":"end-silence"}]}
+```
+
+Global evidence errors use `collector: null`. Missing legacy heartbeats, unsupported schema/
+protocol versions, unknown collectors, malformed counts/status/times/events, discarded event
+history, and database/query failures always refuse. Retained evidence is validated before a
+time filter can hide malformed/future rows. Java reads evidence in bounded 512-row keyset
+pages ordered by signed SQLite rowid; Python streams its SQLite cursor. Both retain only
+each collector's chronologically latest pre-window anchor and heartbeats inside the requested
+window, sorting selected heartbeats by time and rowid before checking gaps. Event rows are
+validated and counted without retaining their messages. Memory for old history is bounded;
+heartbeat memory grows only with the requested window. Later insertion of an older sample
+cannot replace a newer boundary anchor. All pages remain in the same read snapshot.
+Exit status is 0 for QUIET/EVENTS and 2 for
+REFUSED/usage errors. `coverage_guard` (Python) and `Coverage.guard` (Java) are the reusable
+prerequisite for the later baseline/filter consumer; callers must hold one read-only snapshot
+across the guard and any dependent event reads. Filtering cannot turn REFUSED into QUIET.
+
+The current-epoch four-check `collectionHealth` dashboard object below remains unchanged;
+it is separate from this durable five-collector review evidence.
 
 ## The dashboard data file
 

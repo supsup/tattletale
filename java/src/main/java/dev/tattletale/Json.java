@@ -25,7 +25,11 @@ final class Json {
 
     // ---- reader ----
     static Object parse(String s) throws ParseError {
-        Reader r = new Reader(s);
+        return parse(s,false);
+    }
+    static Object parseStrict(String s) throws ParseError {return parse(s,true);}
+    private static Object parse(String s,boolean strict) throws ParseError {
+        Reader r = new Reader(s,strict);
         r.ws();
         Object v = r.value();
         r.ws();
@@ -35,10 +39,12 @@ final class Json {
 
     private static final class Reader {
         final String s;
+        final boolean strict;
         int i;
 
-        Reader(String s) {
+        Reader(String s,boolean strict) {
             this.s = s;
+            this.strict=strict;
         }
 
         ParseError err(String what) {
@@ -74,9 +80,9 @@ final class Json {
                     if (s.startsWith("true", i)) { i += 4; return Boolean.TRUE; }
                     if (s.startsWith("false", i)) { i += 5; return Boolean.FALSE; }
                     if (s.startsWith("null", i)) { i += 4; return null; }
-                    if (s.startsWith("NaN", i)) { i += 3; return Double.NaN; }
-                    if (s.startsWith("Infinity", i)) { i += 8; return Double.POSITIVE_INFINITY; }
-                    if (s.startsWith("-Infinity", i)) { i += 9; return Double.NEGATIVE_INFINITY; }
+                    if (!strict && s.startsWith("NaN", i)) { i += 3; return Double.NaN; }
+                    if (!strict && s.startsWith("Infinity", i)) { i += 8; return Double.POSITIVE_INFINITY; }
+                    if (!strict && s.startsWith("-Infinity", i)) { i += 9; return Double.NEGATIVE_INFINITY; }
                     if (c == '-' || (c >= '0' && c <= '9')) return number();
                     throw err("Expecting value");
             }
@@ -97,6 +103,7 @@ final class Json {
                 i++;
                 ws();
                 Object v = value();
+                if(strict && m.containsKey(k))throw err("Duplicate property");
                 m.remove(k);
                 m.put(k, v);
                 ws();
@@ -146,6 +153,7 @@ final class Json {
                         case 't' -> sb.append('\t');
                         case 'u' -> {
                             if (i + 4 > s.length()) throw err("Invalid \\uXXXX escape");
+                            if(strict && !s.substring(i,i+4).matches("[0-9a-fA-F]{4}"))throw err("Invalid \\uXXXX escape");
                             try {
                                 sb.append((char) Integer.parseInt(s.substring(i, i + 4), 16));
                             } catch (NumberFormatException x) {
@@ -182,12 +190,17 @@ final class Json {
                 while (i < s.length() && Character.isDigit(s.charAt(i))) i++;
             }
             String t = s.substring(start, i);
+            if(strict && !t.matches("-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"))throw err("Invalid number");
             if (t.equals("-")) {
                 i = start;
                 throw err("Expecting value");
             }
             try {
-                if (frac) return Double.parseDouble(t);
+                if (frac) {
+                    double value=Double.parseDouble(t);
+                    if(strict && !Double.isFinite(value))throw err("Non-finite number");
+                    return value;
+                }
                 BigInteger b = new BigInteger(t);
                 return b.bitLength() < 64 ? (Object) b.longValue() : (Object) b.doubleValue();
             } catch (NumberFormatException x) {
