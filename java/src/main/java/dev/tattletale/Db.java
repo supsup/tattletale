@@ -57,7 +57,9 @@ final class Db implements AutoCloseable {
     private Db(Process proc) {
         this.proc = proc;
         this.in = new BufferedWriter(new OutputStreamWriter(proc.getOutputStream(), StandardCharsets.UTF_8));
-        this.out = new BufferedReader(new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8));
+        this.out = new BufferedReader(new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)));
     }
 
     /**

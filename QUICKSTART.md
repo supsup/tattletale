@@ -106,6 +106,22 @@ edit it; matching rows say `known` instead of `ALERT`.
 
 ## 4. Optional: settings
 
+You can also review collector coverage and event count without starting another watcher:
+
+```sh
+python3 python/tattletale.py --review --since 2000-01-01T00:00:00Z --until 2000-01-01T01:00:00Z
+# Or use java -jar java/build/tattletale.jar with the same flags.
+```
+
+Replace the example UTC endpoints with the window you want. `QUIET` requires valid sampled
+coverage from processes, listeners, startup, crontab, and the keychain stream plus zero
+events. `EVENTS` means coverage is complete and events exist. `REFUSED` (exit 2) names missing,
+degraded, or unverifiable coverage, including legacy databases without heartbeats. The
+command reads the running WAL database and never creates a missing database or watcher
+files. Both endpoints are required; window flags without `--review` are rejected. See
+[the coverage contract](docs/DATA_FORMAT.md#durable-heartbeats-and-read-only-review) for grace
+and boundary rules. The dashboard's four current health checks retain their existing meaning.
+
 ```sh
 cp tattletale.env.example tattletale.env       # at the repository root; git-ignored; both versions read it
 python3 python/tattletale.py --show-settings   # check what took effect
