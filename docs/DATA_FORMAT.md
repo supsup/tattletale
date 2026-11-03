@@ -125,18 +125,24 @@ transaction as their inventory/events; a rollback cannot leave a healthy heartbe
 A recoverable failed collection records a degraded heartbeat separately after rollback.
 If the connection cannot persist progress, no healthy replacement row is invented.
 
-The Python keychain worker services nonblocking stdout; Java owns one blocking reader with
-a bounded eight-chunk queue (64 KiB per chunk), independent EOF/failure reporting, and a
-one-MiB partial-record limit. The worker checks its own child and live reader before periodic
+The Python keychain worker selects stdout and stderr independently; Java owns one reader per
+pipe, each with a bounded eight-chunk queue (64 KiB per chunk). Both have independent
+EOF/failure reporting and a one-MiB stdout partial-record limit. The worker checks its own child and live reader before periodic
 ok-zero heartbeats, and its current interval must contain no malformed or partial record.
 Closed stdout is degraded even if the child remains alive; `available()==0` cannot establish
 healthy idle coverage. Main-loop progress and the process-list credential fallback provide no
-keychain credit. Invalid UTF-8/JSON, duplicate JSON fields, invalid record identities, and
+keychain credit. One initial, nonempty line beginning exactly `Filtering the log data using `
+is the known macOS prelude. It is accepted once, before any other stdout evidence, and
+provides no record count. Repeated/later preludes and arbitrary first non-JSON lines remain
+malformed. Stderr is drained fairly, one bounded chunk per pipe per turn, retaining at most
+4 KiB of diagnostic bytes in memory; it never becomes JSON record evidence. Invalid UTF-8/JSON, duplicate JSON fields, invalid record identities, and
 unterminated records degrade that interval. Worker stalls create heartbeat gaps. Child exit
 is degraded after buffered final records are drained; the existing confirmed-terminal
-restart waits ten seconds, after both owned child and reader are confirmed stopped.
+restart waits ten seconds, after the child and both owned pipes/readers are confirmed stopped.
 Incomplete cleanup retains ownership, blocks restart, and stops the watcher with failure.
-An unexpected interrupt records degraded coverage and stops honestly. Initial unavailable or zero-output
+An unexpected Java worker/reader interrupt records degraded coverage and stops honestly.
+A fixed five-second drain deadline after observed child exit cannot be renewed by diagnostic
+traffic; it is checked between worker steps. Initial unavailable or zero-valid-record
 nonzero-exit streams retain the existing process-only fallback, which cannot produce full
 coverage. A mere idle read never restarts the child. A fresh successful interval can recover,
 but cannot erase a failure already inside the requested review window.
@@ -153,7 +159,8 @@ java -jar java/build/tattletale.jar --review --db /path/to/tattletale.db \
 The window includes both endpoints, requires start < end, and uses exact UTC seconds with
 `Z` (no local time, fractional seconds, offsets, or future end). Both window flags are
 required with `--review`; using either without review or mixing review with `--report`,
-`--query`, or `--show-settings` is a usage error before watcher setup. Review opens an
+`--query`, or `--show-settings` is a usage error before watcher setup. Python also rejects
+`--review --hud` as a usage error before settings/DB access or JSON output. Review opens an
 existing database read-only/query-only and uses one read transaction for schema, heartbeat,
 and event evidence. It supports the actively running WAL writer and its committed rows.
 Normal SQLite read locks/shared-memory bookkeeping may occur; review performs no application
@@ -168,13 +175,21 @@ Every in-window degraded row refuses review. Internal gaps must fit **both** adj
 grace, and the final in-window heartbeat must be fresh at the window end. Even a very short
 window with no heartbeat inside is unverifiable. One early row cannot cover a whole hour.
 
-Grace is `max(5, 2 * cadence_seconds + 2)` seconds. Declared cadence must be finite and
-between 0.5 and 3600 seconds; unsupported cadences refuse coverage rather than expanding
-grace without a bound (maximum grace 7202 seconds). Process cadence is its actual loop
-interval; listener/startup/crontab cadence is `max(check interval, process interval) + process
-interval`, allowing for scheduling on that loop. Keychain cadence is always three seconds.
-Defaults therefore give 8 seconds for processes/keychain, 68 for listeners, and 608 for
-startup/crontab. Slow commands, suspension, worker death, and clock discontinuities can
+Watcher polling intervals must be finite and between 0.5 and 3600 seconds. Constructors
+validate before creating directories or opening a DB; the watcher CLI validates before
+legacy migration. Invalid values are refused, not clipped. Read-only modes do not require
+valid watcher-only interval settings.
+
+Grace is `max(5, 2 * cadence_seconds + 2)` seconds. Process cadence is **twice** its configured
+process interval, a minimal allowance for the serial shared polling loop. Listener/startup/
+crontab cadence is `max(check interval, process interval) + process interval`. Derived cadence
+can therefore reach 7200 seconds (maximum grace 14402), including a supported hourly
+startup interval with default process interval: cadence 3603. Keychain cadence must remain
+exactly three seconds; the wider polling bound cannot expand keychain grace.
+Defaults give 14 seconds for processes, 8 for keychain, 68 for listeners, and 608 for
+startup/crontab. This is a sampled coverage budget, not a hard bound on the whole loop:
+a command may succeed within its own longer timeout while process coverage still has a
+genuine gap. Slow commands, suspension, worker death, and clock discontinuities can
 exceed these bounds and correctly refuse coverage. This is evidence of sampled collector
 progress with bounded scheduling grace, not continuous OS capture or all-machine safety.
 
@@ -188,9 +203,14 @@ rules. `REFUSED` has a NULL event count and issues naming the collector/error, f
 ```
 
 Global evidence errors use `collector: null`. Missing legacy heartbeats, unsupported schema/
-protocol versions, unknown collectors, malformed counts/status/times/events, discarded event
-history, and database/query failures always refuse. Retained evidence is validated before a
-time filter can hide malformed/future rows. Java reads evidence in bounded 512-row keyset
+protocol versions, unknown collectors, unlocatable timestamps, future-stamped evidence,
+discarded event history, malformed event evidence, and database/query failures still refuse.
+For known protocol/collector rows with trustworthy times, heartbeat observation payloads
+(count/status/error/cadence) are checked on every in-window row and the latest necessary
+pre-window anchor. A malformed latest anchor refuses; review never falls back past it to
+an older healthy row. A valid sample exactly at start supersedes that anchor. A superseded
+old bad payload, or one strictly after the requested end, cannot poison an otherwise covered
+recovered window. Java reads evidence in bounded 512-row keyset
 pages ordered by signed SQLite rowid; Python streams its SQLite cursor. Both retain only
 each collector's chronologically latest pre-window anchor and heartbeats inside the requested
 window, sorting selected heartbeats by time and rowid before checking gaps. Event rows are
@@ -202,8 +222,9 @@ REFUSED/usage errors. `coverage_guard` (Python) and `Coverage.guard` (Java) are 
 prerequisite for the later baseline/filter consumer; callers must hold one read-only snapshot
 across the guard and any dependent event reads. Filtering cannot turn REFUSED into QUIET.
 
-The current-epoch four-check `collectionHealth` dashboard object below remains unchanged;
-it is separate from this durable five-collector review evidence.
+The historical guard is CLI-only. The browser since-reviewed view and the current-epoch
+four-check `collectionHealth` dashboard object below remain unchanged; they do not consume
+this durable five-collector window evidence. Browser wiring is a separate slice.
 
 ## The dashboard data file
 

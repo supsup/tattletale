@@ -59,6 +59,9 @@ its child to stay live; the process-list fallback does not qualify. Review suppo
 running WAL database and does not create a missing database or watcher files. Coverage is
 sampled progress with bounded grace, not proof of continuous capture; see the
 [window rules and result contract](docs/DATA_FORMAT.md#durable-heartbeats-and-read-only-review).
+Historical coverage refusal is currently **CLI-only**. The browser's since-reviewed view
+and existing dashboard/HUD health displays do not consume this durable window guard and
+do not certify coverage while the watcher was off. Browser wiring is a separate slice.
 Synthetic producer, active-WAL, stream-liveness and parity checks are in
 [docs/COVERAGE_TESTING.md](docs/COVERAGE_TESTING.md).
 

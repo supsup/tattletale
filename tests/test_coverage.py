@@ -2,6 +2,7 @@
 import argparse
 import contextlib
 import copy
+import datetime as dt
 import io
 import json
 import pathlib
@@ -9,19 +10,22 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+import types
 from unittest import mock
 
 import test_collection_health as health
 import compare_coverage_parity as parity
+import test_review_regressions as regressions
 TT, LSOF, CRON = health.TT, health.LSOF, health.CRON
 
 FIXTURE = json.loads((pathlib.Path(__file__).parent / 'fixtures/coverage.json').read_text())
 T0 = FIXTURE['since']
 RESULTS = []
+PRODUCER_RESULTS = []
 
 
 def stamp(second):
-    return '2000-01-01T00:00:%02dZ' % second
+    return (dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc) + dt.timedelta(seconds=second)).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 def seed(conn):
@@ -61,6 +65,26 @@ def mutate(conn, case):
         conn.execute('UPDATE collector_heartbeats SET ' + case['field'] + "=? WHERE collector='keychain' AND time=?", (case['value'], stamp(0)))
     elif op == 'floor': conn.execute("INSERT INTO coverage_metadata VALUES ('event_floor',?)", (case['value'],))
     elif op == 'bad-event': conn.execute("INSERT INTO events VALUES (NULL,?,'FIXTURE','synthetic')", (case['value'],))
+    elif op == 'cadence': conn.execute('UPDATE collector_heartbeats SET cadence_seconds=? WHERE collector=?', (case['value'], case['target']))
+    elif op in ('old-payload', 'required-payload', 'later-payload'):
+        at = {'old-payload': -1, 'required-payload': 1, 'later-payload': 31}[op]
+        conn.execute("INSERT INTO collector_heartbeats VALUES (NULL,1,'startup',?,0,'ok',NULL,7201)", (stamp(at),))
+    elif op in ('mixed-gap', 'mixed-reverse-gap', 'tight-gap'):
+        conn.execute("DELETE FROM collector_heartbeats WHERE collector='processes'")
+        if op == 'tight-gap':
+            samples = [(second, 1) for second in (0, case['value'], 10, 15, 20, 25, 30)]
+        else:
+            first, later = (3, 6) if op == 'mixed-gap' else (6, 3)
+            samples = [(0, first)] + [(second, later) for second in (case['value'], 15, 22, 30)]
+        for second, cadence in samples:
+            conn.execute("INSERT INTO collector_heartbeats VALUES (NULL,1,'processes',?,0,'ok',NULL,?)", (stamp(second), cadence))
+    elif op == 'process-end':
+        conn.execute("UPDATE collector_heartbeats SET cadence_seconds=6 WHERE collector='processes'")
+        for key in ('listeners', 'startup', 'crontab', 'keychain'):
+            for at in (35, 40, 45): conn.execute("INSERT INTO collector_heartbeats VALUES (NULL,1,?,?,0,'ok',NULL,3)", (key, stamp(at)))
+    elif op == 'anchor-age':
+        conn.execute("DELETE FROM collector_heartbeats WHERE collector='startup' AND time<?", (stamp(2),))
+        conn.execute("INSERT INTO collector_heartbeats VALUES (NULL,1,'startup',?,0,'ok',NULL,3)", (stamp(2 - case['value']),))
     else: raise AssertionError('unhandled fixture operation')
 
 
@@ -81,6 +105,46 @@ def snapshot_guard(conn, since=None):
 
 
 class CoverageTests(unittest.TestCase):
+    def test_review_hud_conflict_is_usage_error_before_any_read_or_write(self):
+        output, error = io.StringIO(), io.StringIO()
+        flags = ['fixture', '--review', '--hud', '--since', T0, '--until', FIXTURE['until']]
+        with mock.patch.object(TT.sys, 'argv', flags), \
+                mock.patch.object(TT, 'resolve_settings', side_effect=AssertionError('settings must not be read')), \
+                mock.patch.object(TT, 'review', side_effect=AssertionError('review must not run')), \
+                mock.patch.object(TT, 'hud_main', side_effect=AssertionError('HUD must not run')), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+            with self.assertRaises(SystemExit) as raised: TT.main()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn('--review and --hud are mutually exclusive', error.getvalue())
+        self.assertEqual(output.getvalue(), '')
+
+    def test_invalid_cli_interval_is_rejected_before_migration_or_watch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = pathlib.Path(directory) / 'fixture.env'; config.write_text('')
+            flags = ['fixture', '--config', str(config), '--process-interval', '0.49']
+            with mock.patch.object(TT.sys, 'argv', flags), \
+                    mock.patch.object(TT, 'migrate_v001', side_effect=AssertionError('migration forbidden')), \
+                    mock.patch.object(TT, 'Watch', side_effect=AssertionError('watch construction forbidden')), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised: TT.main()
+            self.assertEqual(raised.exception.code, 2)
+            self.assertEqual(list(pathlib.Path(directory).iterdir()), [config])
+
+    def test_review_main_success_ignores_watcher_only_invalid_interval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, config = pathlib.Path(directory) / 'db', pathlib.Path(directory) / 'fixture.env'
+            config.write_text(''); writer = sqlite3.connect(path); seed(writer); writer.commit(); writer.close()
+            flags = ['fixture', '--config', str(config), '--db', str(path), '--review', '--since', T0,
+                     '--until', FIXTURE['until'], '--process-interval', '0']
+            output = io.StringIO()
+            with mock.patch.object(TT.sys, 'argv', flags), \
+                    mock.patch.object(TT, 'Watch', side_effect=AssertionError('watcher forbidden')), \
+                    mock.patch.object(TT, 'migrate_v001', side_effect=AssertionError('migration forbidden')), \
+                    contextlib.redirect_stdout(output):
+                with self.assertRaises(SystemExit) as raised: TT.main()
+            self.assertEqual(raised.exception.code, 0)
+            self.assertEqual(json.loads(output.getvalue())['outcome'], 'QUIET')
+
     def test_stream_raw_controls_rejected_but_valid_escapes_are_accepted(self):
         for control in range(32):
             raw = ('{"processID":42,"processImagePath":"/fixture/SecurityAgent","eventMessage":"raw' + chr(control) + '"}').encode()
@@ -144,6 +208,10 @@ class CoverageTests(unittest.TestCase):
         row = next(r for r in wrong_type['results'] if r['name'] == 'healthy-zero')
         row['result']['eventCount'] = False; mutations.append(wrong_type)
         future = copy.deepcopy(good); future['fixtureVersion'] = 2; mutations.append(future)
+        wrong_producer = copy.deepcopy(good)
+        row = next(r for r in wrong_producer['producerResults'] if r['name'] == 'producer-default')
+        next(r for r in row['rows'] if r['collector'] == 'processes')['cadence_seconds'] = 3.0
+        mutations.append(wrong_producer)
         for value in mutations:
             with self.assertRaises(ValueError): parity.validate(value, FIXTURE)
 
@@ -292,6 +360,8 @@ class ProducerHeartbeatTests(unittest.TestCase):
     commands = health.CollectionHealthTests.commands
     ps_responses = health.CollectionHealthTests.ps_responses
     seed_listener = health.CollectionHealthTests.seed_listener
+    rows = regressions.ReviewRegressionTests.rows
+    worker = regressions.ReviewRegressionTests.worker
 
     def pulses(self, key):
         return self.w.db.execute('SELECT observed_count,status,error FROM collector_heartbeats WHERE collector=? ORDER BY id', (key,)).fetchall()
@@ -330,7 +400,7 @@ class ProducerHeartbeatTests(unittest.TestCase):
         self.assertEqual(self.pulses('processes'), [(None, 'degraded', 'collection-db')])
 
     def test_configured_cadence_and_retention_floor(self):
-        self.assertEqual([self.w._cadence(k) for k in TT.COLLECTORS], [3, 33, 303, 303, 3])
+        self.assertEqual([self.w._cadence(k) for k in TT.COLLECTORS], [6, 33, 303, 303, 3])
         self.w.retention_days = 1
         self.w.retain()
         self.assertIsNotNone(self.w.db.execute("SELECT value FROM coverage_metadata WHERE key='event_floor'").fetchone())
@@ -339,17 +409,22 @@ class ProducerHeartbeatTests(unittest.TestCase):
         class Child:
             code = None
             stdout = mock.Mock()
+            stderr = mock.Mock()
             def poll(self): return self.code
             def wait(self, **kwargs): return self.code
             def terminate(self): self.code = 0
             def kill(self): self.code = -9
         child, tick, reads = Child(), [0], []
+        child.stdout.fileno.return_value, child.stderr.fileno.return_value = 31, 32
         final = b'{"processID":42,"processImagePath":"/fixture/SecurityAgent"}\n'
         def selected(timeout):
             tick[0] += 3
             if tick[0] >= 6: child.code = 0
-            return [object()] if child.code is not None else []
+            if tick[0] == 3:
+                return [(types.SimpleNamespace(data='stderr'), TT.selectors.EVENT_READ)]
+            return [(types.SimpleNamespace(data='stdout'), TT.selectors.EVENT_READ)] if child.code is not None else []
         def read(fd, size):
+            if fd == 32: return b''
             reads.append(size)
             return final if len(reads) == 1 else b''
         selector = mock.MagicMock()
@@ -363,6 +438,7 @@ class ProducerHeartbeatTests(unittest.TestCase):
         self.assertEqual(events.call_count, 1)
         self.assertEqual(self.pulses('keychain'), [(0, 'ok', None), (None, 'degraded', 'keychain-ended')])
         child.stdout.close.assert_called_once()
+        child.stderr.close.assert_called_once()
         self.assertIsNone(self.w.stream_proc)
 
     def test_stream_restart_is_delayed_and_previous_child_is_closed(self):
@@ -372,6 +448,7 @@ class ProducerHeartbeatTests(unittest.TestCase):
             child = mock.Mock()
             child.poll.return_value = 0
             child.wait.return_value = 0
+            child.stdout.fileno.return_value, child.stderr.fileno.return_value = 31, 32
             children.append(child)
             return child
         def pause(seconds):
@@ -379,7 +456,7 @@ class ProducerHeartbeatTests(unittest.TestCase):
             if len(delays) == 2: self.w.stop.set()
             return self.w.stop.is_set()
         selector = mock.MagicMock()
-        selector.__enter__.return_value.select.return_value = [object()]
+        selector.__enter__.return_value.select.return_value = [(types.SimpleNamespace(data=name), TT.selectors.EVENT_READ) for name in ('stdout', 'stderr')]
         with mock.patch.object(TT.subprocess, 'Popen', side_effect=start), mock.patch.object(TT.os, 'set_blocking'), \
                 mock.patch.object(TT.os, 'read', return_value=b''), \
                 mock.patch.object(TT.selectors, 'DefaultSelector', return_value=selector), mock.patch.object(self.w.stop, 'wait', side_effect=pause):
@@ -392,8 +469,9 @@ class ProducerHeartbeatTests(unittest.TestCase):
         child = mock.Mock()
         child.poll.return_value = 2
         child.wait.return_value = 2
+        child.stdout.fileno.return_value, child.stderr.fileno.return_value = 31, 32
         selector = mock.MagicMock()
-        selector.__enter__.return_value.select.return_value = [object()]
+        selector.__enter__.return_value.select.return_value = [(types.SimpleNamespace(data=name), TT.selectors.EVENT_READ) for name in ('stdout', 'stderr')]
         with mock.patch.object(TT.subprocess, 'Popen', return_value=child) as starts, mock.patch.object(TT.os, 'set_blocking'), \
                 mock.patch.object(TT.os, 'read', return_value=b''), \
                 mock.patch.object(TT.selectors, 'DefaultSelector', return_value=selector), \
@@ -406,6 +484,7 @@ class ProducerHeartbeatTests(unittest.TestCase):
         class Child:
             code = None
             stdout = mock.Mock()
+            stderr = mock.Mock()
             terminated = False
             def poll(self): return self.code
             def wait(self, timeout):
@@ -414,8 +493,9 @@ class ProducerHeartbeatTests(unittest.TestCase):
             def terminate(self): self.terminated, self.code = True, 0
             def kill(self): raise AssertionError('terminated fake child should not need kill')
         child = Child()
+        child.stdout.fileno.return_value, child.stderr.fileno.return_value = 31, 32
         selector = mock.MagicMock()
-        selector.__enter__.return_value.select.return_value = [object()]
+        selector.__enter__.return_value.select.return_value = [(types.SimpleNamespace(data=name), TT.selectors.EVENT_READ) for name in ('stdout', 'stderr')]
         with mock.patch.object(TT.subprocess, 'Popen', return_value=child) as starts, \
                 mock.patch.object(TT.os, 'set_blocking'), mock.patch.object(TT.os, 'read', return_value=b''), \
                 mock.patch.object(TT.selectors, 'DefaultSelector', return_value=selector), \
@@ -428,11 +508,157 @@ class ProducerHeartbeatTests(unittest.TestCase):
         self.assertTrue(child.terminated)
         self.assertEqual(child.poll(), 0)
         child.stdout.close.assert_called_once()
+        child.stderr.close.assert_called_once()
         self.assertIsNone(self.w.stream_proc)
+
+    def test_dead_child_diagnostic_flood_cannot_renew_drain_deadline(self):
+        child, clock = regressions.FixtureChild(), [0]
+        child.stderr, child.code = child.diagnostics, 0
+        selector = regressions.FixtureSelector(child, clock, 0)
+        def select(timeout):
+            clock[0] += 1
+            self.assertLessEqual(clock[0], 8, 'stderr progress renewed the dead-child deadline')
+            return [(key, TT.selectors.EVENT_READ) for key in list(selector.keys.values())]
+        selector.select = select
+        def read(fd, size): return b'' if fd == 31 else b'x' * size
+        with mock.patch.object(TT.subprocess, 'Popen', return_value=child), mock.patch.object(TT.os, 'set_blocking'), \
+                mock.patch.object(TT.os, 'read', side_effect=read), \
+                mock.patch.object(TT.selectors, 'DefaultSelector', return_value=selector), \
+                mock.patch.object(TT.time, 'monotonic', side_effect=lambda: clock[0]):
+            self.assertFalse(self.w._log_stream_once())
+        self.assertEqual(self.pulses('keychain')[-1], (None, 'degraded', 'keychain-io'))
+        self.assertEqual(len(self.w.stream_diagnostics), 4096)
+        self.assertTrue(child.stdout.closed and child.stderr.closed)
+        self.assertIsNone(self.w.stream_proc)
+
+    def test_unconfirmed_child_cleanup_retains_ownership_and_blocks_retry(self):
+        class Child(regressions.FixtureChild):
+            def wait(self, timeout): raise TT.subprocess.TimeoutExpired('fixture-log', timeout)
+            def terminate(self): self.terminated = True
+            def kill(self): self.terminated = True
+        child, clock = Child(), [0]
+        child.stderr = child.diagnostics
+        child.stdout.eof = child.stderr.eof = True
+        selector = regressions.FixtureSelector(child, clock, 0)
+        selector.select = lambda timeout: [(key, TT.selectors.EVENT_READ) for key in list(selector.keys.values())]
+        with mock.patch.object(TT.subprocess, 'Popen', return_value=child) as starts, \
+                mock.patch.object(TT.os, 'set_blocking'), mock.patch.object(TT.os, 'read', return_value=b''), \
+                mock.patch.object(TT.selectors, 'DefaultSelector', return_value=selector):
+            self.assertFalse(self.w._log_stream_once())
+            self.assertTrue(self.w.stop.is_set())
+            self.assertIs(self.w.stream_proc, child)
+            self.assertEqual(self.pulses('keychain')[-1], (None, 'degraded', 'keychain-cleanup'))
+            self.assertFalse(self.w._log_stream_once())
+            self.assertEqual(starts.call_count, 1)
+        self.assertTrue(child.stdout.closed and child.stderr.closed)
+
+    def test_unconfirmed_pipe_close_blocks_otherwise_eligible_restart(self):
+        child, clock = regressions.FixtureChild(), [0]
+        child.stderr, child.code = child.diagnostics, 0
+        child.stdout.eof = child.stderr.eof = True
+        child.stderr.close = mock.Mock(side_effect=OSError('synthetic diagnostic close failure'))
+        selector = regressions.FixtureSelector(child, clock, 0)
+        selector.select = lambda timeout: [(key, TT.selectors.EVENT_READ) for key in list(selector.keys.values())]
+        with mock.patch.object(TT.subprocess, 'Popen', return_value=child) as starts, mock.patch.object(TT.os, 'set_blocking'), \
+                mock.patch.object(TT.os, 'read', return_value=b''), mock.patch.object(TT.selectors, 'DefaultSelector', return_value=selector):
+            self.assertFalse(self.w._log_stream_once(), 'zero exit cannot waive an unconfirmed owned pipe close')
+            self.assertIs(self.w.stream_proc, child)
+            self.assertTrue(self.w.stop.is_set())
+            self.assertFalse(self.w._log_stream_once())
+            self.assertEqual(starts.call_count, 1)
+        self.assertEqual(self.pulses('keychain')[-1], (None, 'degraded', 'keychain-cleanup'))
+
+
+ROW_SQL = ('SELECT version,collector,time,observed_count,status,error,cadence_seconds '
+           'FROM collector_heartbeats ORDER BY collector,time,id')
+
+
+def actual_rows(watch):
+    cursor = watch.db.execute(ROW_SQL)
+    columns = [column[0] for column in cursor.description]
+    return [dict(zip(columns, row)) for row in cursor]
+
+
+def producer_case(case):
+    def test(self):
+        root = self.root / case['name']
+        self.w = TT.Watch(str(root / 'log'), str(root / 'db'), process_every=case['process'],
+                          listen_every=case['listen'], startup_every=case['startup'], notify=False)
+        self.addCleanup(self.w.db.close)
+        self.w.load_state()
+        def healthy():
+            with self.commands(self.ps_responses()): self.assertTrue(self.w.check_processes())
+            with self.commands({LSOF: (1, '', '')}): self.assertTrue(self.w.check_listeners())
+            with self.commands({CRON: (1, '', 'no crontab for fixture\n')}): self.assertTrue(self.w.check_startup())
+        healthy()
+        if case['scenario'] == 'failure-recovery':
+            with mock.patch.object(TT, 'now', return_value=stamp(1)):
+                with self.commands({health.PS_COMM: (7, '', '')}): self.assertFalse(self.w.check_processes())
+                with self.commands({LSOF: (0, 'p42\ncpartial\n', '')}): self.assertFalse(self.w.check_listeners())
+                with mock.patch.object(self.w, '_startup_files', side_effect=TT.CollectionError('startup-read')), self.commands({CRON: (7, '', '')}):
+                    self.assertFalse(self.w.check_startup())
+            with mock.patch.object(TT, 'now', return_value=stamp(2)): healthy()
+        rows = actual_rows(self.w)
+        parity.equal(rows, case['expectedRows'])
+        PRODUCER_RESULTS.append({'name': case['name'], 'rows': rows})
+    return test
+
+
+def invalid_interval_case(case):
+    def test(self):
+        root = self.root / case['name']
+        values = {'process_every': 3, 'listen_every': 30, 'startup_every': 300}
+        values[{'process': 'process_every', 'listen': 'listen_every', 'startup': 'startup_every'}[case['field']]] = float(case['value'])
+        with self.assertRaises(ValueError): TT.Watch(str(root / 'log'), str(root / 'db'), notify=False, **values)
+        self.assertFalse(root.exists(), 'invalid configuration created a directory or database')
+        PRODUCER_RESULTS.append({'name': case['name'], 'rejected': True, 'directoryEmpty': True})
+    return test
+
+
+def worker_case(case):
+    def test(self):
+        stdout = ''.join(line + '\n' for line in case['stdoutLines']).encode()
+        stderr = (case['stderr'] * case.get('stderrRepeat', 1)).encode()
+        pulses_with_backlog = []
+        class DrainSelector(regressions.FixtureSelector):
+            def select(selector, timeout=None):
+                if case.get('stderrRepeat') and selector.turn == 2:
+                    accepted = self.w.db.execute("SELECT observed_count,status FROM collector_heartbeats WHERE collector='keychain' ORDER BY id DESC LIMIT 1").fetchone()
+                    pulses_with_backlog.append(accepted == (1, 'ok') and bool(selector.child.diagnostics.chunks))
+                if selector.turn < 3:
+                    return super().select(timeout)
+                selector.turn += 1
+                if selector.turn > 12: raise AssertionError('diagnostic drain failed to finish')
+                return [(key, TT.selectors.EVENT_READ) for key in list(selector.keys.values())
+                        if key.fileobj.chunks or key.fileobj.eof]
+        with mock.patch.object(regressions, 'FixtureSelector', DrainSelector):
+            retry, delays, child, ignored = self.worker(stdout, stderr, case['exitCode'])
+        rows = actual_rows(self.w)
+        result = {'name': case['name'], 'rows': rows, 'retry': retry,
+                  'diagnosticBytes': len(self.w.stream_diagnostics),
+                  'credentialEvents': self.w.db.execute("SELECT count(*) FROM credential_events WHERE source='log'").fetchone()[0]}
+        expected = {'name': case['name'], 'rows': case['expectedRows'], 'retry': case['retry'],
+                    'diagnosticBytes': case['diagnosticBytes'], 'credentialEvents': case['credentialEvents']}
+        parity.equal(result, expected)
+        self.assertEqual(child.diagnostics.bytes_read, len(stderr))
+        self.assertTrue(child.stderr.closed)
+        if case.get('stderrRepeat'):
+            self.assertIn(True, pulses_with_backlog, 'stdout count and deadline pulse were starved by continuously ready diagnostics')
+        PRODUCER_RESULTS.append(result)
+    return test
+
+
+for index, case in enumerate(FIXTURE['producerCases']):
+    setattr(ProducerHeartbeatTests, 'test_row_parity_%02d' % index, producer_case(case))
+for index, case in enumerate(FIXTURE['invalidIntervalCases']):
+    setattr(ProducerHeartbeatTests, 'test_invalid_interval_%02d' % index, invalid_interval_case(case))
+for index, case in enumerate(FIXTURE['workerCases']):
+    setattr(ProducerHeartbeatTests, 'test_worker_row_parity_%02d' % index, worker_case(case))
 
 
 def parity_snapshots():
-    result = {'fixtureVersion': 1, 'results': sorted(RESULTS, key=lambda row: row['name'])}
+    result = {'fixtureVersion': 1, 'results': sorted(RESULTS, key=lambda row: row['name']),
+              'producerResults': sorted(PRODUCER_RESULTS, key=lambda row: row['name'])}
     parity.validate(result, FIXTURE)
     return result
 

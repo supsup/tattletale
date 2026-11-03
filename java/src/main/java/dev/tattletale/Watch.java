@@ -145,8 +145,13 @@ final class Watch {
 
     double cadence(String key) {
         if(key.equals("keychain"))return Coverage.KEYCHAIN_CADENCE;
-        if(key.equals("processes"))return processEvery;
+        if(key.equals("processes"))return 2*processEvery;
         return Math.max(processEvery,key.equals("listeners")?listenEvery:startupEvery)+processEvery;
+    }
+    static void validatePolling(double process,double listen,double startup) {
+        double[] values={process,listen,startup};String[] names={"process_interval","listen_interval","startup_interval"};
+        for(int i=0;i<values.length;i++)if(!Double.isFinite(values[i]) || values[i]<0.5 || values[i]>3600)
+            throw new Exit("tattletale: "+names[i]+": expected finite seconds between 0.5 and 3600",2);
     }
     String heartbeatSql(String key,Long count,String error,String at) {
         return Db.bind("INSERT INTO collector_heartbeats(version,collector,time,observed_count,status,error,cadence_seconds) VALUES (?,?,?,?,?,?,?)",
@@ -350,6 +355,9 @@ final class Watch {
     String pidFile;
     volatile Process streamProc;
     volatile OwnedStreamReader streamReader;
+    volatile OwnedStreamReader streamDiagnosticsReader;
+    byte[] streamDiagnostics=new byte[0];
+    static final int STREAM_DIAGNOSTIC_LIMIT=4096;
     volatile String streamWorkerFailure;
 
     static final class Listener {
@@ -364,6 +372,7 @@ final class Watch {
     Watch(String logPath, String dbPath, double listenEvery, double startupEvery, List<String> extraStartup,
             boolean notify, long rotateBytes, long keepLogs, double processEvery, String mapPath, long retentionDays,
             long sightingsRetentionDays, String dashboard) {
+        validatePolling(processEvery,listenEvery,startupEvery);
         this.logPath = logPath;
         this.dbPath = dbPath;
         this.mapPath = mapPath;
@@ -1268,12 +1277,13 @@ final class Watch {
     }
 
     interface StreamFactory { Process start(List<String> command) throws IOException; }
-    StreamFactory streamFactory=command->new ProcessBuilder(command).redirectErrorStream(true)
+    StreamFactory streamFactory=command->new ProcessBuilder(command).redirectErrorStream(false)
             .redirectInput(ProcessBuilder.Redirect.from(new java.io.File("/dev/null"))).start();
     java.util.function.DoubleSupplier streamClock=Watch::monotonic;
     interface StreamPause {boolean waitFor(long millis)throws InterruptedException;}
     StreamPause streamPause=millis->stop.await(millis,TimeUnit.MILLISECONDS);
     java.util.function.Consumer<Map<?,?>> streamEvents=this::streamEvent;
+    java.util.function.LongFunction<String[]> streamLookup=this::lookupNow;
 
     /** Owns the sole blocking stdout read, bounded to eight 64-KiB chunks.
      * EOF/failure is independent of the child process's lifetime. No DB access here.
@@ -1288,7 +1298,10 @@ final class Watch {
         volatile boolean terminal,done,cancelled;
         volatile String error;
         OwnedStreamReader(InputStream input) {
-            this.input=input;thread=new Thread(this::read,"keychain-stdout");thread.setDaemon(true);
+            this(input,"stdout");
+        }
+        OwnedStreamReader(InputStream input,String channel) {
+            this.input=input;thread=new Thread(this::read,"keychain-"+channel);thread.setDaemon(true);
         }
         void start(){thread.start();}
         void read() {
@@ -1320,6 +1333,9 @@ final class Watch {
         return interrupted;
     }
     StreamCleanup cleanupStream(Process child,OwnedStreamReader reader) {
+        return cleanupStream(child,reader,streamDiagnosticsReader);
+    }
+    StreamCleanup cleanupStream(Process child,OwnedStreamReader reader,OwnedStreamReader diagnostics) {
         boolean interrupted=Thread.interrupted(),closed=true;
         if(child!=null) {
             if(child.isAlive())child.destroy();
@@ -1329,12 +1345,17 @@ final class Watch {
                 try {child.waitFor(5,TimeUnit.SECONDS);}catch(InterruptedException e){interrupted=true;}
             }
         }
-        if(reader!=null) {
-            try {reader.cancel();}catch(IOException e){closed=false;}
-            interrupted|=joinOwned(reader.thread,5000);
-        } else if(child!=null)try{child.getInputStream().close();}catch(IOException e){closed=false;}
-        boolean complete=closed && (child==null || !child.isAlive()) && (reader==null || !reader.thread.isAlive());
-        if(complete){streamProc=null;streamReader=null;}
+        for(OwnedStreamReader owned:new OwnedStreamReader[]{reader,diagnostics})if(owned!=null) {
+            try {owned.cancel();}catch(IOException e){closed=false;}
+            interrupted|=joinOwned(owned.thread,5000);
+        }
+        if(child!=null) {
+            if(reader==null)try{child.getInputStream().close();}catch(IOException e){closed=false;}
+            if(diagnostics==null)try{child.getErrorStream().close();}catch(IOException e){closed=false;}
+        }
+        boolean complete=closed && (child==null || !child.isAlive()) && (reader==null || !reader.thread.isAlive())
+                && (diagnostics==null || !diagnostics.thread.isAlive());
+        if(complete){streamProc=null;streamReader=null;streamDiagnosticsReader=null;}
         else {streamWorkerFailure="keychain-cleanup";requestStop();}
         return new StreamCleanup(complete,interrupted);
     }
@@ -1352,25 +1373,32 @@ final class Watch {
     }
     boolean logStreamOnce() {
         // A prior incomplete cleanup never authorizes a second owned child/reader.
-        if(streamProc!=null || streamReader!=null) {
+        if(streamProc!=null || streamReader!=null || streamDiagnosticsReader!=null) {
             streamWorkerFailure="keychain-cleanup";requestStop();heartbeat("keychain",null,"keychain-cleanup");return false;
         }
         List<String> preds=new ArrayList<>();for(String name:STREAM_PROCS)preds.add("process == \""+name+"\"");
         List<String> command=List.of("log","stream","--style","ndjson","--predicate",String.join(" OR ",preds));
-        Process child=null;OwnedStreamReader reader=null;
-        long lines=0;boolean interrupted=false,retry=false,recorded=false,clean=true;
+        Process child=null;OwnedStreamReader reader=null,diagnosticReader=null;
+        boolean interrupted=false,retry=false,recorded=false,clean=true;
         try {
             try {child=streamFactory.start(command);streamProc=child;}
             catch(IOException e){heartbeat("keychain",null,"keychain-unavailable");log("NOTE","log stream unavailable; credential checks use the process list only; keychain coverage is degraded");return false;}
             reader=new OwnedStreamReader(child.getInputStream());streamReader=reader;reader.start();
+            diagnosticReader=new OwnedStreamReader(child.getErrorStream(),"stderr");streamDiagnosticsReader=diagnosticReader;diagnosticReader.start();
             java.io.ByteArrayOutputStream pending=new java.io.ByteArrayOutputStream();
+            java.io.ByteArrayOutputStream diagnostics=new java.io.ByteArrayOutputStream();streamDiagnostics=new byte[0];
             KeychainProgress progress=new KeychainProgress();
-            double deadline=streamClock.getAsDouble()+Coverage.KEYCHAIN_CADENCE,deadSince=Double.NaN;
+            double deadline=streamClock.getAsDouble()+Coverage.KEYCHAIN_CADENCE,deadSince=Double.NaN,closedSince=Double.NaN;
             while(!stopped()) {
                 byte[] bytes=reader.chunks.poll();
+                // Fair, bounded diagnostic drain. Stderr is never JSON record evidence.
+                byte[] diagnosticBytes=diagnosticReader.chunks.poll();
+                if(diagnosticBytes!=null) {
+                    diagnostics.write(diagnosticBytes,0,Math.min(diagnosticBytes.length,STREAM_DIAGNOSTIC_LIMIT-diagnostics.size()));
+                    streamDiagnostics=diagnostics.toByteArray();
+                }
                 if(bytes!=null)for(byte value:bytes) {
                     if(value=='\n') {
-                        lines++;
                         Map<?,?> event=progress.line(pending.toByteArray());pending.reset();
                         if(event!=null)streamEvents.accept(event);
                     } else pending.write(value);
@@ -1378,37 +1406,55 @@ final class Watch {
                 }
                 if(recorded)break;
                 boolean alive=child.isAlive();
-                if(reader.thread.isInterrupted() && !reader.cancelled) {
+                if((reader.thread.isInterrupted() && !reader.cancelled)
+                        || (diagnosticReader.thread.isInterrupted() && !diagnosticReader.cancelled)) {
                     streamWorkerFailure="keychain-interrupted";requestStop();
                     heartbeat("keychain",null,"keychain-interrupted");recorded=true;break;
                 }
+                if(diagnosticReader.error!=null) {
+                    heartbeat("keychain",null,diagnosticReader.error);recorded=true;
+                    if(diagnosticReader.error.equals("keychain-interrupted")){streamWorkerFailure="keychain-interrupted";requestStop();}
+                    break;
+                }
                 // Finished reader + empty queue proves final bytes have been drained.
                 // EOF while the child remains alive is a closed stream, never healthy idle.
-                if(reader.done && reader.chunks.isEmpty()) {
-                    String error=reader.error!=null?reader.error:alive?"keychain-closed":"keychain-ended";
+                boolean stdoutDone=reader.done && reader.chunks.isEmpty();
+                boolean diagnosticsDone=diagnosticReader.done && diagnosticReader.chunks.isEmpty();
+                if(stdoutDone && reader.error!=null) {
+                    heartbeat("keychain",null,reader.error);recorded=true;
+                    if(reader.error.equals("keychain-interrupted")){streamWorkerFailure=reader.error;requestStop();}
+                    break;
+                }
+                if(stdoutDone && diagnosticsDone) {
+                    if(alive)alive=!child.waitFor(5,TimeUnit.SECONDS);
+                    String error=alive?"keychain-closed":"keychain-ended";
                     heartbeat("keychain",null,error);recorded=true;
                     if(error.equals("keychain-interrupted")){streamWorkerFailure=error;requestStop();}
-                    if(reader.error==null && !alive) {
-                        if(lines==0 && child.exitValue()!=0)log("NOTE","log stream exited without output; credential checks use the process list only; keychain coverage is degraded");
-                        retry=lines>0 || child.exitValue()==0;
+                    if(!alive) {
+                        if(progress.recordsSeen==0 && child.exitValue()!=0)log("NOTE","log stream exited without records; credential checks use the process list only; keychain coverage is degraded");
+                        retry=progress.recordsSeen>0 || child.exitValue()==0;
                     }
                     break;
                 }
                 double now=streamClock.getAsDouble();
                 if(!alive) {
-                    if(bytes!=null || Double.isNaN(deadSince))deadSince=now;
+                    if(Double.isNaN(deadSince))deadSince=now;
                     if(now-deadSince>=5) {
                         streamWorkerFailure="keychain-reader-stalled";requestStop();
                         heartbeat("keychain",null,"keychain-reader-stalled");recorded=true;break;
                     }
                 }
-                if(alive && reader.observing() && now>=deadline) {
+                if(stdoutDone && alive) {
+                    if(Double.isNaN(closedSince))closedSince=now;
+                    if(now-closedSince>=5){heartbeat("keychain",null,"keychain-closed");recorded=true;break;}
+                }
+                if(alive && reader.observing() && (diagnosticReader.done || diagnosticReader.observing()) && now>=deadline) {
                     KeychainProgress.Cycle cycle=progress.cycle(true,pending.size()!=0);
                     // Recheck terminal state after taking the count: no EOF/failure credit.
-                    if(reader.observing())heartbeat("keychain",cycle.count(),cycle.error());
+                    if(reader.observing() && diagnosticReader.error==null)heartbeat("keychain",cycle.count(),cycle.error());
                     deadline=now+Coverage.KEYCHAIN_CADENCE;
                 }
-                if(bytes==null && streamPause.waitFor(250))break;
+                if(bytes==null && diagnosticBytes==null && streamPause.waitFor(250))break;
             }
             if(!recorded)heartbeat("keychain",null,"keychain-ended");
         } catch(InterruptedException e) {
@@ -1416,7 +1462,7 @@ final class Watch {
             if(!expected){streamWorkerFailure="keychain-interrupted";requestStop();}
             heartbeat("keychain",null,expected?"keychain-ended":"keychain-interrupted");
         } finally {
-            StreamCleanup cleanup=cleanupStream(child,reader);clean=cleanup.complete();interrupted|=cleanup.interrupted();
+            StreamCleanup cleanup=cleanupStream(child,reader,diagnosticReader);clean=cleanup.complete();interrupted|=cleanup.interrupted();
             if(cleanup.interrupted() && !stopped()){streamWorkerFailure="keychain-interrupted";requestStop();}
             if(interrupted)Thread.currentThread().interrupt();
         }
@@ -1428,7 +1474,7 @@ final class Watch {
     void streamEvent(Map<?,?> ev) {
         long pid=(Long)ev.get("processID");String proc=Py.basename((String)ev.get("processImagePath"));
         double t=monotonic();Double last=streamPids.get(pid);if(last!=null && t-last<300)return;
-        String[] lookup=lookupNow(pid);String args=lookup[0],chain=lookup[1];
+        String[] lookup=streamLookup.apply(pid);String args=lookup[0],chain=lookup[1];
         String kind=proc.equals("SecurityAgent")?"PASSWORD":"CRED-NET";
         String message=proc+" pid "+pid+" | args: "+(args.isEmpty()?"(exited)":args)+" | chain: "+chain
                 +" | first log: "+Py.cut(ev.containsKey("eventMessage")?(String)ev.get("eventMessage"):"",160);
@@ -1556,8 +1602,8 @@ final class Watch {
             requestStop();
             for(Thread worker:workers) worker.interrupt();
             boolean interrupted=false;
-            // Stream cleanup can spend 5s each on terminate, kill, and reader join.
-            for(Thread worker:workers)interrupted|=joinOwned(worker,20000);
+            // Terminal wait, terminate/kill, and both owned reader joins are bounded.
+            for(Thread worker:workers)interrupted|=joinOwned(worker,30000);
             for(Thread worker:workers)if(worker.isAlive())streamWorkerFailure="worker-cleanup-incomplete";
             synchronized(LOCK) {db.close();}
             releasePidFile();

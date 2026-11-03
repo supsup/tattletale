@@ -15,6 +15,7 @@ final class Coverage {
     static final long VERSION=1;
     static final double KEYCHAIN_CADENCE=3;
     static final int PAGE_SIZE=512;
+    static final double MAX_CADENCE=7200;
     static final List<String> COLLECTORS=List.of("processes","listeners","startup","crontab","keychain");
     private Coverage() {}
 
@@ -41,7 +42,13 @@ final class Coverage {
         List<Map<String,Object>> rows=db.query("SELECT version FROM "+table+" LIMIT 2;");
         return rows.size()==1 && rows.getFirst().get("version") instanceof Long value && value==version;
     }
-    record Pulse(long rowid,double at,String status,String error,double grace) {}
+    record Pulse(long rowid,double at,String status,String error,double grace,boolean malformed) {}
+    static boolean validCadence(String collector,Object raw) {
+        if(!(raw instanceof Number number))return false;
+        double value=number.doubleValue();
+        return Double.isFinite(value) && value>=0.5 && value<=MAX_CADENCE
+                && (!collector.equals("keychain") || value==KEYCHAIN_CADENCE);
+    }
     static final Comparator<Pulse> CHRONOLOGICAL=Comparator.comparingDouble(Pulse::at).thenComparingLong(Pulse::rowid);
 
     /** One bounded JSON result at a time, including SQLite's full signed rowid range.
@@ -106,15 +113,16 @@ final class Coverage {
                 Object rawKey=row.get("collector");if(!(rawKey instanceof String key) || !grouped.containsKey(key))return refused(since,until,null,"unknown-collector");
                 double at;
                 try {at=time(row.get("time"));}catch(RuntimeException e){return refused(since,until,key,"malformed-heartbeat");}
+                if(at>present)return refused(since,until,key,"malformed-heartbeat");
+                if(at>end)continue;
                 Object count=row.get("observed_count"),rawCadence=row.get("cadence_seconds"),error=row.get("error"),status=row.get("status");
-                if(!(rawCadence instanceof Number number))return refused(since,until,key,"malformed-heartbeat");
-                double cadence=number.doubleValue();
                 boolean ok="ok".equals(status),degraded="degraded".equals(status);
-                if(at>present || !Double.isFinite(cadence) || cadence<0.5 || cadence>3600 || (!ok && !degraded)
+                boolean malformed=!validCadence(key,rawCadence) || (!ok && !degraded)
                         || (ok && (!(count instanceof Long n) || n<0 || error!=null))
-                        || (degraded && (count!=null || !(error instanceof String s) || !s.matches("[a-z][a-z0-9-]{0,63}"))))
-                    return refused(since,until,key,"malformed-heartbeat");
-                Pulse pulse=new Pulse((Long)row.get("evidence_rowid"),at,(String)status,(String)error,Math.max(5,2*cadence+2));
+                        || (degraded && (count!=null || !(error instanceof String s) || !s.matches("[a-z][a-z0-9-]{0,63}")));
+                Pulse pulse=new Pulse((Long)row.get("evidence_rowid"),at,malformed?"degraded":(String)status,
+                        malformed?"malformed-heartbeat":(String)error,
+                        malformed?0:Math.max(5,2*((Number)rawCadence).doubleValue()+2),malformed);
                 if(at<start) {
                     Pulse prior=anchors.get(key);
                     if(prior==null || CHRONOLOGICAL.compare(prior,pulse)<0)anchors.put(key,pulse);
@@ -127,6 +135,8 @@ final class Coverage {
                 if(inside.isEmpty()){issues.add(issue(key,"missing-heartbeat"));continue;}
                 Pulse first=inside.getFirst();
                 if(first.at()==start)anchor=null;
+                if((anchor!=null && anchor.malformed()) || inside.stream().anyMatch(Pulse::malformed))
+                    return refused(since,until,key,"malformed-heartbeat");
                 if(anchor==null) {if(first.at()!=start)issues.add(issue(key,"start-silence"));}
                 else if(!anchor.status().equals("ok") || start-anchor.at()>anchor.grace())issues.add(issue(key,"start-silence"));
                 TreeSet<String> errors=new TreeSet<>();for(Pulse row:inside)if(!row.status().equals("ok"))errors.add(row.error());

@@ -565,6 +565,7 @@ public final class Main {
                 runQuery(dbPath, a.query);
                 return 0;
             }
+            Watch.validatePolling(num(eff.get("process_interval")),num(eff.get("listen_interval")),num(eff.get("startup_interval")));
             if (r.src().get("db").equals("default")) {
                 List<String> moved = migrateV001(Py.dirname(dbPath));
                 if (moved != null && !moved.isEmpty())
@@ -581,7 +582,7 @@ public final class Main {
         List<String> extra = (List<String>) eff.get("extra_startup");
         Watch w = new Watch((String) eff.get("log"), dbPath, num(eff.get("listen_interval")), num(eff.get("startup_interval")),
                 extra, (Boolean) eff.get("notify"), (long) (num(eff.get("rotate_mb")) * 1024 * 1024), Math.max(0, keep),
-                pi > 0.5 ? pi : 0.5, (String) eff.get("map"), (Long) eff.get("retention_days"),
+                pi, (String) eff.get("map"), (Long) eff.get("retention_days"),
                 (Long) eff.get("sightings_retention_days"), DASHBOARD);
         Signals.install(w::requestStop);
         try {

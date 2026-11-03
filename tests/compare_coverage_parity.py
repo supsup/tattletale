@@ -35,7 +35,13 @@ def oracle(fixture):
     for case in fixture['streamCases']:
         rows.append({'name': 'stream-' + case['name'], 'count': case['count'], 'error': case['error']})
     require(len({row['name'] for row in rows}) == len(rows), 'duplicate fixture case')
-    return {'fixtureVersion': 1, 'results': sorted(rows, key=lambda row: row['name'])}
+    producer = [{'name': case['name'], 'rows': case['expectedRows']} for case in fixture['producerCases']]
+    producer += [{'name': case['name'], 'rejected': True, 'directoryEmpty': True} for case in fixture['invalidIntervalCases']]
+    producer += [{'name': case['name'], 'rows': case['expectedRows'], 'retry': case['retry'],
+                  'diagnosticBytes': case['diagnosticBytes'], 'credentialEvents': case['credentialEvents']} for case in fixture['workerCases']]
+    require(len({row['name'] for row in producer}) == len(producer), 'duplicate producer fixture case')
+    return {'fixtureVersion': 1, 'results': sorted(rows, key=lambda row: row['name']),
+            'producerResults': sorted(producer, key=lambda row: row['name'])}
 
 
 def equal(actual, expected, at='$'):
@@ -58,7 +64,10 @@ def compare(python_path, java_path, fixture_path):
     fixture, left, right = load(fixture_path), load(python_path), load(java_path)
     validate(left, fixture); validate(right, fixture); equal(left, right)
     return {'dataComparison': 'equal', 'producerExecutionCertified': False,
-            'coverageCases': len(fixture['cases']), 'streamCases': len(fixture['streamCases'])}
+            'coverageCases': len(fixture['cases']), 'streamCases': len(fixture['streamCases']),
+            'producerCases': len(fixture['producerCases']), 'invalidIntervalCases': len(fixture['invalidIntervalCases']),
+            'workerCases': len(fixture['workerCases']),
+            'producerRows': sum(len(case['expectedRows']) for case in fixture['producerCases'] + fixture['workerCases'])}
 
 
 def main():

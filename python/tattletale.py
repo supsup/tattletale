@@ -132,6 +132,10 @@ CHECKS = ("processes", "listeners", "startup", "crontab")
 COLLECTORS = CHECKS + ("keychain",)
 HEARTBEAT_VERSION = 1
 KEYCHAIN_CADENCE = 3.0
+MAX_POLL_INTERVAL = 3600.0
+MAX_HEARTBEAT_CADENCE = 2 * MAX_POLL_INTERVAL
+LOG_STREAM_PRELUDE = "Filtering the log data using "
+STREAM_DIAGNOSTIC_LIMIT = 4096
 ASCII_WS = " \t\r\n\v\f"
 STARTUP_MAX_BYTES = 16 * 1024 * 1024
 
@@ -142,6 +146,19 @@ class CollectionError(ValueError):
 
 class FatalDatabaseError(RuntimeError):
     """The connection is unusable; propagate past recoverable polling errors."""
+
+
+def validate_polling_intervals(process_every, listen_every, startup_every):
+    for name, value in (("process_interval", process_every), ("listen_interval", listen_every),
+                        ("startup_interval", startup_every)):
+        if type(value) not in (int, float) or not math.isfinite(value) or not 0.5 <= value <= MAX_POLL_INTERVAL:
+            raise ValueError(name + ": expected finite seconds between 0.5 and 3600")
+
+
+def valid_heartbeat_cadence(collector, cadence):
+    return (type(cadence) in (int, float) and math.isfinite(cadence)
+            and 0.5 <= cadence <= MAX_HEARTBEAT_CADENCE
+            and (collector != "keychain" or cadence == KEYCHAIN_CADENCE))
 
 
 def bounded_ascii_number(value, minimum, maximum, reason):
@@ -365,9 +382,16 @@ class KeychainProgress:
     """Worker-owned progress since its last durable pulse; no process-poll credit."""
     def __init__(self):
         self.count, self.error = 0, None
+        self.records_seen, self.stdout_evidence, self.prelude_seen = 0, False, False
 
     def line(self, raw):
         try:
+            text = raw.decode("utf-8")
+            if (not self.stdout_evidence and not self.prelude_seen and text.startswith(LOG_STREAM_PRELUDE)
+                    and len(text) > len(LOG_STREAM_PRELUDE) and not any(ord(c) < 32 for c in text)):
+                self.prelude_seen = True
+                return None
+            self.stdout_evidence = True
             def unique(pairs):
                 result = {}
                 for key, value in pairs:
@@ -380,7 +404,7 @@ class KeychainProgress:
             def finite_float(value):
                 number = float(value)
                 return number if math.isfinite(number) else nonfinite(value)
-            ev = json.loads(raw.decode("utf-8"), object_pairs_hook=unique, parse_constant=nonfinite,
+            ev = json.loads(text, object_pairs_hook=unique, parse_constant=nonfinite,
                             parse_float=finite_float)
             if (type(ev) is not dict or type(ev.get("processID")) is not int
                     or not 0 < ev["processID"] <= 2147483647
@@ -390,9 +414,11 @@ class KeychainProgress:
                     or type(ev.get("eventMessage", "")) is not str):
                 raise ValueError("stream-record")
         except (UnicodeError, ValueError, TypeError, RecursionError):
+            self.stdout_evidence = True
             self.error = "keychain-malformed"
             return None
         self.count += 1
+        self.records_seen += 1
         return ev
 
     def cycle(self, alive=True, partial=False):
@@ -406,6 +432,7 @@ class Watch:
     def __init__(self, log_path, db_path, listen_every=30, startup_every=300, extra_startup=(),
                  notify=True, rotate_bytes=20 * 1024 * 1024, keep_logs=3, process_every=3,
                  map_path=None, retention_days=30, sightings_retention_days=7):
+        validate_polling_intervals(process_every, listen_every, startup_every)
         self.log_path, self.db_path, self.map_path = log_path, db_path, map_path
         self.notify_on, self.rotate_bytes, self.keep_logs = notify, rotate_bytes, keep_logs
         self.process_every = process_every
@@ -439,6 +466,7 @@ class Watch:
         self._inventory_cache = None
         self._inventory_as_of = None
         self.worker_database_failure = None
+        self.stream_worker_failure = None
 
     def _attempt(self, name):
         with lock:
@@ -452,7 +480,7 @@ class Watch:
         if name == "keychain":
             return KEYCHAIN_CADENCE
         if name == "processes":
-            return self.process_every
+            return 2 * self.process_every
         return max(self.process_every, self.listen_every if name == "listeners" else self.startup_every) + self.process_every
 
     def _heartbeat(self, name, count, error=None, conn=None, at=None):
@@ -1429,71 +1457,147 @@ class Watch:
                 return
             self.stop.wait(10)  # existing bounded recovery, after owned child cleanup
 
+    def _cleanup_stream(self, child):
+        """Keep ownership on uncertain termination/close; never authorize another child."""
+        complete = True
+        try:
+            if child.poll() is None:
+                child.terminate()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            complete = False
+        for pipe in (getattr(child, "stdout", None), getattr(child, "stderr", None)):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    complete = False
+        complete = complete and child.poll() is not None
+        if complete:
+            self.stream_proc, self.stream_pipes = None, ()
+        else:
+            self.stream_worker_failure = "keychain-cleanup"
+            self.stop.set()
+        return complete
+
     def _log_stream_once(self):
+        if getattr(self, "stream_proc", None) is not None:
+            self.stream_worker_failure = "keychain-cleanup"
+            self.stop.set()
+            self._heartbeat("keychain", None, "keychain-cleanup")
+            return False
         pred = " OR ".join(f'process == "{p}"' for p in self.STREAM_PROCS)
         cmd = ["log", "stream", "--style", "ndjson", "--predicate", pred]
-        p, pending, progress, lines = None, b"", KeychainProgress(), 0
+        child, pending, progress = None, b"", KeychainProgress()
+        diagnostics = bytearray()
+        self.stream_diagnostics = b""
+        retry, recorded, clean = False, False, True
         try:
             try:
-                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     stdin=subprocess.DEVNULL)
-                self.stream_proc = p
+                child = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                         stdin=subprocess.DEVNULL)
+                self.stream_proc = child
+                self.stream_pipes = (child.stdout, child.stderr)
             except OSError:
                 self._heartbeat("keychain", None, "keychain-unavailable")
                 self.log("NOTE", "log stream unavailable; credential checks use the process list only; keychain coverage is degraded")
                 return False
-            # The worker advances this control only after checking its own pipe and child.
-            # A blocked/dead worker cannot be certified by the main polling loop.
-            os.set_blocking(p.stdout.fileno(), False)
+            pipes = {"stdout": child.stdout, "stderr": child.stderr}
             with selectors.DefaultSelector() as selected:
-                selected.register(p.stdout, selectors.EVENT_READ)
+                for name, pipe in pipes.items():
+                    os.set_blocking(pipe.fileno(), False)
+                    selected.register(pipe, selectors.EVENT_READ, name)
                 deadline = time.monotonic() + KEYCHAIN_CADENCE
+                stdout_closed_at, dead_since = None, None
                 while not self.stop.is_set():
-                    ready = selected.select(min(0.25, max(0, deadline - time.monotonic())))
-                    if ready or p.poll() is not None:
-                        chunk = os.read(p.stdout.fileno(), 65536)
+                    code = child.poll()
+                    if code is not None and dead_since is None:
+                        dead_since = time.monotonic()
+                    closing = stdout_closed_at is not None or code is not None
+                    ready = selected.select(0.25 if closing else min(0.25, max(0, deadline - time.monotonic())))
+                    names = {key.data for key, _ in ready}
+                    code = child.poll()
+                    if code is not None:
+                        if dead_since is None:
+                            dead_since = time.monotonic()
+                        names.update(pipes)
+                    # One bounded chunk per channel per turn prevents diagnostic starvation.
+                    for name in ("stdout", "stderr"):
+                        if name not in names or name not in pipes:
+                            continue
+                        pipe = pipes[name]
+                        try:
+                            chunk = os.read(pipe.fileno(), 65536)
+                        except BlockingIOError:
+                            continue
                         if not chunk:
-                            self._heartbeat("keychain", None, "keychain-ended")
-                            code = p.wait(timeout=5)
-                            if lines == 0 and code != 0 and not self.stop.is_set():
-                                self.log("NOTE", "log stream exited without output; credential checks use the process list only; keychain coverage is degraded")
-                            return lines > 0 or code == 0
+                            selected.unregister(pipe)
+                            del pipes[name]
+                            if name == "stdout":
+                                stdout_closed_at = time.monotonic()
+                            continue
+                        if name == "stderr":
+                            diagnostics.extend(chunk[:max(0, STREAM_DIAGNOSTIC_LIMIT - len(diagnostics))])
+                            self.stream_diagnostics = bytes(diagnostics)
+                            continue
                         pending += chunk
                         if len(pending) > 1024 * 1024:
                             self._heartbeat("keychain", None, "keychain-malformed")
-                            return False
+                            recorded = True
+                            break
                         while b"\n" in pending:
                             line, pending = pending.split(b"\n", 1)
-                            lines += 1
-                            ev = progress.line(line)
-                            if ev is not None:
-                                self._stream_event(ev)
-                    if p.poll() is None and time.monotonic() >= deadline:
+                            event = progress.line(line)
+                            if event is not None:
+                                self._stream_event(event)
+                    if recorded:
+                        break
+                    code = child.poll()
+                    if not pipes:
+                        if code is None:
+                            code = child.wait(timeout=5)
+                        self._heartbeat("keychain", None, "keychain-ended")
+                        recorded = True
+                        if code != 0 and progress.records_seen == 0:
+                            self.log("NOTE", "log stream exited without records; credential checks use the process list only; keychain coverage is degraded")
+                        retry = progress.records_seen > 0 or code == 0
+                        break
+                    tick = time.monotonic()
+                    if code is not None:
+                        if dead_since is None:
+                            dead_since = tick
+                        if tick - dead_since >= 5:
+                            self._heartbeat("keychain", None, "keychain-io")
+                            recorded = True
+                            break
+                    elif stdout_closed_at is not None:
+                        if tick - stdout_closed_at >= 5:
+                            self._heartbeat("keychain", None, "keychain-closed")
+                            recorded = True
+                            break
+                    elif tick >= deadline:
                         count, error = progress.cycle(partial=bool(pending))
                         self._heartbeat("keychain", count, error)
-                        deadline = time.monotonic() + KEYCHAIN_CADENCE
-                self._heartbeat("keychain", None, "keychain-ended")
+                        deadline = tick + KEYCHAIN_CADENCE
+                if not recorded:
+                    self._heartbeat("keychain", None, "keychain-ended")
         except (OSError, ValueError):
             self._heartbeat("keychain", None, "keychain-io")
-            return False
         except subprocess.TimeoutExpired:
             self._heartbeat("keychain", None, "keychain-ended")
-            return False
         except sqlite3.Error as error:
-            # Missing durable progress must stop this worker; never follow it with ok-zero.
             require_recovered_db(self.db, error)
             raise FatalDatabaseError("keychain-db") from error
         finally:
-            if p is not None:
-                if p.poll() is None:
-                    p.terminate()
-                try:
-                    p.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    p.kill()
-                    p.wait(timeout=5)
-                p.stdout.close()
-                self.stream_proc = None
+            if child is not None:
+                clean = self._cleanup_stream(child)
+        if not clean:
+            self._heartbeat("keychain", None, "keychain-cleanup")
+        return retry and clean and not self.stop.is_set()
 
     def _stream_event(self, ev):
         pid, proc, t = ev["processID"], os.path.basename(ev["processImagePath"]), time.monotonic()
@@ -1656,6 +1760,8 @@ class Watch:
                 self.stop.wait(self.process_every)
             if self.worker_database_failure is not None:
                 raise self.worker_database_failure
+            if self.stream_worker_failure is not None:
+                raise FatalDatabaseError(self.stream_worker_failure)
         finally:
             # A fatal DB error must exit, not turn into a silent live no-op. Cleanup may
             # fail too, but must neither mask the primary failure nor skip PID release.
@@ -1689,6 +1795,8 @@ class Watch:
             cleanup(self.release_pid_file)
             if original is None and self.worker_database_failure is not None:
                 raise self.worker_database_failure
+            if original is None and getattr(self, "stream_worker_failure", None) is not None:
+                raise FatalDatabaseError(self.stream_worker_failure)
             if cleanup_error is not None:
                 print("tattletale: cleanup incomplete", file=sys.stderr, flush=True)
                 if original is None:
@@ -1877,8 +1985,8 @@ def coverage_guard(conn, since, until, current_time=None):
             return review_result(since, until, [issue(None, "malformed-metadata")])
         if floors and start < review_time(floors[0][1]):
             return review_result(since, until, [issue(None, "events-expired")])
-        # Validate the complete retained evidence, including rows whose malformed time
-        # would otherwise disappear from a SQL range predicate. No unknown version waiver.
+        # Protocol/collector/time must be trustworthy before a row can be located.
+        # Observation payloads matter only inside the window or on its required anchor.
         grouped = {key: [] for key in COLLECTORS}
         anchors = {}
         # sqlite3 streams rows; retain one chronological pre-window anchor per collector,
@@ -1893,14 +2001,16 @@ def coverage_guard(conn, since, until, current_time=None):
                 at = review_time(stamp)
             except (ValueError, OverflowError):
                 return review_result(since, until, [issue(key, "malformed-heartbeat")])
-            if (at > present or type(cadence) not in (int, float) or not math.isfinite(cadence)
-                    or not 0.5 <= cadence <= 3600
+            if at > present:
+                return review_result(since, until, [issue(key, "malformed-heartbeat")])
+            if at > end:
+                continue
+            malformed = (not valid_heartbeat_cadence(key, cadence)
                     or status not in ("ok", "degraded")
                     or (status == "ok" and (type(count) is not int or count < 0 or error is not None))
                     or (status == "degraded" and (count is not None or type(error) is not str
-                                                 or not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", error)))):
-                return review_result(since, until, [issue(key, "malformed-heartbeat")])
-            pulse = (at, status, error, max(5.0, 2 * cadence + 2), rowid)
+                                                 or not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", error))))
+            pulse = (at, status, error, 0 if malformed else max(5.0, 2 * cadence + 2), rowid, malformed)
             if at < start:
                 prior = anchors.get(key)
                 if prior is None or (prior[0], prior[4]) < (at, rowid):
@@ -1918,6 +2028,8 @@ def coverage_guard(conn, since, until, current_time=None):
             first = inside[0]
             if first[0] == start:
                 anchor = None
+            if any(row[5] for row in ([anchor] if anchor is not None else []) + inside):
+                return review_result(since, until, [issue(key, "malformed-heartbeat")])
             if anchor is None:
                 if first[0] != start:
                     issues.append(issue(key, "start-silence"))
@@ -2547,6 +2659,8 @@ def main():
         else:
             ap.add_argument(flag, dest=name, type=kind, default=None, help=f"{help_text} (default {default})")
     a = ap.parse_args()
+    if a.review and a.hud:
+        ap.error("--review and --hud are mutually exclusive")
     if sum((a.review, a.report, a.query is not None, a.show_settings)) > 1:
         ap.error("--review, --report, --query and --show-settings are mutually exclusive")
     if a.review != (a.since is not None and a.until is not None) or (not a.review and (a.since is not None or a.until is not None)):
@@ -2570,6 +2684,10 @@ def main():
     if a.hud:
         hud_main(eff["db"], a.hud_interval, os.path.expanduser(a.hud_baseline or HUD_BASELINE))
         return
+    try:
+        validate_polling_intervals(eff["process_interval"], eff["listen_interval"], eff["startup_interval"])
+    except ValueError as error:
+        ap.error(str(error))
     if src["db"] == "default":
         moved = migrate_v001(os.path.dirname(eff["db"]))
         if moved:
@@ -2578,7 +2696,7 @@ def main():
     w = Watch(eff["log"], eff["db"], eff["listen_interval"], eff["startup_interval"],
               eff["extra_startup"], notify=eff["notify"],
               rotate_bytes=int(eff["rotate_mb"] * 1024 * 1024), keep_logs=max(0, eff["keep_logs"]),
-              process_every=max(0.5, eff["process_interval"]), map_path=eff["map"],
+              process_every=eff["process_interval"], map_path=eff["map"],
               retention_days=eff["retention_days"],
               sightings_retention_days=eff["sightings_retention_days"])
     signal.signal(signal.SIGINT, lambda *_: w.stop.set())

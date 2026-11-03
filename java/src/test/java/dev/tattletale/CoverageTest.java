@@ -22,7 +22,8 @@ public final class CoverageTest {
     private CoverageTest() {}
     static Map<?,?> shared;
     static final List<Map<String,Object>> parity=new ArrayList<>();
-    static String stamp(int second){return "2000-01-01T00:00:%02dZ".formatted(second);}
+    static final List<Map<String,Object>> producerParity=new ArrayList<>();
+    static String stamp(int second){return java.time.Instant.parse("2000-01-01T00:00:00Z").plusSeconds(second).toString();}
     static String field(String key){return (String)shared.get(key);}
     static Path next(String name)throws Exception{return CollectionHealthTest.root.resolve(name+"-"+(++CollectionHealthTest.serial));}
     static void seed(Db db)throws Exception {
@@ -62,6 +63,28 @@ public final class CoverageTest {
             }
             case "floor" -> db.exec(Db.bind("INSERT INTO coverage_metadata VALUES ('event_floor',?)",c.get("value")));
             case "bad-event" -> db.exec(Db.bind("INSERT INTO events VALUES (NULL,?,'FIXTURE','synthetic')",c.get("value")));
+            case "cadence" -> db.exec(Db.bind("UPDATE collector_heartbeats SET cadence_seconds=? WHERE collector=?",c.get("value"),c.get("target")));
+            case "old-payload","required-payload","later-payload" -> {
+                int at=op.equals("old-payload")?-1:op.equals("required-payload")?1:31;
+                db.exec(Db.bind("INSERT INTO collector_heartbeats VALUES (NULL,1,'startup',?,0,'ok',NULL,7201)",stamp(at)));
+            }
+            case "mixed-gap","mixed-reverse-gap","tight-gap" -> {
+                db.exec("DELETE FROM collector_heartbeats WHERE collector='processes';");
+                int[] times=op.equals("tight-gap")?new int[]{0,((Number)c.get("value")).intValue(),10,15,20,25,30}:new int[]{0,((Number)c.get("value")).intValue(),15,22,30};
+                for(int i=0;i<times.length;i++) {
+                    int cadence=op.equals("tight-gap")?1:op.equals("mixed-gap")?(i==0?3:6):(i==0?6:3);
+                    db.exec(Db.bind("INSERT INTO collector_heartbeats VALUES (NULL,1,'processes',?,0,'ok',NULL,?)",stamp(times[i]),cadence));
+                }
+            }
+            case "process-end" -> {
+                db.exec("UPDATE collector_heartbeats SET cadence_seconds=6 WHERE collector='processes';");
+                for(String key:List.of("listeners","startup","crontab","keychain"))for(int at:List.of(35,40,45))
+                    db.exec(Db.bind("INSERT INTO collector_heartbeats VALUES (NULL,1,?,?,0,'ok',NULL,3)",key,stamp(at)));
+            }
+            case "anchor-age" -> {
+                db.exec(Db.bind("DELETE FROM collector_heartbeats WHERE collector='startup' AND time<?",stamp(2)));
+                db.exec(Db.bind("INSERT INTO collector_heartbeats VALUES (NULL,1,'startup',?,0,'ok',NULL,3)",stamp(2-((Number)c.get("value")).intValue())));
+            }
             default -> throw new AssertionError("unhandled fixture operation "+op);
         }
     }
@@ -97,6 +120,105 @@ public final class CoverageTest {
     static Map<String,Object> last(Watch w,String key)throws Exception {
         List<Map<String,Object>> rows=w.db.query(Db.bind("SELECT observed_count,status,error FROM collector_heartbeats WHERE collector=? ORDER BY id DESC LIMIT 1",key));
         check(rows.size()==1,"missing producer heartbeat "+key);return rows.getFirst();
+    }
+    static List<Map<String,Object>> actualRows(Watch watch)throws Exception {
+        return watch.db.query("SELECT version,collector,time,observed_count,status,error,cadence_seconds FROM collector_heartbeats ORDER BY collector,time,id;");
+    }
+    static Watch configured(Path root,double process,double listen,double startup) {
+        return new Watch(root.resolve("log").toString(),root.resolve("db").toString(),listen,startup,List.of(),false,
+                100000,1,process,root.resolve("absent-map").toString(),0,0,root.resolve("absent-page").toString());
+    }
+    static double number(Object value) {return value instanceof Number n?n.doubleValue():Double.parseDouble((String)value);}
+    static void healthyPolls(Watch watch,CollectionHealthTest.Fake fake) {
+        fake.comm=new Proc.Result(0,"42 1 fixture /fixture/a\n","");
+        fake.lsof=new Proc.Result(1,"","");fake.failList=false;fake.cron=new Proc.Result(1,"","no crontab for fixture\n");
+        watch.checkProcesses();watch.checkListeners();watch.checkStartup();
+    }
+    static void producerCase(Map<?,?> c)throws Exception {
+        Watch watch=configured(next((String)c.get("name")),number(c.get("process")),number(c.get("listen")),number(c.get("startup")));
+        try {
+            var fake=new CollectionHealthTest.Fake();watch.sources=fake;watch.clock=()->stamp(0);watch.loadState();healthyPolls(watch,fake);
+            if(c.get("scenario").equals("failure-recovery")) {
+                watch.clock=()->stamp(1);fake.comm=new Proc.Result(7,"","");watch.checkProcesses();
+                fake.lsof=new Proc.Result(0,"p42\ncpartial\n","");watch.checkListeners();
+                fake.failList=true;fake.cron=new Proc.Result(7,"","");watch.checkStartup();
+                watch.clock=()->stamp(2);healthyPolls(watch,fake);
+            }
+            var rows=actualRows(watch);check(rows.equals(c.get("expectedRows")),"emitted producer rows "+c.get("name")+" "+Json.write(rows));
+            producerParity.add(Map.of("name",c.get("name"),"rows",rows));
+        }finally {watch.db.close();}
+    }
+    static void invalidIntervalCase(Map<?,?> c)throws Exception {
+        double process=3,listen=30,startup=300;double value=number(c.get("value"));
+        switch((String)c.get("field")){case "process" -> process=value;case "listen" -> listen=value;case "startup" -> startup=value;default -> throw new AssertionError("unknown interval fixture");}
+        Path root=next((String)c.get("name"));Watch unexpected=null;
+        try {unexpected=configured(root,process,listen,startup);throw new AssertionError("invalid interval accepted");}
+        catch(Watch.Exit expected){check(expected.code==2,"invalid interval exit status");}
+        finally {if(unexpected!=null)unexpected.db.close();}
+        check(!Files.exists(root),"invalid interval created filesystem/database state");
+        producerParity.add(Map.of("name",c.get("name"),"rejected",true,"directoryEmpty",true));
+    }
+    /** Scripted pipe: bounded initial bytes, then real blocking idle, then injected EOF. */
+    static final class StagedInput extends InputStream {
+        final byte[] bytes;
+        final java.util.concurrent.CountDownLatch gate=new java.util.concurrent.CountDownLatch(1),waiting=new java.util.concurrent.CountDownLatch(1);
+        int position;boolean closed;
+        StagedInput(byte[] bytes){this.bytes=bytes;}
+        public int read(byte[] target,int offset,int length)throws java.io.IOException {
+            try {gate.await();}catch(InterruptedException e){Thread.currentThread().interrupt();throw new java.io.IOException("fixture-interrupted");}
+            synchronized(this) {
+                if(closed)return -1;
+                if(position<bytes.length) {
+                    int count=Math.min(length,bytes.length-position);System.arraycopy(bytes,position,target,offset,count);position+=count;return count;
+                }
+                waiting.countDown();
+                while(!closed)try{wait();}catch(InterruptedException e){Thread.currentThread().interrupt();throw new java.io.IOException("fixture-interrupted");}
+                return -1;
+            }
+        }
+        public int read()throws java.io.IOException {byte[] one=new byte[1];return read(one,0,1)<0?-1:one[0]&255;}
+        public synchronized void close(){closed=true;gate.countDown();notifyAll();}
+    }
+    static void workerCase(Map<?,?> c)throws Exception {
+        try(var f=new CollectionHealthTest.Fixture()) {
+            StringBuilder output=new StringBuilder();for(Object line:(List<?>)c.get("stdoutLines"))output.append(line).append('\n');
+            int repeats=c.containsKey("stderrRepeat")?((Number)c.get("stderrRepeat")).intValue():1;
+            StagedInput stdout=new StagedInput(output.toString().getBytes(StandardCharsets.UTF_8));
+            StagedInput stderr=new StagedInput(((String)c.get("stderr")).repeat(repeats).getBytes(StandardCharsets.UTF_8));
+            Child child=new Child(stdout,true){public InputStream getErrorStream(){return stderr;}};
+            double[] tick={0};boolean[] primed={false},pulseWithBacklog={false};
+            f.w.streamFactory=command->child;f.w.streamLookup=pid->new String[]{"synthetic args","fixture parent"};
+            f.w.clock=()->{
+                if(repeats>1 && tick[0]==3 && f.w.streamDiagnosticsReader!=null && !f.w.streamDiagnosticsReader.chunks.isEmpty())pulseWithBacklog[0]=true;
+                return stamp((int)tick[0]);
+            };
+            f.w.streamClock=()->{
+                if(!primed[0]) {
+                    stdout.gate.countDown();stderr.gate.countDown();
+                    try {check(stdout.waiting.await(1,TimeUnit.SECONDS) && stderr.waiting.await(1,TimeUnit.SECONDS),"scripted initial bytes not queued");}
+                    catch(InterruptedException e){Thread.currentThread().interrupt();throw new IllegalStateException(e);}
+                    primed[0]=true;
+                }
+                // Four diagnostic chunks: advance to the real pulse deadline while two
+                // chunks remain queued, independently of the ordinary idle pause seam.
+                if(repeats>1 && tick[0]<3 && f.w.streamDiagnosticsReader.chunks.size()<=2)tick[0]=3;
+                return tick[0];
+            };
+            f.w.streamPause=millis->{
+                if(tick[0]<3){tick[0]=3;return false;}
+                tick[0]=4;child.code=((Number)c.get("exitCode")).intValue();child.alive=false;stdout.close();stderr.close();awaitReader(f.w);return false;
+            };
+            boolean retry=f.w.logStreamOnce();var rows=actualRows(f.w);
+            check(rows.equals(c.get("expectedRows")),"worker-emitted rows "+c.get("name")+" "+Json.write(rows));
+            check(retry==(Boolean)c.get("retry"),"worker restart accounting "+c.get("name"));
+            check(f.w.streamDiagnostics.length==((Number)c.get("diagnosticBytes")).intValue(),"bounded diagnostic retention");
+            check(stderr.position==stderr.bytes.length,"stderr was discarded rather than independently drained");
+            check(f.w.streamProc==null && f.w.streamReader==null && f.w.streamDiagnosticsReader==null,"either owned reader escaped cleanup");
+            long credentialEvents=(Long)f.w.db.scalar("SELECT count(*) FROM credential_events WHERE source='log';");
+            check(credentialEvents==((Number)c.get("credentialEvents")).longValue(),"valid credential record lost");
+            if(repeats>1)check(pulseWithBacklog[0],"continuously ready stderr starved stdout/pulse progress");
+            producerParity.add(Map.of("name",c.get("name"),"rows",rows,"retry",retry,"diagnosticBytes",(long)f.w.streamDiagnostics.length,"credentialEvents",credentialEvents));
+        }
     }
     static Map<String,Object> snapshotGuard(Db db,String since)throws Exception {
         db.exec("PRAGMA query_only=ON; BEGIN;");
@@ -154,6 +276,27 @@ public final class CoverageTest {
         });
     }
     static void producerTests() {
+        for(int delay:List.of(5,11))test("coverage-timed-real-poll-chain-lsof-"+delay,()->{try(var f=new CollectionHealthTest.Fixture()) {
+            int finish=delay+5;double[] tick={0};
+            f.w.clock=()->stamp(1);for(String key:List.of("listeners","startup","crontab"))f.w.heartbeat(key,0L,null);
+            for(int at=1;at<=finish;at+=3){final int time=at;f.w.clock=()->stamp(time);f.w.heartbeat("keychain",0L,null);}
+            var timed=new CollectionHealthTest.Fake(){
+                public Proc.Result run(List<String> command,long timeout)throws java.io.IOException {
+                    if(command.getFirst().equals("ps"))tick[0]+=0.5;
+                    if(command.getFirst().equals("lsof"))tick[0]+=delay;
+                    return super.run(command,timeout);
+                }
+            };
+            timed.lsof=new Proc.Result(1,"","");f.w.sources=timed;f.w.clock=()->stamp((int)tick[0]);
+            f.w.checkProcesses();f.w.checkListeners();f.w.checkStartup();tick[0]+=3;f.w.checkProcesses();
+            var rows=f.w.db.query("SELECT time,observed_count,status,error,cadence_seconds FROM collector_heartbeats WHERE collector='processes' ORDER BY id;");
+            check(rows.size()==2 && rows.getFirst().get("time").equals(stamp(1)) && rows.getLast().get("time").equals(stamp(finish)),"timed poll samples did not reproduce shared loop");
+            check(rows.stream().allMatch(row->row.get("cadence_seconds").equals(6.0) && row.get("observed_count").equals(1L) && row.get("status").equals("ok") && row.get("error")==null),"timed emitted rows lost process allowance");
+            f.w.db.exec("PRAGMA query_only=ON; BEGIN;");
+            var result=Coverage.guard(f.w.db,stamp(1),stamp(finish),stamp(100));f.w.db.exec("ROLLBACK; PRAGMA query_only=OFF;");
+            if(delay==5)check(issues(result).isEmpty(),"ordinary five-second sibling opened false gap "+Json.write(result));
+            else check(issues(result).contains("processes/heartbeat-gap") && result.get("outcome").equals("REFUSED"),"genuine gap15 did not refuse");
+        }});
         test("coverage-producer-counts-failure-partial-recovery",()->{try(var f=new CollectionHealthTest.Fixture()) {
             f.seed();f.fake.lsof=new Proc.Result(1,"","");f.w.checkListeners();
             check(last(f.w,"listeners").get("observed_count").equals(0L),"healthy zero listener count");
@@ -174,7 +317,7 @@ public final class CoverageTest {
             check(last(f.w,"processes").get("error").equals("collection-db"),"rollback lacks failure heartbeat");
         }});
         test("coverage-configured-cadence",()->{try(var f=new CollectionHealthTest.Fixture()) {
-            check(f.w.cadence("processes")==3 && f.w.cadence("listeners")==33 && f.w.cadence("startup")==303 && f.w.cadence("crontab")==303 && f.w.cadence("keychain")==3,"configured scheduling cadence");
+            check(f.w.cadence("processes")==6 && f.w.cadence("listeners")==33 && f.w.cadence("startup")==303 && f.w.cadence("crontab")==303 && f.w.cadence("keychain")==3,"configured scheduling cadence");
         }});
         test("coverage-startup-partial-crontab-failure-independent-controls",()->{try(var f=new CollectionHealthTest.Fixture()) {
             var blocked=new CollectionHealthTest.Fake(){public byte[] entry(String file)throws java.io.IOException{throw new Watch.Unreadable("permission-denied");}};
@@ -193,7 +336,7 @@ public final class CoverageTest {
         public InputStream getInputStream(){return input;}
         public InputStream getErrorStream(){return InputStream.nullInputStream();}
         public int waitFor(){alive=false;return code;}
-        public boolean waitFor(long timeout,TimeUnit unit){alive=false;return true;}
+        public boolean waitFor(long timeout,TimeUnit unit){return !alive;}
         public int exitValue(){if(alive)throw new IllegalThreadStateException();return code;}
         public void destroy(){destroyed=true;alive=false;}
         public Process destroyForcibly(){destroy();return this;}
@@ -212,8 +355,37 @@ public final class CoverageTest {
     }
     static void awaitReader(Watch w)throws InterruptedException {
         check(w.streamReader!=null && w.streamReader.ended.await(1,TimeUnit.SECONDS),"owned reader did not observe terminal input");
+        check(w.streamDiagnosticsReader!=null && w.streamDiagnosticsReader.ended.await(1,TimeUnit.SECONDS),"owned diagnostics reader did not observe terminal input");
     }
     static void workerTests() {
+        test("coverage-diagnostic-close-failure-blocks-eligible-restart",()->{try(var f=new CollectionHealthTest.Fixture()) {
+            InputStream diagnostics=new ByteArrayInputStream(new byte[0]){public void close()throws java.io.IOException{throw new java.io.IOException("fixture-close");}};
+            Child child=new Child(new byte[0],false){public InputStream getErrorStream(){return diagnostics;}};
+            int[] starts={0};f.w.streamFactory=command->{starts[0]++;return child;};f.w.streamPause=millis->{awaitReader(f.w);return false;};
+            check(!f.w.logStreamOnce() && f.w.stopped(),"zero exit waived diagnostic close failure");
+            check(f.w.streamProc==child && f.w.streamReader!=null && f.w.streamDiagnosticsReader!=null,"uncertain pipe ownership cleared");
+            check(!f.w.logStreamOnce() && starts[0]==1,"second child started after failed owned close");
+            check(last(f.w,"keychain").get("error").equals("keychain-cleanup"),"pipe cleanup lost degraded evidence");
+        }});
+        test("coverage-dead-child-diagnostic-flood-does-not-renew-drain-deadline",()->{try(var f=new CollectionHealthTest.Fixture()) {
+            var queued=new java.util.concurrent.CountDownLatch(1);var reads=new java.util.concurrent.atomic.AtomicInteger();
+            InputStream diagnostics=new InputStream(){
+                volatile boolean closed;
+                public int read(byte[] bytes,int offset,int length)throws java.io.IOException {
+                    if(closed)throw new java.io.IOException("fixture-closed");Arrays.fill(bytes,offset,offset+length,(byte)'x');
+                    if(reads.incrementAndGet()==9)queued.countDown();return length;
+                }
+                public int read(){return 'x';}
+                public void close(){closed=true;}
+            };
+            Child child=new Child(new byte[0],false){public InputStream getErrorStream(){return diagnostics;}};
+            double[] tick={0};f.w.streamFactory=command->child;
+            f.w.streamClock=()->{check(tick[0]<=12,"stderr progress renewed dead-child timeout");return tick[0]++;};
+            f.w.streamPause=millis->{check(queued.await(1,TimeUnit.SECONDS),"diagnostic reader never exercised sustained backpressure");return false;};
+            check(!f.w.logStreamOnce() && f.w.stopped(),"dead-child diagnostics authorized indefinite observation/restart");
+            check(last(f.w,"keychain").get("error").equals("keychain-reader-stalled"),"dead-child drain lacked degraded evidence");
+            check(f.w.streamDiagnostics.length==4096 && f.w.streamProc==null && f.w.streamReader==null && f.w.streamDiagnosticsReader==null,"either diagnostic ownership or bound escaped cleanup");
+        }});
         test("coverage-strict-raw-controls-and-escaped-positive-legacy-compatibility",()->{
             for(int control=0;control<32;control++) {
                 String prefix="{\"processID\":42,\"processImagePath\":\"/fixture/SecurityAgent\",\"eventMessage\":\"";
@@ -301,7 +473,8 @@ public final class CoverageTest {
             IdleInput input=new IdleInput();Child child=new Child(input,true);double[] tick={0};
             f.w.streamFactory=command->child;f.w.streamClock=()->tick[0];
             f.w.streamPause=millis->{
-                check(input.reading.await(1,TimeUnit.SECONDS),"idle reader never observed pipe");tick[0]+=3;
+                check(input.reading.await(1,TimeUnit.SECONDS),"idle reader never observed pipe");
+                check(f.w.streamDiagnosticsReader.ended.await(1,TimeUnit.SECONDS),"idle diagnostics EOF unobserved");tick[0]+=3;
                 if(tick[0]>=6){child.alive=false;input.close();awaitReader(f.w);}return false;
             };
             check(f.w.logStreamOnce(),"normal confirmed terminal exit should allow bounded restart");
@@ -323,6 +496,13 @@ public final class CoverageTest {
         }});
     }
     static void readonlyTests() {
+        test("coverage-review-main-success-needs-no-watcher-configuration",()->{
+            Path path=next("cli-quiet"),config=next("cli-config");Files.writeString(config,"");
+            try(Db db=Db.open(path.toString(),false)){seed(db);}
+            byte[] before=Files.readAllBytes(path);
+            check(Main.run(new String[]{"--config",config.toString(),"--db",path.toString(),"--review","--since",field("since"),"--until",field("until"),"--process-interval","0"})==0,"read-only review unnecessarily validated watcher intervals");
+            check(Arrays.equals(before,Files.readAllBytes(path)),"review CLI mutated writer data");
+        });
         test("coverage-writer-refuses-future-header-or-rows-before-extension",()->{
             for(String sql:List.of("UPDATE schema_version SET version=2;","UPDATE heartbeat_schema SET version=2;","UPDATE collector_heartbeats SET version=2;")) {
                 Path path=next("future-writer");try(Db db=Db.open(path.toString(),false)){seed(db);db.exec(sql);}
@@ -401,13 +581,17 @@ public final class CoverageTest {
         check(shared.get("fixtureVersion").equals(1L),"unsupported fixture version");
         for(Object item:(List<?>)shared.get("cases")){Map<?,?> c=(Map<?,?>)item;test("coverage-"+c.get("name"),()->caseTest(c));}
         for(Object item:(List<?>)shared.get("streamCases")){Map<?,?> c=(Map<?,?>)item;test("stream-"+c.get("name"),()->streamCase(c));}
+        for(Object item:(List<?>)shared.get("producerCases")){Map<?,?> c=(Map<?,?>)item;test((String)c.get("name"),()->producerCase(c));}
+        for(Object item:(List<?>)shared.get("invalidIntervalCases")){Map<?,?> c=(Map<?,?>)item;test((String)c.get("name"),()->invalidIntervalCase(c));}
+        for(Object item:(List<?>)shared.get("workerCases")){Map<?,?> c=(Map<?,?>)item;test((String)c.get("name"),()->workerCase(c));}
         producerTests();workerTests();readonlyTests();historyTests();
         long failed=CollectionHealthTest.results.stream().filter(r->!r.get("status").equals("pass")).count();
         writeXml(xml);
         System.out.println("COVERAGE RESULT cases="+CollectionHealthTest.results.size()+" failed="+failed);
         if(failed>0)throw new AssertionError("coverage controls failed: "+failed);
         parity.sort(java.util.Comparator.comparing(row->(String)row.get("name")));
-        if(output!=null)Files.writeString(output,Json.write(Map.of("fixtureVersion",1L,"results",parity))+"\n");
+        producerParity.sort(java.util.Comparator.comparing(row->(String)row.get("name")));
+        if(output!=null)Files.writeString(output,Json.write(Map.of("fixtureVersion",1L,"results",parity,"producerResults",producerParity))+"\n");
     }
     static void writeXml(Path path)throws Exception {
         var results=CollectionHealthTest.results;

@@ -38,7 +38,7 @@
     {"name":"ambiguous-offset","op":"mutate","field":"time","value":"2000-01-01T00:00:00+00:00","outcome":"REFUSED","issues":["keychain/malformed-heartbeat"]},
     {"name":"future-time","op":"mutate","field":"time","value":"2000-01-01T00:03:00Z","outcome":"REFUSED","issues":["keychain/malformed-heartbeat"]},
     {"name":"zero-cadence","op":"mutate","field":"cadence_seconds","value":0,"outcome":"REFUSED","issues":["keychain/malformed-heartbeat"]},
-    {"name":"unbounded-cadence","op":"mutate","field":"cadence_seconds","value":3601,"outcome":"REFUSED","issues":["keychain/malformed-heartbeat"]},
+    {"name":"unbounded-cadence","op":"mutate","field":"cadence_seconds","value":7201,"outcome":"REFUSED","issues":["keychain/malformed-heartbeat"]},
     {"name":"expired-events","op":"floor","value":"2000-01-01T00:00:01Z","outcome":"REFUSED","issues":["-/events-expired"]},
     {"name":"malformed-floor","op":"floor","value":"bad","outcome":"REFUSED","issues":["-/malformed-metadata"]},
     {"name":"malformed-event","op":"bad-event","value":"bad","outcome":"REFUSED","issues":["-/malformed-event"]},
@@ -46,7 +46,23 @@
     {"name":"invalid-window","op":"none","since":"bad","outcome":"REFUSED","issues":["-/invalid-window"]},
     {"name":"empty-window","op":"none","until":"2000-01-01T00:00:00Z","outcome":"REFUSED","issues":["-/invalid-window"]},
     {"name":"reversed-window","op":"none","since":"2000-01-01T00:00:40Z","outcome":"REFUSED","issues":["-/invalid-window"]},
-    {"name":"future-window","op":"none","until":"2000-01-01T00:03:00Z","outcome":"REFUSED","issues":["-/invalid-window"]}
+    {"name":"future-window","op":"none","until":"2000-01-01T00:03:00Z","outcome":"REFUSED","issues":["-/invalid-window"]},
+    {"name":"hourly-cadence-supported","op":"cadence","target":"startup","value":3603,"outcome":"QUIET","issues":[]},
+    {"name":"keychain-cadence-stays-fixed","op":"mutate","field":"cadence_seconds","value":3603,"outcome":"REFUSED","issues":["keychain/malformed-heartbeat"]},
+    {"name":"old-bad-payload-superseded","op":"old-payload","since":"2000-01-01T00:00:02Z","outcome":"QUIET","issues":[]},
+    {"name":"bad-required-anchor","op":"required-payload","since":"2000-01-01T00:00:02Z","outcome":"REFUSED","issues":["startup/malformed-heartbeat"]},
+    {"name":"exact-start-supersedes-bad-anchor","op":"old-payload","outcome":"QUIET","issues":[]},
+    {"name":"end-outside-bad-payload-irrelevant","op":"later-payload","outcome":"QUIET","issues":[]},
+    {"name":"mixed-cadence-gap-exact-minimum","op":"mixed-gap","value":8,"outcome":"QUIET","issues":[]},
+    {"name":"mixed-cadence-gap-beyond-minimum","op":"mixed-gap","value":9,"outcome":"REFUSED","issues":["processes/heartbeat-gap"]},
+    {"name":"required-anchor-exact-grace","op":"anchor-age","value":8,"since":"2000-01-01T00:00:02Z","outcome":"REFUSED","issues":["startup/heartbeat-gap"]},
+    {"name":"required-anchor-beyond-grace","op":"anchor-age","value":9,"since":"2000-01-01T00:00:02Z","outcome":"REFUSED","issues":["startup/start-silence","startup/heartbeat-gap"]},
+    {"name":"mixed-reverse-gap-exact-minimum","op":"mixed-reverse-gap","value":8,"outcome":"QUIET","issues":[]},
+    {"name":"mixed-reverse-gap-beyond-minimum","op":"mixed-reverse-gap","value":9,"outcome":"REFUSED","issues":["processes/heartbeat-gap"]},
+    {"name":"tight-cadence-gap-exact-five","op":"tight-gap","value":5,"outcome":"QUIET","issues":[]},
+    {"name":"tight-cadence-gap-beyond-five","op":"tight-gap","value":6,"outcome":"REFUSED","issues":["processes/heartbeat-gap"]},
+    {"name":"process-six-end-exact-fourteen","op":"process-end","until":"2000-01-01T00:00:44Z","outcome":"QUIET","issues":[]},
+    {"name":"process-six-end-beyond-fourteen","op":"process-end","until":"2000-01-01T00:00:45Z","outcome":"REFUSED","issues":["processes/end-silence"]}
   ],
   "streamCases": [
     {"name":"idle-live","lines":[],"alive":true,"partial":false,"count":0,"error":null},
@@ -63,6 +79,47 @@
     {"name":"raw-control-tab","lines":["{\"processID\":42,\"processImagePath\":\"/fixture/SecurityAgent\",\"eventMessage\":\"raw\ttab\"}"],"alive":true,"partial":false,"count":null,"error":"keychain-malformed"},
     {"name":"raw-control-cr","lines":["{\"processID\":42,\"processImagePath\":\"/fixture/SecurityAgent\",\"eventMessage\":\"raw\rcarriage\"}"],"alive":true,"partial":false,"count":null,"error":"keychain-malformed"},
     {"name":"signed-unicode-escape","lines":["{\"processID\":42,\"processImagePath\":\"/fixture/SecurityAgent\",\"eventMessage\":\"\\u+001\"}"],"alive":true,"partial":false,"count":null,"error":"keychain-malformed"},
-    {"name":"escaped-controls-valid","lines":["{\"processID\":42,\"processImagePath\":\"/fixture/SecurityAgent\",\"eventMessage\":\"escaped\\t\\r\\u0001\"}"],"alive":true,"partial":false,"count":1,"error":null}
+    {"name":"escaped-controls-valid","lines":["{\"processID\":42,\"processImagePath\":\"/fixture/SecurityAgent\",\"eventMessage\":\"escaped\\t\\r\\u0001\"}"],"alive":true,"partial":false,"count":1,"error":null},
+    {"name":"known-prelude-idle","lines":["Filtering the log data using \"process == SecurityAgent\""],"alive":true,"partial":false,"count":0,"error":null},
+    {"name":"known-prelude-record","lines":["Filtering the log data using \"process == SecurityAgent\"","{\"processID\":42,\"processImagePath\":\"/fixture/SecurityAgent\",\"eventMessage\":\"synthetic credential record\"}"],"alive":true,"partial":false,"count":1,"error":null},
+    {"name":"repeated-prelude","lines":["Filtering the log data using \"process == SecurityAgent\"","Filtering the log data using \"process == SecurityAgent\""],"alive":true,"partial":false,"count":null,"error":"keychain-malformed"},
+    {"name":"late-prelude","lines":["{\"processID\":42,\"processImagePath\":\"/fixture/SecurityAgent\",\"eventMessage\":\"synthetic credential record\"}","Filtering the log data using \"process == SecurityAgent\""],"alive":true,"partial":false,"count":null,"error":"keychain-malformed"},
+    {"name":"invalid-before-prelude","lines":["not an approved prelude","Filtering the log data using \"process == SecurityAgent\""],"alive":true,"partial":false,"count":null,"error":"keychain-malformed"}
+  ],
+  "producerCases": [
+    {"name":"producer-default","process":3,"listen":30,"startup":300,"scenario":"healthy","expectedRows":[{"version":1,"collector":"crontab","time":"2000-01-01T00:00:00Z","observed_count":0,"status":"ok","error":null,"cadence_seconds":303.0},{"version":1,"collector":"listeners","time":"2000-01-01T00:00:00Z","observed_count":0,"status":"ok","error":null,"cadence_seconds":33.0},{"version":1,"collector":"processes","time":"2000-01-01T00:00:00Z","observed_count":1,"status":"ok","error":null,"cadence_seconds":6.0},{"version":1,"collector":"startup","time":"2000-01-01T00:00:00Z","observed_count":0,"status":"ok","error":null,"cadence_seconds":303.0}]},
+    {"name":"producer-hourly","process":3,"listen":3600,"startup":3600,"scenario":"healthy","expectedRows":[{"version":1,"collector":"crontab","time":"2000-01-01T00:00:00Z","observed_count":0,"status":"ok","error":null,"cadence_seconds":3603.0},{"version":1,"collector":"listeners","time":"2000-01-01T00:00:00Z","observed_count":0,"status":"ok","error":null,"cadence_seconds":3603.0},{"version":1,"collector":"processes","time":"2000-01-01T00:00:00Z","observed_count":1,"status":"ok","error":null,"cadence_seconds":6.0},{"version":1,"collector":"startup","time":"2000-01-01T00:00:00Z","observed_count":0,"status":"ok","error":null,"cadence_seconds":3603.0}]},
+    {"name":"producer-maximum","process":3600,"listen":3600,"startup":3600,"scenario":"healthy","expectedRows":[{"version":1,"collector":"crontab","time":"2000-01-01T00:00:00Z","observed_count":0,"status":"ok","error":null,"cadence_seconds":7200.0},{"version":1,"collector":"listeners","time":"2000-01-01T00:00:00Z","observed_count":0,"status":"ok","error":null,"cadence_seconds":7200.0},{"version":1,"collector":"processes","time":"2000-01-01T00:00:00Z","observed_count":1,"status":"ok","error":null,"cadence_seconds":7200.0},{"version":1,"collector":"startup","time":"2000-01-01T00:00:00Z","observed_count":0,"status":"ok","error":null,"cadence_seconds":7200.0}]},
+    {"name":"producer-fractional","process":0.5,"listen":0.5,"startup":0.5,"scenario":"healthy","expectedRows":[{"version":1,"collector":"crontab","time":"2000-01-01T00:00:00Z","observed_count":0,"status":"ok","error":null,"cadence_seconds":1.0},{"version":1,"collector":"listeners","time":"2000-01-01T00:00:00Z","observed_count":0,"status":"ok","error":null,"cadence_seconds":1.0},{"version":1,"collector":"processes","time":"2000-01-01T00:00:00Z","observed_count":1,"status":"ok","error":null,"cadence_seconds":1.0},{"version":1,"collector":"startup","time":"2000-01-01T00:00:00Z","observed_count":0,"status":"ok","error":null,"cadence_seconds":1.0}]},
+    {"name":"producer-failure-recovery","process":3,"listen":30,"startup":300,"scenario":"failure-recovery","expectedRows":[{"version":1,"collector":"crontab","time":"2000-01-01T00:00:00Z","observed_count":0,"status":"ok","error":null,"cadence_seconds":303.0},{"version":1,"collector":"crontab","time":"2000-01-01T00:00:01Z","observed_count":null,"status":"degraded","error":"crontab-command","cadence_seconds":303.0},{"version":1,"collector":"crontab","time":"2000-01-01T00:00:02Z","observed_count":0,"status":"ok","error":null,"cadence_seconds":303.0},{"version":1,"collector":"listeners","time":"2000-01-01T00:00:00Z","observed_count":0,"status":"ok","error":null,"cadence_seconds":33.0},{"version":1,"collector":"listeners","time":"2000-01-01T00:00:01Z","observed_count":null,"status":"degraded","error":"lsof-parse","cadence_seconds":33.0},{"version":1,"collector":"listeners","time":"2000-01-01T00:00:02Z","observed_count":0,"status":"ok","error":null,"cadence_seconds":33.0},{"version":1,"collector":"processes","time":"2000-01-01T00:00:00Z","observed_count":1,"status":"ok","error":null,"cadence_seconds":6.0},{"version":1,"collector":"processes","time":"2000-01-01T00:00:01Z","observed_count":null,"status":"degraded","error":"ps-command","cadence_seconds":6.0},{"version":1,"collector":"processes","time":"2000-01-01T00:00:02Z","observed_count":1,"status":"ok","error":null,"cadence_seconds":6.0},{"version":1,"collector":"startup","time":"2000-01-01T00:00:00Z","observed_count":0,"status":"ok","error":null,"cadence_seconds":303.0},{"version":1,"collector":"startup","time":"2000-01-01T00:00:01Z","observed_count":null,"status":"degraded","error":"startup-read","cadence_seconds":303.0},{"version":1,"collector":"startup","time":"2000-01-01T00:00:02Z","observed_count":0,"status":"ok","error":null,"cadence_seconds":303.0}]}
+  ],
+  "invalidIntervalCases": [
+    {"name":"invalid-process-0","field":"process","value":0},
+    {"name":"invalid-process-1","field":"process","value":0.49},
+    {"name":"invalid-process-2","field":"process","value":3600.5},
+    {"name":"invalid-process-3","field":"process","value":"NaN"},
+    {"name":"invalid-process-4","field":"process","value":"Infinity"},
+    {"name":"invalid-process-5","field":"process","value":"-Infinity"},
+    {"name":"invalid-listen-0","field":"listen","value":0},
+    {"name":"invalid-listen-1","field":"listen","value":0.49},
+    {"name":"invalid-listen-2","field":"listen","value":3600.5},
+    {"name":"invalid-listen-3","field":"listen","value":"NaN"},
+    {"name":"invalid-listen-4","field":"listen","value":"Infinity"},
+    {"name":"invalid-listen-5","field":"listen","value":"-Infinity"},
+    {"name":"invalid-startup-0","field":"startup","value":0},
+    {"name":"invalid-startup-1","field":"startup","value":0.49},
+    {"name":"invalid-startup-2","field":"startup","value":3600.5},
+    {"name":"invalid-startup-3","field":"startup","value":"NaN"},
+    {"name":"invalid-startup-4","field":"startup","value":"Infinity"},
+    {"name":"invalid-startup-5","field":"startup","value":"-Infinity"}
+  ],
+  "workerCases": [
+    {"name":"worker-banner-diagnostics","stdoutLines":["Filtering the log data using \"process == SecurityAgent\""],"stderr":"synthetic informational diagnostic\n","exitCode":0,"retry":true,"diagnosticBytes":35,"expectedRows":[{"version":1,"collector":"keychain","time":"2000-01-01T00:00:03Z","observed_count":0,"status":"ok","error":null,"cadence_seconds":3.0},{"version":1,"collector":"keychain","time":"2000-01-01T00:00:04Z","observed_count":null,"status":"degraded","error":"keychain-ended","cadence_seconds":3.0}],"credentialEvents":0},
+    {"name":"worker-banner-record-diagnostics","stdoutLines":["Filtering the log data using \"process == SecurityAgent\"","{\"processID\":42,\"processImagePath\":\"/fixture/SecurityAgent\",\"eventMessage\":\"synthetic credential record\"}"],"stderr":"synthetic informational diagnostic\n","exitCode":0,"retry":true,"diagnosticBytes":35,"expectedRows":[{"version":1,"collector":"keychain","time":"2000-01-01T00:00:03Z","observed_count":1,"status":"ok","error":null,"cadence_seconds":3.0},{"version":1,"collector":"keychain","time":"2000-01-01T00:00:04Z","observed_count":null,"status":"degraded","error":"keychain-ended","cadence_seconds":3.0}],"credentialEvents":1},
+    {"name":"worker-unsupported-style","stdoutLines":["Filtering the log data using \"process == SecurityAgent\""],"stderr":"log: unsupported style ndjson\n","exitCode":2,"retry":false,"diagnosticBytes":30,"expectedRows":[{"version":1,"collector":"keychain","time":"2000-01-01T00:00:03Z","observed_count":0,"status":"ok","error":null,"cadence_seconds":3.0},{"version":1,"collector":"keychain","time":"2000-01-01T00:00:04Z","observed_count":null,"status":"degraded","error":"keychain-ended","cadence_seconds":3.0}],"credentialEvents":0},
+    {"name":"worker-malformed-first","stdoutLines":["not an approved prelude","Filtering the log data using \"process == SecurityAgent\""],"stderr":"","exitCode":0,"retry":true,"diagnosticBytes":0,"expectedRows":[{"version":1,"collector":"keychain","time":"2000-01-01T00:00:03Z","observed_count":null,"status":"degraded","error":"keychain-malformed","cadence_seconds":3.0},{"version":1,"collector":"keychain","time":"2000-01-01T00:00:04Z","observed_count":null,"status":"degraded","error":"keychain-ended","cadence_seconds":3.0}],"credentialEvents":0},
+    {"name":"worker-late-banner","stdoutLines":["{\"processID\":42,\"processImagePath\":\"/fixture/SecurityAgent\",\"eventMessage\":\"synthetic credential record\"}","Filtering the log data using \"process == SecurityAgent\""],"stderr":"","exitCode":0,"retry":true,"diagnosticBytes":0,"expectedRows":[{"version":1,"collector":"keychain","time":"2000-01-01T00:00:03Z","observed_count":null,"status":"degraded","error":"keychain-malformed","cadence_seconds":3.0},{"version":1,"collector":"keychain","time":"2000-01-01T00:00:04Z","observed_count":null,"status":"degraded","error":"keychain-ended","cadence_seconds":3.0}],"credentialEvents":1},
+    {"name":"worker-repeated-banner","stdoutLines":["Filtering the log data using \"process == SecurityAgent\"","Filtering the log data using \"process == SecurityAgent\""],"stderr":"","exitCode":0,"retry":true,"diagnosticBytes":0,"expectedRows":[{"version":1,"collector":"keychain","time":"2000-01-01T00:00:03Z","observed_count":null,"status":"degraded","error":"keychain-malformed","cadence_seconds":3.0},{"version":1,"collector":"keychain","time":"2000-01-01T00:00:04Z","observed_count":null,"status":"degraded","error":"keychain-ended","cadence_seconds":3.0}],"credentialEvents":0},
+    {"name":"worker-diagnostic-flood","stdoutLines":["Filtering the log data using \"process == SecurityAgent\"","{\"processID\":42,\"processImagePath\":\"/fixture/SecurityAgent\",\"eventMessage\":\"synthetic credential record\"}"],"stderr":"x","exitCode":0,"retry":true,"diagnosticBytes":4096,"expectedRows":[{"version":1,"collector":"keychain","time":"2000-01-01T00:00:03Z","observed_count":1,"status":"ok","error":null,"cadence_seconds":3.0},{"version":1,"collector":"keychain","time":"2000-01-01T00:00:04Z","observed_count":null,"status":"degraded","error":"keychain-ended","cadence_seconds":3.0}],"stderrRepeat":196625,"credentialEvents":1}
   ]
 }
