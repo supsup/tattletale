@@ -1571,7 +1571,9 @@ class Watch:
                         if dead_since is None:
                             dead_since = tick
                         if tick - dead_since >= 5:
-                            self._heartbeat("keychain", None, "keychain-io")
+                            self.stream_worker_failure = "keychain-reader-stalled"
+                            self.stop.set()
+                            self._heartbeat("keychain", None, "keychain-reader-stalled")
                             recorded = True
                             break
                     elif stdout_closed_at is not None:
@@ -1588,7 +1590,7 @@ class Watch:
         except (OSError, ValueError):
             self._heartbeat("keychain", None, "keychain-io")
         except subprocess.TimeoutExpired:
-            self._heartbeat("keychain", None, "keychain-ended")
+            self._heartbeat("keychain", None, "keychain-closed")
         except sqlite3.Error as error:
             require_recovered_db(self.db, error)
             raise FatalDatabaseError("keychain-db") from error
@@ -2701,7 +2703,11 @@ def main():
               sightings_retention_days=eff["sightings_retention_days"])
     signal.signal(signal.SIGINT, lambda *_: w.stop.set())
     signal.signal(signal.SIGTERM, lambda *_: w.stop.set())
-    w.run()
+    try:
+        w.run()
+    except FatalDatabaseError as error:
+        print(f"tattletale: {error}", file=sys.stderr)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

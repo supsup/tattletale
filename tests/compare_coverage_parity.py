@@ -38,7 +38,8 @@ def oracle(fixture):
     producer = [{'name': case['name'], 'rows': case['expectedRows']} for case in fixture['producerCases']]
     producer += [{'name': case['name'], 'rejected': True, 'directoryEmpty': True} for case in fixture['invalidIntervalCases']]
     producer += [{'name': case['name'], 'rows': case['expectedRows'], 'retry': case['retry'],
-                  'diagnosticBytes': case['diagnosticBytes'], 'credentialEvents': case['credentialEvents']} for case in fixture['workerCases']]
+                  'diagnosticBytes': case['diagnosticBytes'], 'credentialEvents': case['credentialEvents'],
+                  'stopRequested': case['stopRequested'], 'workerFailure': case['workerFailure']} for case in fixture['workerCases']]
     require(len({row['name'] for row in producer}) == len(producer), 'duplicate producer fixture case')
     return {'fixtureVersion': 1, 'results': sorted(rows, key=lambda row: row['name']),
             'producerResults': sorted(producer, key=lambda row: row['name'])}

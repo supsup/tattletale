@@ -212,6 +212,17 @@ class CoverageTests(unittest.TestCase):
         row = next(r for r in wrong_producer['producerResults'] if r['name'] == 'producer-default')
         next(r for r in row['rows'] if r['collector'] == 'processes')['cadence_seconds'] = 3.0
         mutations.append(wrong_producer)
+        # Each terminal field must fail independently; a wrong row must not mask a
+        # comparator that accidentally ignores the worker's stop/failure disposition.
+        for field, wrong_value in [('stopRequested', False), ('workerFailure', None)]:
+            wrong_terminal = copy.deepcopy(good)
+            row = next(r for r in wrong_terminal['producerResults'] if r['name'] == 'worker-dead-child-diagnostic-held')
+            row[field] = wrong_value
+            mutations.append(wrong_terminal)
+        wrong_terminal_row = copy.deepcopy(good)
+        row = next(r for r in wrong_terminal_row['producerResults'] if r['name'] == 'worker-dead-child-diagnostic-held')
+        row['rows'][0]['error'] = 'keychain-io'
+        mutations.append(wrong_terminal_row)
         for value in mutations:
             with self.assertRaises(ValueError): parity.validate(value, FIXTURE)
 
@@ -504,6 +515,9 @@ class ProducerHeartbeatTests(unittest.TestCase):
         rows = self.pulses('keychain')
         self.assertTrue(rows)
         self.assertTrue(all(count is None and status == 'degraded' for count, status, error in rows))
+        self.assertEqual(rows, [(None, 'degraded', 'keychain-closed')])
+        self.assertFalse(self.w.stop.is_set())
+        self.assertIsNone(self.w.stream_worker_failure)
         self.assertEqual(starts.call_count, 1)
         self.assertTrue(child.terminated)
         self.assertEqual(child.poll(), 0)
@@ -526,7 +540,9 @@ class ProducerHeartbeatTests(unittest.TestCase):
                 mock.patch.object(TT.selectors, 'DefaultSelector', return_value=selector), \
                 mock.patch.object(TT.time, 'monotonic', side_effect=lambda: clock[0]):
             self.assertFalse(self.w._log_stream_once())
-        self.assertEqual(self.pulses('keychain')[-1], (None, 'degraded', 'keychain-io'))
+        self.assertEqual(self.pulses('keychain')[-1], (None, 'degraded', 'keychain-reader-stalled'))
+        self.assertTrue(self.w.stop.is_set())
+        self.assertEqual(self.w.stream_worker_failure, 'keychain-reader-stalled')
         self.assertEqual(len(self.w.stream_diagnostics), 4096)
         self.assertTrue(child.stdout.closed and child.stderr.closed)
         self.assertIsNone(self.w.stream_proc)
@@ -617,6 +633,9 @@ def invalid_interval_case(case):
 
 def worker_case(case):
     def test(self):
+        if case.get('driver'):
+            terminal_worker_case(self, case)
+            return
         stdout = ''.join(line + '\n' for line in case['stdoutLines']).encode()
         stderr = (case['stderr'] * case.get('stderrRepeat', 1)).encode()
         pulses_with_backlog = []
@@ -636,9 +655,11 @@ def worker_case(case):
         rows = actual_rows(self.w)
         result = {'name': case['name'], 'rows': rows, 'retry': retry,
                   'diagnosticBytes': len(self.w.stream_diagnostics),
-                  'credentialEvents': self.w.db.execute("SELECT count(*) FROM credential_events WHERE source='log'").fetchone()[0]}
+                  'credentialEvents': self.w.db.execute("SELECT count(*) FROM credential_events WHERE source='log'").fetchone()[0],
+                  'stopRequested': self.w.stop.is_set(), 'workerFailure': self.w.stream_worker_failure}
         expected = {'name': case['name'], 'rows': case['expectedRows'], 'retry': case['retry'],
-                    'diagnosticBytes': case['diagnosticBytes'], 'credentialEvents': case['credentialEvents']}
+                    'diagnosticBytes': case['diagnosticBytes'], 'credentialEvents': case['credentialEvents'],
+                    'stopRequested': case['stopRequested'], 'workerFailure': case['workerFailure']}
         parity.equal(result, expected)
         self.assertEqual(child.diagnostics.bytes_read, len(stderr))
         self.assertTrue(child.stderr.closed)
@@ -646,6 +667,53 @@ def worker_case(case):
             self.assertIn(True, pulses_with_backlog, 'stdout count and deadline pulse were starved by continuously ready diagnostics')
         PRODUCER_RESULTS.append(result)
     return test
+
+
+def terminal_worker_case(self, case):
+    """Real worker, fixed observation UTC, bounded synthetic monotonic/pipe inputs.
+
+    The emitted row is always read from SQLite; expectedRows is only the independent oracle.
+    """
+    child, tick = regressions.FixtureChild(), [0]
+    child.stderr = child.diagnostics
+    child.stdout.eof = True
+    dead = case['driver'] == 'dead-child-diagnostics'
+    child.code = 0 if dead else None
+    child.stderr.eof = not dead
+    selector = regressions.FixtureSelector(child, tick, 0)
+    def select(timeout):
+        tick[0] += 1
+        self.assertLessEqual(tick[0], 8, 'diagnostic bytes renewed the dead-child deadline')
+        return [(key, TT.selectors.EVENT_READ) for key in list(selector.keys.values())]
+    selector.select = select
+    def read(fd, size):
+        data = case['stderr'].encode() * size if dead and fd == 32 else b''
+        if fd == 32: child.diagnostics.bytes_read += len(data)
+        return data
+    with mock.patch.object(TT.subprocess, 'Popen', return_value=child) as starts, \
+            mock.patch.object(TT.os, 'set_blocking'), mock.patch.object(TT.os, 'read', side_effect=read), \
+            mock.patch.object(TT.selectors, 'DefaultSelector', return_value=selector), \
+            mock.patch.object(TT.time, 'monotonic', side_effect=lambda: tick[0]), \
+            mock.patch.object(TT, 'now', return_value=case['observationTime']), \
+            mock.patch.object(self.w.stop, 'wait', side_effect=AssertionError('terminal input must not authorize retry')):
+        retry = self.w._log_stream_once()
+    rows = actual_rows(self.w)
+    result = {'name': case['name'], 'rows': rows, 'retry': retry,
+              'diagnosticBytes': len(self.w.stream_diagnostics),
+              'credentialEvents': self.w.db.execute("SELECT count(*) FROM credential_events WHERE source='log'").fetchone()[0],
+              'stopRequested': self.w.stop.is_set(), 'workerFailure': self.w.stream_worker_failure}
+    self.assertEqual(starts.call_count, 1)
+    self.assertTrue(child.stdout.closed and child.stderr.closed)
+    self.assertIsNone(self.w.stream_proc)
+    if dead: self.assertGreater(child.diagnostics.bytes_read, 4096)
+    expected = {'name': case['name'], 'rows': case['expectedRows'], 'retry': case['retry'],
+                'diagnosticBytes': case['diagnosticBytes'], 'credentialEvents': case['credentialEvents'],
+                'stopRequested': case['stopRequested'], 'workerFailure': case['workerFailure']}
+    try:
+        parity.equal(result, expected)
+    except ValueError as mismatch:
+        self.fail(str(mismatch) + '; observed terminal state: ' + json.dumps(result, sort_keys=True))
+    PRODUCER_RESULTS.append(result)
 
 
 for index, case in enumerate(FIXTURE['producerCases']):

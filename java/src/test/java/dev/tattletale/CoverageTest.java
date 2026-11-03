@@ -180,6 +180,7 @@ public final class CoverageTest {
         public synchronized void close(){closed=true;gate.countDown();notifyAll();}
     }
     static void workerCase(Map<?,?> c)throws Exception {
+        if(c.containsKey("driver")){terminalWorkerCase(c);return;}
         try(var f=new CollectionHealthTest.Fixture()) {
             StringBuilder output=new StringBuilder();for(Object line:(List<?>)c.get("stdoutLines"))output.append(line).append('\n');
             int repeats=c.containsKey("stderrRepeat")?((Number)c.get("stderrRepeat")).intValue():1;
@@ -217,7 +218,56 @@ public final class CoverageTest {
             long credentialEvents=(Long)f.w.db.scalar("SELECT count(*) FROM credential_events WHERE source='log';");
             check(credentialEvents==((Number)c.get("credentialEvents")).longValue(),"valid credential record lost");
             if(repeats>1)check(pulseWithBacklog[0],"continuously ready stderr starved stdout/pulse progress");
-            producerParity.add(Map.of("name",c.get("name"),"rows",rows,"retry",retry,"diagnosticBytes",(long)f.w.streamDiagnostics.length,"credentialEvents",credentialEvents));
+            check(f.w.stopped()==(Boolean)c.get("stopRequested"),"worker stop disposition "+c.get("name"));
+            check(java.util.Objects.equals(f.w.streamWorkerFailure,c.get("workerFailure")),"retained worker failure "+c.get("name"));
+            producerParity.add(workerObservation(f.w,c,retry));
+        }
+    }
+    static Map<String,Object> workerObservation(Watch watch,Map<?,?> c,boolean retry)throws Exception {
+        Map<String,Object> result=new LinkedHashMap<>();result.put("name",c.get("name"));result.put("rows",actualRows(watch));
+        result.put("retry",retry);result.put("diagnosticBytes",(long)watch.streamDiagnostics.length);
+        result.put("credentialEvents",watch.db.scalar("SELECT count(*) FROM credential_events WHERE source='log';"));
+        result.put("stopRequested",watch.stopped());result.put("workerFailure",watch.streamWorkerFailure);return result;
+    }
+    static void terminalWorkerCase(Map<?,?> c)throws Exception {
+        try(var f=new CollectionHealthTest.Fixture()) {
+            boolean dead=c.get("driver").equals("dead-child-diagnostics");
+            var queued=new java.util.concurrent.CountDownLatch(1);var reads=new java.util.concurrent.atomic.AtomicInteger();
+            InputStream diagnostics=dead?new InputStream(){
+                volatile boolean closed;
+                public int read(byte[] bytes,int offset,int length)throws java.io.IOException {
+                    if(closed)throw new java.io.IOException("fixture-closed");Arrays.fill(bytes,offset,offset+length,(byte)'x');
+                    if(reads.incrementAndGet()==9)queued.countDown();return length;
+                }
+                public int read(){return 'x';}
+                public void close(){closed=true;}
+            }:InputStream.nullInputStream();
+            Child child=new Child(new byte[0],!dead){public InputStream getErrorStream(){return diagnostics;}};
+            child.code=((Number)c.get("exitCode")).intValue();double[] tick={0};boolean[] primed={false};
+            f.w.streamFactory=command->child;f.w.clock=()->(String)c.get("observationTime");
+            f.w.streamClock=()->{
+                if(dead && !primed[0]) {
+                    try {check(queued.await(1,TimeUnit.SECONDS),"continuous diagnostic input never filled its bounded queue");}
+                    catch(InterruptedException e){Thread.currentThread().interrupt();throw new IllegalStateException(e);}
+                    primed[0]=true;
+                }
+                check(tick[0]<=12,"diagnostics renewed terminal drain deadline");return dead?tick[0]++:0;
+            };
+            f.w.streamPause=millis->{
+                if(dead)check(queued.await(1,TimeUnit.SECONDS),"continuous diagnostic input never exercised bounded queue");
+                else awaitReader(f.w);
+                return false;
+            };
+            boolean retry=f.w.logStreamOnce();Map<String,Object> result=workerObservation(f.w,c,retry);
+            check(result.get("rows").equals(c.get("expectedRows")),"terminal emitted rows "+c.get("name")+" "+Json.write(result));
+            check(retry==(Boolean)c.get("retry"),"terminal restart disposition");
+            check(result.get("diagnosticBytes").equals(c.get("diagnosticBytes")),"terminal diagnostic retention");
+            check(result.get("credentialEvents").equals(c.get("credentialEvents")),"terminal input invented credential records");
+            check(result.get("stopRequested").equals(c.get("stopRequested")),"terminal stop disposition");
+            check(java.util.Objects.equals(result.get("workerFailure"),c.get("workerFailure")),"terminal worker failure disposition");
+            check(f.w.streamProc==null && f.w.streamReader==null && f.w.streamDiagnosticsReader==null,"terminal child/either reader cleanup unconfirmed");
+            if(dead)check(reads.get()>=9,"diagnostic progress was not exercised before terminal failure");
+            producerParity.add(result);
         }
     }
     static Map<String,Object> snapshotGuard(Db db,String since)throws Exception {
